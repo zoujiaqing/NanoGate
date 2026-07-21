@@ -31,6 +31,12 @@ NewGate 是一个**通用开源 LLM API 中转站（网关）发行版**，对�
 
 ### 2.1 仓库布局
 
+**目录布局（2026-07-21 已落地）**：`~/projects/NewGate/` 为产品工作区（meta 仓库存 docs），
+内含独立 git 仓库 `newgate`（后端，clone 自 neton-application，origin 指向底座可持续 pull）、
+`newgate-front`（管理台，clone 自 neton-application-front）、`newgate-client`（用户控制台，新建）；
+框架与 canonical 模块仓保持在 `~/projects/Neton/`，newgate 以 `../../Neton/` 相对路径装配
+（与 privchat fork 同约定，见底座 docs/MODULE_EXTRACTION_MIGRATION.md）。编译验证已通过。
+
 | 仓库 | 内容 | 性质 |
 |------|------|------|
 | `neton` | 框架：服务端流式响应支持（M0 前置）、neton-ai IR 扩展 | 框架改动 |
