@@ -101,6 +101,24 @@ new-api 的 `模型倍率 × 0.002/1K` 是 one-api 历史包袱。NewGate 采用
 - 额度余额以 **μUSD（BIGINT，1e-6 美元）** 记账，避免浮点误差
 - 额度变动走台账（授予 / 消费 / 退还 / 兑换），可审计——优于 new-api 的单列 int
 
+### 决策 B2：定价子系统要显著优于 new-api（成本/售价分离 + 官方价源同步 + 毛利可视化）
+
+new-api 的定价痛点：倍率单位反人类且手工维护；`ratio_sync` 靠抄同类站点的倍率表（以讹传讹）；
+成本与售价混在一个倍率里，站长算不清毛利。NewGate 设计（产品哲学：**大多数功能仿 new-api 保迁移习惯，
+new-api 做得差的点必须做得更好**）：
+
+1. **成本价与销售价分离**：
+   - 成本层：模型官方价（来自价源同步）× 渠道成本折扣（`gateway_channels.cost_discount`，渠道商给的折扣如官方 6 折）
+   - 销售层：售价 = 官方价 × 全局加价率（默认策略）| 每模型覆盖价 | × 用户分组倍率
+   - 每笔用量日志同时记成本与收入 → 管理台**毛利看板**（按模型/渠道/用户维度）——商业站长真正的刚需，new-api 没有
+2. **官方价源分层同步**（替代 new-api 的抄站倍率）：
+   - 内置快照：构建时从 LiteLLM 社区价格库（`model_prices_and_context_window.json`，事实标准）生成，开箱即有全量模型价
+   - 在线同步源（可配多源+优先级，module-infra Job 定时拉取）：LiteLLM 价格库、OpenRouter `/api/v1/models`（含实时价格）、上游渠道 models 接口自带价格的（OpenRouter/SiliconFlow）
+   - 同步流程：拉取 → **差异预览**（新模型/涨降价 diff 列表）→ 管理员确认应用（可开自动应用）
+3. **价格变更审计**：`gateway_price_revisions` 记录每次变价（来源/前后值/操作人），计费争议可追溯
+4. **未定价模型兜底策略**（全局配置三选一）：拒绝请求 | 按全局默认价 | 放行并告警
+5. 借鉴清单：one-hub 的价格更新 UI、OpenRouter 的价目 API 形态；后续发现更好的商业中转站实践持续吸收
+
 ### 决策 C：用量以上游 usage 字段为准
 
 流式请求向上游注入 `stream_options.include_usage`（OpenAI 兼容）/ 解析
@@ -162,15 +180,17 @@ message_start/content_block_delta 序列 ↔ OpenAI chunk ↔ Gemini streamGener
 
 | 表 | 关键字段 | 说明 |
 |----|---------|------|
-| `gateway_channels` | type、name、base_url、group、models(JSON)、model_mapping(JSON)、param_override(JSON)、priority、weight、status、timeout、proxy、settings(JSON) | 渠道 |
+| `gateway_channels` | type、name、base_url、group、models(JSON)、model_mapping(JSON)、param_override(JSON)、priority、weight、status、timeout、proxy、cost_discount、settings(JSON) | 渠道（cost_discount 用于毛利核算） |
 | `gateway_channel_keys` | channel_id、key(加密存储)、status、fail_count、last_error | 渠道多 Key，逐 Key 禁用（优于 new-api 换行分隔） |
 | `gateway_tokens` | user_id、key_hash、key_display、name、quota_budget、quota_used、expires_at、allowed_models(JSON)、allowed_ips(JSON)、group_override、status | 用户 API 令牌 |
-| `gateway_model_prices` | model、input_price、output_price、cache_read_price、cache_write_price、per_request_price、mode(token/次) | 定价（USD/1M） |
+| `gateway_model_prices` | model、input_price、output_price、cache_read_price、cache_write_price、per_request_price、mode(token/次)、sale_override(JSON)、source | 官方价 + 售价覆盖（USD/1M，决策 B2） |
+| `gateway_price_sources` | type(litellm/openrouter/upstream)、url、priority、enabled、auto_apply、last_sync_at | 价源同步配置 |
+| `gateway_price_revisions` | model、field、old_value、new_value、source、applied_by、applied_at | 价格变更审计 |
 | `gateway_groups` | name、ratio、description | 用户分组倍率 |
 | `gateway_quota_accounts` | user_id、balance(μUSD BIGINT) | 额度账户 |
 | `gateway_quota_transactions` | user_id、type(grant/consume/refund/redeem)、amount、balance_after、ref | 额度台账 |
 | `gateway_redemptions` | code、amount、status、used_by、used_at | 兑换码 |
-| `gateway_usage_logs` | user_id、token_id、channel_id、request_model、upstream_model、prompt/completion/cache tokens、cost、ttfb_ms、latency_ms、stream、status、error_code | 逐请求日志 |
+| `gateway_usage_logs` | user_id、token_id、channel_id、request_model、upstream_model、prompt/completion/cache tokens、charged(收入)、cost(成本)、ttfb_ms、latency_ms、stream、status、error_code | 逐请求日志（收入/成本双记，支撑毛利看板） |
 
 与现有模块的关系：
 
@@ -215,7 +235,7 @@ message_start/content_block_delta 序列 ↔ OpenAI chunk ↔ Gemini streamGener
 
 - 仪表盘：请求量 / tokens / 消费 / 错误率 / TTFB p50·p95，按模型·渠道·用户维度
 - 渠道管理：CRUD、多 Key、连通性测试、模型映射编辑、启停、健康状态板
-- 定价管理：模型价格表（支持从预置 JSON 导入）、分组倍率
+- 定价管理：模型价格表、价源同步（LiteLLM/OpenRouter，差异预览确认）、全局加价率与每模型售价覆盖、分组倍率、变价审计、**毛利看板**
 - 令牌管理（全局视角）、用户额度调整、兑换码生成
 - 用量日志：筛选 / 导出
 
@@ -253,7 +273,7 @@ UI 组件一律走各自 front-kit（shadcn-ui）；i18n v1 中文优先，英�
 | M0 | 框架前置：服务端流式响应（Ktor）、client 长流压测、IR 扩展审计、gateway 路由组 |
 | M1 | MVP：TokenGuard、渠道/令牌/定价/额度/日志、ChatCompletions + Embeddings 同协议透传、路由与重试、admin 最小管理页 |
 | M2 | 跨协议：Anthropic / Gemini 原生入站 + IR 矩阵全通、Claude Code 实测通过 |
-| M3 | 扩展端点：Responses / Images / Audio / Rerank、健康巡检、限流完善 |
+| M3 | 扩展端点：Responses / Images / Audio / Rerank、健康巡检、限流完善、价源同步（内置快照 M1 先行） |
 | M4 | neton-application-client 底座搭建 + NewGate-console 用户控制台 + 充值打通 module-payment + 兑换码 |
 | M5 | 发行：文档站、docker-compose、多节点（Redis）、new-api 数据迁移工具（β）、英文 i18n |
 

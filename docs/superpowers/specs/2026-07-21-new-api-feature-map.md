@@ -83,7 +83,7 @@ Replicate（❌）、Cloudflare（A 类模板）、PaLM/Dummy（废弃 ❌）、
 | channel_affinity_cache | 渠道亲和缓存 | 🧭（多节点优化，v2） |
 | token 管理（全局） | 令牌 CRUD/搜索/批量 | ✅ |
 | pricing / ratio_config | 模型定价、倍率配置 | ✅（按 spec 决策 B 的 USD/1M 模型） |
-| ratio_sync | 从上游/同类站同步倍率 | ✅ 变体：价格表 JSON 导入导出 |
+| ratio_sync | 从同类站抄倍率表 | ✅ **重设计**（spec 决策 B2）：官方价源同步（LiteLLM 价格库/OpenRouter API）+ 差异预览 + 成本/售价分离 + 毛利看板 |
 | model_meta / vendor_meta / model_sync / missing_models | 模型元数据、厂商图标、缺失模型检测 | ✅ 精简版（模型目录表）；厂商图标 🔜 |
 | log / usedata / stat | 用量日志、消耗统计、看板 | ✅ |
 | rankings | 消耗排行榜 | 🔜 |
