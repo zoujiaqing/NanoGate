@@ -157,3 +157,19 @@ Replicate（❌）、Cloudflare（A 类模板）、PaLM/Dummy（废弃 ❌）、
 4. **订阅制（subscription plans）明确为 v2 评估项**——new-api 已把它做成一等公民（4 个支付网关 × 订阅），说明市场有需求，但会显著复杂化计费模型，v1 坚持纯按量
 5. **国产厂商策略写明**：一律走 OpenAI 兼容 + 预设模板，永不做原生协议适配（防止长尾腐蚀）
 6. **渠道预设模板机制加入 v1**：内置常用厂商（DeepSeek/Moonshot/智谱/通义/硅基流动等）的 base_url 与模型清单，弥补「只有 4 个适配器」相对 56 个渠道类型的体验差
+
+## 8. 补遗（setting/、middleware/、electron/ 二次核查发现）
+
+| new-api 功能 | 说明 | NewGate |
+|---|---|---|
+| sensitive.go 敏感词过滤 | 请求/响应内容命中词表拦截 | 🔜 v1.1（合规运营刚需，gateway 管线加过滤阶段） |
+| turnstile-check | Cloudflare Turnstile 注册/登录人机校验 | 🔜 v1.1（防撸羊毛，member 注册加校验点） |
+| secure_verification + 2FA + passkey | 敏感操作二次验证 | 🧭 v2 安全包（与 passkey/2FA 一并） |
+| status_code_ranges | 按上游状态码范围定制重试/禁用规则 | ✅ 并入 v1 重试条件配置 |
+| auto_group / user_usable_group | 用户自动分组、可用分组开放 | 🔜 v1.1 |
+| chat.go 聊天面板快捷链接 | 一键接 ChatGPT-Next-Web 等第三方面板 | 🧭（playground 已覆盖主场景） |
+| console_setting / header_nav 主题与导航定制 | 站点主题、自定义导航 | 🔜 基础版（站点名/Logo/首页内容配置），完整主题系统 🧭 |
+| request_body_limit / email-verification-rate-limit | 请求体上限、验证码限流 | ✅ spec 已含（32MB 上限、限流体系） |
+| reasoning 设置 | thinking 内容转换策略 | ✅ 归入 IR 审计项 2 |
+| electron/ 桌面客户端 | 打包桌面 App | ❌（Web 优先，无此规划） |
+| deployment / codex_usage / video_proxy | 托管部署管理、Codex 用量、视频代理 | ❌（niche，与不做的任务型 API 绑定） |
