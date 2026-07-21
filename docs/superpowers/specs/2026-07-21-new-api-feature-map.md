@@ -147,7 +147,7 @@ Replicate（❌）、Cloudflare（A 类模板）、PaLM/Dummy（废弃 ❌）、
 - **admin 区**：channels、users、system-settings、redemption-codes、system-info、performance-metrics、dashboard(管理视角)
 - **console 区（app）**：keys、wallet、usage-logs、profile、subscriptions(🧭)、dashboard(个人视角)、auth
 - **公开区**：home、models、pricing、rankings、about、legal、chat/playground(🔜)、setup(🔜)、errors
-- **NewGate-front 落位**：全部进 `packages/front-module-gateway`（admin+console 页面）；公开页进 shell 的公开路由
+- **落位（2026-07-21 决策：双前端）**：admin 区页面进 **NewGate-front**（fork neton-application-front）的 `front-module-gateway`；console 区 + 公开区进 **NewGate-console**（fork 新建底座 neton-application-client，React 19 + shadcn-ui，member 账号体系，云厂商控制台风格）
 
 ## 7. spec 修订建议（待确认后并入 spec）
 
