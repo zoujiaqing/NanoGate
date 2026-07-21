@@ -250,9 +250,8 @@ UI 组件一律走 front-kit；i18n v1 中文优先，英文包 M5 补齐。
 
 ## 13. 开放问题
 
-1. **开源许可与依赖开放**（最重要）：NewGate 要让别人部署，则 `neton` 框架、
-   module-member、module-payment 目前均为 Private 许可，必须一并开源（或至少发布二进制/maven 构件）。
-   建议 NewGate 用 Apache-2.0；框架许可需要 owner 决策
+1. ~~开源许可与依赖开放~~ **已决策（2026-07-21）**：member / payment 等均为自有项目，
+   随 NewGate 一并采用开源许可发布；NewGate 建议 Apache-2.0
 2. new-api 迁移工具范围：只迁渠道/定价，还是含用户（密码 bcrypt 可移植）与额度
 3. Bedrock / Vertex 进 v1.1 的优先级
 4. Realtime WebSocket 代理是否永久排除
