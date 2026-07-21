@@ -131,6 +131,12 @@ new-api 做得差的点必须做得更好**）：
 SiliconFlow、Ollama、vLLM 等绝大多数）、`Anthropic`、`Gemini`、`Azure OpenAI`
 （ChatCompletions 语义 + 不同 URL/认证头）。Bedrock / Vertex 列入 v1.1。
 
+**国产厂商接入形态（2026-07 查证）**：兼容模式已是行业标准且是官方推荐路径——不仅全员提供
+OpenAI 兼容端点，DeepSeek（`api.deepseek.com/anthropic`）、智谱 GLM、Qwen、Kimi、MiniMax、
+StepFun 等还官方提供 **Anthropic 兼容端点**（Claude Code 生态带动）。因此 NewGate 的
+Anthropic 适配器天然兼作国产上游适配器；**渠道预设模板须为每家内置双端点**
+（OpenAI 兼容 + Anthropic 兼容 base_url 及推荐模型映射）。私有原生协议为遗留形态，坚持不做。
+
 ### 决策 E：v1 服务端适配器只要求 Ktor CIO
 
 服务端流式写出（M0）先在 KtorHttpAdapter 落地（Ktor 原生支持 `respondBytesWriter`）。
