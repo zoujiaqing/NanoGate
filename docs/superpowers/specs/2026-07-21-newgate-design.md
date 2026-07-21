@@ -44,8 +44,8 @@ NewGate 是一个**通用开源 LLM API 中转站（网关）发行版**，对�
 | `neton-application-module-member` | C 端用户体系 | sibling include，复用 |
 | `neton-application-module-payment` | 充值支付 | sibling include，复用 |
 | `NewGate-front` | **管理台**前端发行版：shell + front-module-system + **front-module-gateway**（admin 页面） | fork 自 neton-application-front |
-| `neton-application-client` | 生态新增：**C 端用户控制台通用底座**（React 19 + shadcn-ui，member 账号体系/JWT 对接 `app` 组，界面风格对标阿里云·腾讯云·AWS 控制台） | 新建 base 项目 |
-| `NewGate-console` | 用户控制台 + 公开页发行版（余额/充值/令牌/用量/模型广场） | fork 自 neton-application-client |
+| `neton-application-client` | 生态新增：**C 端用户控制台通用底座**（React 19 + shadcn-ui + Next.js SSR，member 账号体系对接 `app` 组，静态导航，界面对标云厂商控制台）——**已建成**（2026-07-22，fork 自 front 底座改造，构建/typecheck 通过） | 位于 ~/projects/Neton/ |
+| `newgate-client` | 用户控制台 + 公开页发行版（余额/充值/令牌/用量/模型广场），未来 C 端模块拆分为 `neton-application-client-xxx` canonical 仓 | fork 自 neton-application-client |
 
 ### 2.2 路由组（四组）
 
