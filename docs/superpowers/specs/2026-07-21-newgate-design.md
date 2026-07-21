@@ -37,7 +37,9 @@ NewGate 是一个**通用开源 LLM API 中转站（网关）发行版**，对�
 | `NewGate` | 后端发行版：application 入口 + module-system + module-infra + **module-gateway**（新增，in-tree） | fork 自 neton-application |
 | `neton-application-module-member` | C 端用户体系 | sibling include，复用 |
 | `neton-application-module-payment` | 充值支付 | sibling include，复用 |
-| `NewGate-front` | 前端发行版：shell + front-module-system + **front-module-gateway**（新增） | fork 自 neton-application-front |
+| `NewGate-front` | **管理台**前端发行版：shell + front-module-system + **front-module-gateway**（admin 页面） | fork 自 neton-application-front |
+| `neton-application-client` | 生态新增：**C 端用户控制台通用底座**（React 19 + shadcn-ui，member 账号体系/JWT 对接 `app` 组，界面风格对标阿里云·腾讯云·AWS 控制台） | 新建 base 项目 |
+| `NewGate-console` | 用户控制台 + 公开页发行版（余额/充值/令牌/用量/模型广场） | fork 自 neton-application-client |
 
 ### 2.2 路由组（四组）
 
@@ -199,11 +201,17 @@ message_start/content_block_delta 序列 ↔ OpenAI chunk ↔ Gemini streamGener
 - 额度不足：`402/403` + 协议内 error（quota 类 code）；限流：`429` + Retry-After
 - 流中断：已产生的用量按上游最后一次 usage 或估算计费；日志记 status=partial
 
-## 9. 前端（NewGate-front）
+## 9. 前端（双发行版：管理台 + 用户控制台）
 
-新增 `packages/front-module-gateway`，通过 front-contract 注册两个区域的页面：
+**决策（2026-07-21）**：管理台与用户控制台分为两个独立前端项目，不共用一个 shell：
 
-**管理台（admin 菜单）：**
+- **NewGate-front**（fork neton-application-front）：仅管理台，B 端信息密度风格，登录走 `admin` 组（管理员 JWT）
+- **neton-application-client**（新建生态底座）→ **NewGate-console**（fork）：C 端用户控制台 + 公开页，
+  登录走 `app` 组（member JWT/HttpOnly Cookie），界面风格对标云厂商控制台（阿里云/腾讯云/AWS）与 new-api 用户端；
+  架构沿用 neton-application-front 的 monorepo 模式（React 19 + Next.js + shadcn-ui + 模块契约），
+  差异在账号体系（member 而非 system 用户）、导航（产品化侧边栏而非后端菜单驱动 RBAC）、公开路由（未登录可访问首页/模型广场/定价/文档）
+
+**管理台 NewGate-front（admin 菜单）：**
 
 - 仪表盘：请求量 / tokens / 消费 / 错误率 / TTFB p50·p95，按模型·渠道·用户维度
 - 渠道管理：CRUD、多 Key、连通性测试、模型映射编辑、启停、健康状态板
@@ -211,14 +219,15 @@ message_start/content_block_delta 序列 ↔ OpenAI chunk ↔ Gemini streamGener
 - 令牌管理（全局视角）、用户额度调整、兑换码生成
 - 用量日志：筛选 / 导出
 
-**用户控制台（app 菜单，member 登录）：**
+**用户控制台 NewGate-console（member 登录）：**
 
 - 概览：余额、本月消费、用量曲线
 - 我的令牌：创建（一次性展示）、限额、模型/IP 白名单、启停
 - 充值：module-payment 收银台 + 兑换码兑换
 - 用量明细
+- 公开页（未登录）：首页、模型广场/价目表、关于
 
-UI 组件一律走 front-kit；i18n v1 中文优先，英文包 M5 补齐。
+UI 组件一律走各自 front-kit（shadcn-ui）；i18n v1 中文优先，英文包 M5 补齐。
 
 ## 10. 部署形态
 
@@ -245,7 +254,7 @@ UI 组件一律走 front-kit；i18n v1 中文优先，英文包 M5 补齐。
 | M1 | MVP：TokenGuard、渠道/令牌/定价/额度/日志、ChatCompletions + Embeddings 同协议透传、路由与重试、admin 最小管理页 |
 | M2 | 跨协议：Anthropic / Gemini 原生入站 + IR 矩阵全通、Claude Code 实测通过 |
 | M3 | 扩展端点：Responses / Images / Audio / Rerank、健康巡检、限流完善 |
-| M4 | 用户控制台 + 充值打通 module-payment + 兑换码 |
+| M4 | neton-application-client 底座搭建 + NewGate-console 用户控制台 + 充值打通 module-payment + 兑换码 |
 | M5 | 发行：文档站、docker-compose、多节点（Redis）、new-api 数据迁移工具（β）、英文 i18n |
 
 ## 13. 开放问题
