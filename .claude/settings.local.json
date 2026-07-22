@@ -5,7 +5,9 @@
       "Bash(git init *)",
       "Bash(git add *)",
       "Bash(git commit -q -m 'docs: NewGate 设计文档（对标 new-api 的 LLM 中转站发行版） *)",
-      "Bash(git commit -q -m 'docs: 许可开放问题已决策——全生态随 NewGate 开源 *)"
+      "Bash(git commit -q -m 'docs: 许可开放问题已决策——全生态随 NewGate 开源 *)",
+      "Bash(git commit -q -m 'docs: M0 框架流式前置实施计划 *)",
+      "WebSearch"
     ]
   }
 }
