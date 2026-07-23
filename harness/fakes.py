@@ -52,6 +52,8 @@ class H(BaseHTTPRequestHandler):
                 self._json(429, {"error": "rate limited"}); return
             if MODE == "bigstream":
                 self._bigstream(); return
+            if MODE == "midabort":
+                self._midabort(); return
             # ok
             if stream:
                 self._okstream(body.get("model", "?"))
@@ -80,6 +82,18 @@ class H(BaseHTTPRequestHandler):
         tail = {"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 500}}
         self.wfile.write(f"data: {json.dumps(tail)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+
+    def _midabort(self):
+        # 上游中途断流：发 2 个 SSE 块后强行关闭连接（不发 usage/[DONE]），模拟上游 midstream abort
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        for i in range(2):
+            self.wfile.write(f"data: {json.dumps({'choices':[{'delta':{'content':f't{i} '}}]})}\n\n".encode())
+            self.wfile.flush(); time.sleep(0.1)
+        self.close_connection = True
+        try:
+            self.connection.close()
+        except Exception:
+            pass
 
     def _bigstream(self):
         # 大块填满 socket 缓冲，客户端断连后下一次 write 立即失败（触发断连检测）
