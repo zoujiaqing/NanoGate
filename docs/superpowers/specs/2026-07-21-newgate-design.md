@@ -8,7 +8,8 @@
 > - **已落地**：三协议（OpenAI/Anthropic/Gemini）文本聊天核心子集 3×3 baseline E2E（含基础 tool calling/SSE/usage）；
 >   渠道路由/权重/重试（含流式首字节前重试）、多 Key 自动禁用/恢复、sk- 令牌、μUSD 账务闭环、管理台原型
 > - **偏差**：跨协议实际走 gateway 产品侧 JSON codec（非本文 §4 写的 neton-ai IR，决策 A 已改）；
->   额度不足实际返回 429（非 §8 的 402/403）；gateway 运行时仅 embed PostgreSQL migration（MySQL/SQLite 脚本已备未接）
+>   额度不足实际返回 429（非 §8 的 402/403）；**数据库范围收窄为仅 PostgreSQL/MySQL（不含 SQLite）**，
+>   迁移嵌入方言跟随 `neton.database.driver`（默认 postgres）分构建产物，当前 PostgreSQL 已验证、MySQL 为预留未验证
 > - **未实现**：Responses/Images/Audio/Rerank/真实 models 列表；原生认证载体（x-api-key/x-goog-api-key）；
 >   Azure OpenAI；Key 加密存储；IP 白名单校验；RPM/TPM 限流；价源同步；用户控制台；充值兑换；一键部署收尾
 > - 功能地图 `2026-07-21-new-api-feature-map.md` 的 ✅ 表示「规划进 v1」而非「已完成」；统计（56/26）与本地
@@ -27,7 +28,7 @@ NewGate 是一个**通用开源 LLM API 中转站（网关）发行版**，对�
 2. 完整的渠道管理：多渠道、多 Key、权重负载均衡、失败重试、自动禁用与健康恢复
 3. 完整的商业化能力：用户注册、API 令牌、按 token 计费、充值、兑换码、分组倍率
 4. 管理后台 + 普通用户控制台，双端同一前端 shell
-5. 单二进制 + SQLite 零配置起步，MySQL/PostgreSQL 生产部署，别人可一键部署
+5. 单二进制生产部署（PostgreSQL 或 MySQL，各为一种构建产物；不支持 SQLite），别人可一键部署
 
 **v1 非目标（明确不做）：**
 
@@ -274,8 +275,10 @@ UI 组件一律走各自 front-kit（shadcn-ui）；i18n v1 中文优先，英�
 
 ## 10. 部署形态
 
-- 单二进制（~10MB scratch 镜像）+ SQLite：零配置试用
-- MySQL / PostgreSQL：生产；SQL 迁移脚本按现有 `sql/{mysql,postgresql,sqlite}/` 约定
+- 数据库仅支持 **PostgreSQL / MySQL**（不支持 SQLite）。sqlx4k 的 Native 驱动编译期单选，故 PostgreSQL 与
+  MySQL 各为一种构建产物（`-Pneton.database.driver=postgres`（默认）/`=mysql`），分别发布二进制/镜像标签；
+  启动时校验配置库类型与编译驱动一致。SQL 迁移脚本按 `sql/{postgresql,mysql}/` 约定，嵌入方言跟随驱动
+- 单二进制（~10MB scratch 镜像）：生产部署；当前 PostgreSQL 已端到端验证，MySQL 预留待真实 harness 验证
 - Redis：可选，仅多节点限流/共享计数需要
 - 发布物：GitHub Releases 预编译二进制（linuxX64/arm64、macOS）+ Docker 镜像 + docker-compose（后端 + 前端 + MySQL）
 - 前端独立部署（Next.js standalone），`NETON_BACKEND_URL` 指向后端

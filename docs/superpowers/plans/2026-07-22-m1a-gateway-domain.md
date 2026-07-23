@@ -1,5 +1,10 @@
 # M1a：module-gateway 领域基础 — 实施计划
 
+> ⚠️ **数据库范围已被最新设计取代**：NewGate 仅支持 **PostgreSQL / MySQL**，**不支持 SQLite**。本历史计划中一切
+> 以 SQLite 为验收路径的步骤（SQLite 零配置建库、`sql/sqlite/` 建表、SQLite 冒烟等）**不再执行**。sqlx4k Native 驱动
+> 编译期单选，PostgreSQL 与 MySQL 各为一种构建产物（`-Pneton.database.driver=postgres`（默认）/`=mysql`）。
+> 详见 `2026-07-21-newgate-design.md` §10 与 gateway `SPEC.md`「数据库支持范围」。（历史计划正文不改写，仅此声明为准。）
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 建立 `neton-application-module-gateway` canonical 仓库：8 张领域表 + admin CRUD API + sk- 令牌体系 + gateway 路由组接线（TokenGuard），为 M1b 中转引擎提供全部领域基础。
