@@ -2,3 +2,7 @@ new-api/
 newgate/
 newgate-front/
 newgate-client/
+
+# harness 运行产物（隔离库 workdir、app/migrate 日志），不入库
+harness/logs/
+harness/logs/work-*/
