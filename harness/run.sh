@@ -191,5 +191,55 @@ nresp=$(printf '%s\n' "$codes" | grep -cE '^[0-9]{3}')
   && pass "并发首建账户唯一(rows=1)、无唯一键崩溃(500=0)、20 请求全部干净响应" \
   || fail "首建并发错: accountRows=${rows} http500=${n500} 响应数=${nresp} codes=$(printf '%s' "$codes" | tr '\n' ' ')"
 
+# ══ S8 结算幂等（ref 唯一约束防重复扣费）══
+echo "[S8] 结算幂等唯一约束"
+seed_reset; fake ok 9900; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-idem','openai_compatible','http://127.0.0.1:9900','default','m-idem',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-idem'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-idem','1','1','0','0','manual',0,0,0);" >/dev/null
+curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-idem","messages":[]}'; sleep 1
+ref=$(q "SELECT ref FROM gateway_quota_transactions WHERE type='consume' ORDER BY id DESC LIMIT 1")
+b1=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+# 重放：手动以同一 ref 再插一条台账 → 唯一约束应拒绝（模拟重试/outbox 重放不重复扣）
+duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO gateway_quota_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
+cnt=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$ref'")
+b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+{ echo "$duperr" | grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref"; } && rejected=1 || rejected=0
+[ -n "$ref" ] && [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
+  && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
+  || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
+
+# ══ S9 上游 midstream abort（收尾不崩、服务存活）══
+echo "[S9] 上游 midstream abort"
+seed_reset; fake midabort 9901; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-mid','openai_compatible','http://127.0.0.1:9901','default','m-mid',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-mid'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-mid','1','1','0','0','manual',0,0,0);" >/dev/null
+mchunks=$(curl -sN --max-time 10 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","stream":true,"messages":[]}' 2>/dev/null | grep -c "^data:")
+sleep 2
+# 服务存活：断流后仍能立即服务新请求
+fake ok 9902; sleep 1
+q "UPDATE gateway_channels SET base_url='http://127.0.0.1:9902' WHERE name='c-mid'" >/dev/null
+alive=$(timeout 8 curl -s --max-time 8 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","messages":[]}')
+[ "$mchunks" -ge 1 ] && [ "$alive" = "200" ] \
+  && pass "上游中途断流收到 $mchunks 块、收尾不崩、服务存活(新请求 200)" \
+  || fail "midstream abort 处理异常: chunks=$mchunks 存活码=$alive"
+
+# ══ S10 429 → 渠道 cooldown 退避并排除 ══
+echo "[S10] 429 渠道 cooldown"
+seed_reset; fake err429 9903; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,cooldown_until,deleted,created_at,updated_at) VALUES ('c-cd','openai_compatible','http://127.0.0.1:9903','default','m-cd',1,1,1,3000,3000,'1.0',0,0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-cd'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-cd','1','1','0','0','manual',0,0,0);" >/dev/null
+# 首请求：唯一渠道返回 429 → 无其它候选 → 503，但记录 cooldown
+curl -s --max-time 10 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-cd","messages":[]}'; sleep 1
+cd=$(q "SELECT cooldown_until FROM gateway_channels WHERE name='c-cd'")
+# 冷却期内二次请求：该渠道被排除 → 候选为空 → 503 no_available_channel（且 Key 未被永久禁用）
+code2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-cd","messages":[]}')
+kstatus=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID c-cd)")
+[ -n "$cd" ] && [ "$cd" -gt 0 ] && [ "$code2" = "503" ] && [ "$kstatus" = "1" ] \
+  && pass "429 → 渠道 cooldown(until=$cd)、冷却期内被排除(503)、Key 未永久禁用(status=1)" \
+  || fail "429 cooldown 异常: until=$cd 二次码=$code2 keyStatus=$kstatus"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
