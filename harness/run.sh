@@ -209,21 +209,31 @@ b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
   && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
   || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
 
-# ══ S9 上游 midstream abort（收尾不崩、服务存活）══
+# ══ S9 上游 midstream abort（真实 partial 语义）══
+# 上游发 2 块后关连接、未发 [DONE] → 网关须判 PARTIAL：partial 日志、per-request 价四项账务一致、Key 计失败、
+# 不伪造 [DONE]、上游在途归零、请求有限时间结束。
 echo "[S9] 上游 midstream abort"
 seed_reset; fake midabort 9901; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-mid','openai_compatible','http://127.0.0.1:9901','default','m-mid',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-mid'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-mid','1','1','0','0','manual',0,0,0);" >/dev/null
-mchunks=$(curl -sN --max-time 10 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","stream":true,"messages":[]}' 2>/dev/null | grep -c "^data:")
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-mid','0','0','0','0',3000,'manual',0,0,0);" >/dev/null
+t0=$(date +%s); resp=$(curl -sN --max-time 10 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","stream":true,"messages":[]}' 2>/dev/null); t1=$(date +%s)
 sleep 2
-# 服务存活：断流后仍能立即服务新请求
-fake ok 9902; sleep 1
-q "UPDATE gateway_channels SET base_url='http://127.0.0.1:9902' WHERE name='c-mid'" >/dev/null
-alive=$(timeout 8 curl -s --max-time 8 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","messages":[]}')
-[ "$mchunks" -ge 1 ] && [ "$alive" = "200" ] \
-  && pass "上游中途断流收到 $mchunks 块、收尾不崩、服务存活(新请求 200)" \
-  || fail "midstream abort 处理异常: chunks=$mchunks 存活码=$alive"
+mchunks=$(printf '%s\n' "$resp" | grep -c "^data:")
+fakedone=$(printf '%s\n' "$resp" | grep -c "\[DONE\]")
+st=$(q "SELECT status FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
+lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
+ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'usage:%' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+fc=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$(CID c-mid)")
+inflight=$(curl -s --max-time 2 "http://127.0.0.1:9901/inflight" | python3 -c "import sys,json;print(json.load(sys.stdin).get('inflight',-1))" 2>/dev/null)
+dur=$((t1 - t0))
+[ "$mchunks" -ge 1 ] && [ "$fakedone" = "0" ] && [ "$st" = "partial" ] \
+  && [ "$lc" = "3000" ] && [ "$lc" = "$ta" ] && [ "$lc" = "$bd" ] && [ "$lc" = "$tu" ] \
+  && [ "$fc" -ge 1 ] && [ "$inflight" = "0" ] && [ "$dur" -le 10 ] \
+  && pass "midstream partial: 收 ${mchunks} 块无伪造[DONE]、status=partial、四项=${lc} 一致、Key失败=${fc}、在途=0、${dur}s 结束" \
+  || fail "midstream partial 异常: chunks=$mchunks 伪DONE=$fakedone status=$st charged=$lc ta=$ta bd=$bd tu=$tu keyFail=$fc inflight=$inflight dur=${dur}s"
 
 # ══ S10 429 → 渠道 cooldown 退避并排除 ══
 echo "[S10] 429 渠道 cooldown"
