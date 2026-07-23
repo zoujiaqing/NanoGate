@@ -1,7 +1,18 @@
 # NewGate 设计文档
 
-日期：2026-07-21
-状态：待评审
+日期：2026-07-21（2026-07-23 补实现状态说明）
+状态：**目标设计（target）**——本文档描述目标架构与 v1 规划，不代表已实现状态。
+
+> ⚠️ 目标 vs 已实现：本文档是设计目标。真实实现进度以各模块 SPEC 的「已落地」章节为准
+> （gateway 见 `neton-application-module-gateway/SPEC.md`）。截至 2026-07-23 的实际状态：
+> - **已落地**：三协议（OpenAI/Anthropic/Gemini）文本聊天核心子集 3×3 baseline E2E（含基础 tool calling/SSE/usage）；
+>   渠道路由/权重/重试（含流式首字节前重试）、多 Key 自动禁用/恢复、sk- 令牌、μUSD 账务闭环、管理台原型
+> - **偏差**：跨协议实际走 gateway 产品侧 JSON codec（非本文 §4 写的 neton-ai IR，决策 A 已改）；
+>   额度不足实际返回 429（非 §8 的 402/403）；gateway 运行时仅 embed PostgreSQL migration（MySQL/SQLite 脚本已备未接）
+> - **未实现**：Responses/Images/Audio/Rerank/真实 models 列表；原生认证载体（x-api-key/x-goog-api-key）；
+>   Azure OpenAI；Key 加密存储；IP 白名单校验；RPM/TPM 限流；价源同步；用户控制台；充值兑换；一键部署收尾
+> - 功能地图 `2026-07-21-new-api-feature-map.md` 的 ✅ 表示「规划进 v1」而非「已完成」；统计（56/26）与本地
+>   new-api checkout（54 渠道常量/23 feature）略有出入，以代码为准
 
 ## 1. 背景与目标
 
