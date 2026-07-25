@@ -37,9 +37,9 @@ trap cleanup EXIT INT TERM
 pass() { echo "  ✅ $1"; PASS=$((PASS+1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
-seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions RESTART IDENTITY;
-  UPDATE gateway_quota_accounts SET balance=100000000, version=version WHERE user_id=1;
-  UPDATE gateway_tokens SET quota_used=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
+seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions,gateway_settlements RESTART IDENTITY;
+  UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
+  UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
 
 fake() { MODE="$1" PORT="$2" python3 "$HERE/fakes.py" >/dev/null 2>&1 & PIDS+=($!); }
 
@@ -50,6 +50,8 @@ echo "[build] linking app…"
 ( cd "$NEWGATE" && ./gradlew :application:linkDebugExecutableMacosArm64 -q ) || { echo "build failed"; exit 1; }
 createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 隔离 workdir：config/ 指向隔离库；app 与 migrate 都从此目录启动（config 相对 CWD 解析）
+# 只保留最近 2 次运行的 work 目录，避免长期跑 harness 占满磁盘
+ls -dt "$LOGS"/work-* 2>/dev/null | tail -n +3 | xargs rm -rf 2>/dev/null
 WORK="$LOGS/work-$$"; mkdir -p "$WORK/config" "$WORK/logs"
 cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
 cat > "$WORK/config/database.conf" <<EOF
@@ -77,7 +79,7 @@ echo "[S1] 并发结算四项不变量"
 seed_reset; fake ok 9990; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-ok','openai_compatible','http://127.0.0.1:9990','default','m-ok',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ok'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-ok','2.5','10','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-ok','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 seq 1 20 | xargs -P 20 -I{} curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ok","messages":[]}'
 sleep 1
 sc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs WHERE user_id=1")
@@ -96,7 +98,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    ('live','openai_compatible','http://127.0.0.1:9990','default','m-fo',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
    ((SELECT id FROM gateway_channels WHERE name='dead'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='live'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-fo','1','1','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-fo','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 n=$(curl -sN --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-fo","stream":true,"messages":[]}' | grep -c "^data:")
 [ "$n" -ge 3 ] && pass "流式 dead→live 重试成功（$n data 行）" || fail "流式重试失败（$n data 行）"
 
@@ -105,10 +107,10 @@ echo "[S3] 非零断连计费 + producer 无残留"
 seed_reset; fake bigstream 9960; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('big','openai_compatible','http://127.0.0.1:9960','default','m-pr',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='big'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-pr','0','0','0','0',5000,'manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-pr','0','0','0','0',5000,5000,'manual',0,0,0);" >/dev/null
 curl -sN --max-time 1 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-pr","stream":true,"messages":[]}' >/dev/null 2>&1; sleep 3
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-pr' ORDER BY id DESC LIMIT 1")
-ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'usage:%' ORDER BY id DESC LIMIT 1")
+ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
 bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$lc" = "5000" ] && [ "$ta" = "5000" ] && [ "$bd" = "5000" ] && [ "$tu" = "5000" ] \
@@ -135,7 +137,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    ('c429','openai_compatible','http://127.0.0.1:9940','default','m-429',1,1,1,3000,3000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
    ((SELECT id FROM gateway_channels WHERE name='c403'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c429'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-403','1','1','0','0','manual',0,0,0),('m-429','1','1','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-403','1','1','0','0',5000,'manual',0,0,0),('m-429','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 for i in 1 2 3 4 5; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-403","messages":[]}'; done
 s403=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID c403)")
 [ "$s403" = "2" ] && pass "403 连续失败 → Key 自动禁用(status=2)" || fail "403 未禁用 Key(status=$s403)"
@@ -149,7 +151,7 @@ seed_reset; fake err500 9930; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('rv','openai_compatible','http://127.0.0.1:9930','default','m-rv',1,1,1,3000,3000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
    ((SELECT id FROM gateway_channels WHERE name='rv'),'auto',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='rv'),'manual',0,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-rv','1','1','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rv','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 for i in 1 2 3 4 5; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-rv","messages":[]}'; done
 JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/gateway/channel/revive/$(CID rv)" -H "Authorization: Bearer $JWT"
@@ -162,7 +164,7 @@ echo "[S6] token 中途删除"
 seed_reset; fake bigstream 9920; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('td','openai_compatible','http://127.0.0.1:9920','default','m-td',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='td'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-td','0','0','0','0',5000,'manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-td','0','0','0','0',5000,5000,'manual',0,0,0);" >/dev/null
 b0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 ( curl -sN --max-time 2 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-td","stream":true,"messages":[]}' >/dev/null 2>&1 ) & CURL_PID=$!
 sleep 0.6; q "DELETE FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'" >/dev/null; wait "$CURL_PID"; sleep 2
@@ -182,7 +184,7 @@ seed_reset; fake ok 9910; sleep 1
 q "DELETE FROM gateway_quota_accounts WHERE user_id=1;
    INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-new','openai_compatible','http://127.0.0.1:9910','default','m-new',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-new'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-new','2.5','10','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-new','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 codes=$(seq 1 20 | xargs -P 20 -I{} curl -s --max-time 15 -o /dev/null -w "%{http_code}\n" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-new","messages":[]}')
 rows=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id=1")
 n500=$(printf '%s\n' "$codes" | grep -c '^500')
@@ -196,7 +198,7 @@ echo "[S8] 结算幂等唯一约束"
 seed_reset; fake ok 9900; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-idem','openai_compatible','http://127.0.0.1:9900','default','m-idem',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-idem'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-idem','1','1','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-idem','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-idem","messages":[]}'; sleep 1
 ref=$(q "SELECT ref FROM gateway_quota_transactions WHERE type='consume' ORDER BY id DESC LIMIT 1")
 b1=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -208,6 +210,13 @@ b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 [ -n "$ref" ] && [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
   && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
   || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
+# settlement 终态：FINALIZED + 预留归零（V004 核心不变量）
+st=$(q "SELECT status FROM gateway_settlements ORDER BY id DESC LIMIT 1")
+rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+[ "$st" = "FINALIZED" ] && [ "$rb" = "0" ] && [ "$qr" = "0" ] \
+  && pass "settlement 终态 FINALIZED、预留归零(account=$rb token=$qr)" \
+  || fail "settlement 终态错: status=$st reservedBalance=$rb quotaReserved=$qr"
 
 # ══ S9 上游 midstream abort（真实 partial 语义）══
 # 上游发 2 块后关连接、未发 [DONE] → 网关须判 PARTIAL：partial 日志、per-request 价四项账务一致、Key 计失败、
@@ -216,14 +225,14 @@ echo "[S9] 上游 midstream abort"
 seed_reset; fake midabort 9901; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-mid','openai_compatible','http://127.0.0.1:9901','default','m-mid',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-mid'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-mid','0','0','0','0',3000,'manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-mid','0','0','0','0',3000,5000,'manual',0,0,0);" >/dev/null
 t0=$(date +%s); resp=$(curl -sN --max-time 10 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-mid","stream":true,"messages":[]}' 2>/dev/null); t1=$(date +%s)
 sleep 2
 mchunks=$(printf '%s\n' "$resp" | grep -c "^data:")
 fakedone=$(printf '%s\n' "$resp" | grep -c "\[DONE\]")
 st=$(q "SELECT status FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
-ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'usage:%' ORDER BY id DESC LIMIT 1")
+ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
 bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 fc=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$(CID c-mid)")
@@ -240,7 +249,7 @@ echo "[S10] 429 渠道 cooldown"
 seed_reset; fake err429 9903; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,cooldown_until,deleted,created_at,updated_at) VALUES ('c-cd','openai_compatible','http://127.0.0.1:9903','default','m-cd',1,1,1,3000,3000,'1.0',0,0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-cd'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,source,deleted,created_at,updated_at) VALUES ('m-cd','1','1','0','0','manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-cd','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 # 首请求：唯一渠道返回 429 → 无其它候选 → 503，但记录 cooldown
 curl -s --max-time 10 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-cd","messages":[]}'; sleep 1
 cd=$(q "SELECT cooldown_until FROM gateway_channels WHERE name='c-cd'")
