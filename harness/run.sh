@@ -307,5 +307,40 @@ bal=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
   && pass "TTL：RESERVED→RELEASED(释放4000)、UPSTREAM_STARTED→MANUAL_REVIEW(保留6000不退款)、余额未动" \
   || fail "TTL 恢复错: reserved=$s1 started=$s2 action=$ra 剩余预留=$rb 余额=$bal"
 
+# ══ S13 速率限制 RPM ══
+echo "[S13] 速率限制 RPM"
+seed_reset; fake ok 9880; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-rl','openai_compatible','http://127.0.0.1:9880','default','m-rl',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rl'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rl','0','0','0','0',100,5000,'manual',0,0,0);
+   UPDATE gateway_tokens SET rpm_limit=3 WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+codes=""
+for i in 1 2 3 4 5; do
+  c=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-rl","messages":[]}')
+  codes="$codes $c"
+done
+n200=$(echo "$codes" | grep -o "200" | wc -l | tr -d ' ')
+n429=$(echo "$codes" | grep -o "429" | wc -l | tr -d ' ')
+lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+q "UPDATE gateway_tokens SET rpm_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+[ "$n200" = "3" ] && [ "$n429" = "2" ] && [ "$lg" = "3" ] \
+  && pass "RPM=3：前 3 个 200、后 2 个 429、仅 3 条计费（被限流的不调上游）" \
+  || fail "RPM 限流错: codes=${codes} 200=${n200} 429=${n429} 计费条数=${lg}"
+
+# ══ S14 令牌 IP 白名单 ══
+echo "[S14] IP 白名单"
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-ip','openai_compatible','http://127.0.0.1:9880','default','m-ip',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ip'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-ip','0','0','0','0',100,5000,'manual',0,0,0);
+   UPDATE gateway_tokens SET allowed_ips='203.0.113.7' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+deny=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
+allow=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7" -d '{"model":"m-ip","messages":[]}')
+lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+q "UPDATE gateway_tokens SET allowed_ips='' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+[ "$deny" = "403" ] && [ "$allow" = "200" ] && [ "$lg" = "1" ] \
+  && pass "IP 白名单：名单外 403、名单内 200、仅 1 条计费" \
+  || fail "IP 白名单错: 名单外=${deny} 名单内=${allow} 计费条数=${lg}"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
