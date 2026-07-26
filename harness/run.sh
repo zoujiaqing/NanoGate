@@ -342,5 +342,32 @@ q "UPDATE gateway_tokens SET allowed_ips='' WHERE key_hash='${TOKEN_HASH}';" >/d
   && pass "IP 白名单：名单外 403、名单内 200、仅 1 条计费" \
   || fail "IP 白名单错: 名单外=${deny} 名单内=${allow} 计费条数=${lg}"
 
+# ══ S15 /v1/models 真数据 + 原生认证载体 ══
+echo "[S15] /v1/models 与原生认证"
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('c-m1','openai_compatible','http://127.0.0.1:9880','default','gpt-4o,gpt-4o-mini',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-m2','anthropic','http://127.0.0.1:9880','vip','claude-3-5-sonnet',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
+   ((SELECT id FROM gateway_channels WHERE name='c-m1'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-m2'),'k',1,0,0,0,0);" >/dev/null
+models=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH")
+has4o=$(echo "$models" | grep -c '"gpt-4o"')
+hasMini=$(echo "$models" | grep -c '"gpt-4o-mini"')
+hasVip=$(echo "$models" | grep -c 'claude-3-5-sonnet')
+# 令牌白名单收窄后应只剩一个
+q "UPDATE gateway_tokens SET allowed_models='gpt-4o' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+narrowed=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH" | grep -c '"gpt-4o-mini"')
+q "UPDATE gateway_tokens SET allowed_models='' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+[ "$has4o" = "1" ] && [ "$hasMini" = "1" ] && [ "$hasVip" = "0" ] && [ "$narrowed" = "0" ] \
+  && pass "/v1/models 返回可用模型、排除非本组(vip)、遵守令牌白名单" \
+  || fail "/v1/models 错: gpt-4o=${has4o} mini=${hasMini} vip泄漏=${hasVip} 白名单后mini=${narrowed} body=${models}"
+# 三家原生认证载体都应能通过
+ck=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-api-key: ${TOKEN_PLAINTEXT}")
+gk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-goog-api-key: ${TOKEN_PLAINTEXT}")
+bad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-api-key: sk-wrong-key")
+[ "$ck" = "200" ] && [ "$gk" = "200" ] && [ "$bad" != "200" ] \
+  && pass "原生认证载体：x-api-key=200、x-goog-api-key=200、错误 key 被拒(${bad})" \
+  || fail "原生认证错: x-api-key=${ck} x-goog-api-key=${gk} 错误key=${bad}"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
