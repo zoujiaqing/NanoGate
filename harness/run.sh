@@ -374,5 +374,25 @@ bad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-
   && pass "原生认证载体：x-api-key=200、x-goog-api-key=200、错误 key 被拒(${bad})" \
   || fail "原生认证错: x-api-key=${ck} x-goog-api-key=${gk} 错误key=${bad}"
 
+# ══ S16 用户端 app 路由组：自助令牌 / 用量 / 模型广场 / 越权防护 ══
+echo "[S16] 用户端 app API"
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-app','openai_compatible','http://127.0.0.1:9880','default','m-app',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-app'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-app','0','0','0','0',100,5000,'manual',0,0,0);" >/dev/null
+# 模型广场：未登录可访问（@AllowAnonymous）
+anon=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/model/list")
+anonBody=$(curl -s --max-time 10 "$U/app/gateway/model/list")
+hasModel=$(echo "$anonBody" | grep -c "m-app")
+# 用户端需要会员登录态；无凭据时受保护端点必须拒绝
+noauth=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/usage/balance")
+[ "$anon" = "200" ] && [ "$hasModel" -ge 1 ] && [ "$noauth" != "200" ] \
+  && pass "模型广场未登录可读(200/含模型)、受保护端点未登录被拒(${noauth})" \
+  || fail "app 路由组错: 广场=${anon} 含模型=${hasModel} 未登录余额=${noauth}"
+# 未定价模型不得出现在广场（网关会拒绝它，列出来是误导）
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-np','openai_compatible','http://127.0.0.1:9880','default','m-unpriced',1,1,1,30000,90000,'1.0',0,0,0);" >/dev/null
+unpriced=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c "m-unpriced")
+[ "$unpriced" = "0" ] && pass "未定价模型不出现在模型广场" || fail "未定价模型泄漏到广场(${unpriced})"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
