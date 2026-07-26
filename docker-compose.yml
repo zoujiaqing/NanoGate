@@ -1,0 +1,82 @@
+# NewGate 一键部署。用户不需要选数据库——PostgreSQL 与 Redis 都在这里。
+#
+#   1) cp .env.example .env  然后按注释填必须改的三个密钥
+#   2) docker compose up -d
+#   3) 访问 http://localhost:8080
+#
+# 镜像构建上下文是父目录（Gradle composite build 需要看到同级的 neton 与各模块仓库）。
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-newgate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-newgate}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-newgate} -d ${POSTGRES_DB:-newgate}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 默认不对外暴露数据库端口；本地调试时自行放开
+    expose:
+      - "5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "6379"
+
+  # 迁移与服务分开：迁移失败就不该起服务，避免在半套 schema 上接流量
+  migrate:
+    build:
+      context: ..
+      dockerfile: newgate/Dockerfile
+    image: newgate:latest
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-newgate}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-newgate}
+      NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
+    command: ["migrate", "up"]
+
+  newgate:
+    build:
+      context: ..
+      dockerfile: newgate/Dockerfile
+    image: newgate:latest
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-newgate}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-newgate}
+      NETON_REDIS__HOST: redis
+      NETON_REDIS__PORT: "6379"
+      NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
+      # 未设置则渠道 Key 以明文入库——数据库一旦泄露，你采购的所有上游 Key 都会泄露
+      NEWGATE_CHANNEL_KEY_ENC_KEY: ${CHANNEL_KEY_ENC_KEY:-}
+      # 自托管且上游在内网时才打开（默认拒绝内网地址以防 SSRF）
+      NEWGATE_ALLOW_PRIVATE_UPSTREAM: ${ALLOW_PRIVATE_UPSTREAM:-false}
+    ports:
+      - "${NEWGATE_PORT:-8080}:8080"
+
+volumes:
+  postgres-data:
+  redis-data:

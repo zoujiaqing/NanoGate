@@ -9,13 +9,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 NEWGATE="$ROOT/newgate"
-APP="$NEWGATE/application/build/bin/macosArm64/debugExecutable/application.kexe"
+# 构建目标可覆盖：本机默认 macosArm64，CI（Linux）传 NEWGATE_TARGET=linuxX64
+TARGET="${NEWGATE_TARGET:-macosArm64}"
+LINK_TASK="${NEWGATE_LINK_TASK:-:application:linkDebugExecutable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
+APP="$NEWGATE/application/build/bin/$TARGET/debugExecutable/application.kexe"
 LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="newgate_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
 AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:8080"
-PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; export PGPASSWORD="$PGPASS"
+PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"
+export PGPASSWORD="$PGPASS" PGHOST
 PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
@@ -47,7 +51,7 @@ echo "═══ NewGate 可靠性 harness (DB=$DB) ═══"
 
 # ── 前置：编译 + 隔离库 + 迁移 + 基础令牌/账户 ──
 echo "[build] linking app…"
-( cd "$NEWGATE" && ./gradlew :application:linkDebugExecutableMacosArm64 -q ) || { echo "build failed"; exit 1; }
+( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q ) || { echo "build failed"; exit 1; }
 createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 隔离 workdir：config/ 指向隔离库；app 与 migrate 都从此目录启动（config 相对 CWD 解析）
 # 只保留最近 2 次运行的 work 目录，避免长期跑 harness 占满磁盘
@@ -57,7 +61,7 @@ cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
 cat > "$WORK/config/database.conf" <<EOF
 [default]
 driver = "POSTGRESQL"
-uri = "postgresql://$PGUSER:$PGPASS@localhost:5432/$DB"
+uri = "postgresql://$PGUSER:$PGPASS@$PGHOST:5432/$DB"
 debug = false
 [migration]
 history_table = "neton_schema_history"
