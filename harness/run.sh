@@ -336,6 +336,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    UPDATE gateway_tokens SET allowed_ips='203.0.113.7' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
 deny=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
 allow=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7" -d '{"model":"m-ip","messages":[]}')
+sleep 1   # 非流式先响应后计费（延迟优先，资金已由预留担保），等账落库再断言
 lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 q "UPDATE gateway_tokens SET allowed_ips='' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
 [ "$deny" = "403" ] && [ "$allow" = "200" ] && [ "$lg" = "1" ] \
