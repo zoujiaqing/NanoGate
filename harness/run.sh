@@ -71,10 +71,22 @@ EOF
 q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
    INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT (key_hash) DO NOTHING;" >/dev/null
 
+# 网关启动/停止：boot_app 可带 env 覆盖（S22 验证全局加价率与毛利下限），故 APP_PID 单独记录以便中途重启。
+APP_PID=""
+boot_app() {
+  ( cd "$WORK" && env "$@" "$APP" >"$LOGS/app.log" 2>&1 ) & APP_PID=$!; PIDS+=($!)
+  ready=0; for i in $(seq 1 40); do curl -s --max-time 2 -o /dev/null "$U/" && { ready=1; break; }; sleep 0.5; done
+  [ "$ready" = "1" ] || { echo "gateway 未就绪（20s 超时），见 $LOGS/app.log"; exit 1; }
+}
+stop_app() {
+  [ -n "$APP_PID" ] || return 0
+  pkill -P "$APP_PID" 2>/dev/null; kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null
+  # 端口必须真的空出来，否则新实例 bind 失败（表现为「未就绪」，误判成代码问题）
+  for i in $(seq 1 20); do lsof -nP -iTCP:7080 -sTCP:LISTEN >/dev/null 2>&1 || return 0; sleep 0.5; done
+  echo "  ⚠️  端口 7080 仍被占用，重启网关可能失败" >&2
+}
 echo "[boot] starting gateway…"
-( cd "$WORK" && "$APP" >"$LOGS/app.log" 2>&1 ) & PIDS+=($!)
-ready=0; for i in $(seq 1 40); do curl -s --max-time 2 -o /dev/null "$U/" && { ready=1; break; }; sleep 0.5; done
-[ "$ready" = "1" ] || { echo "gateway 未就绪（20s 超时），见 $LOGS/app.log"; exit 1; }
+boot_app
 
 CID() { q "SELECT id FROM gateway_channels WHERE name='$1'"; }
 
@@ -418,14 +430,14 @@ q "UPDATE gateway_groups SET ratio='1.0' WHERE name='default';" >/dev/null   # �
   || fail "在途改价计费错: code=$code charged=${lc} debit=${ta} balanceΔ=${bd} quotaUsed=${tu}（期望 7500）"
 
 # ══ S18 快照损坏不得按实时价扣款 → MANUAL_REVIEW 保留预留（V004 §7.1）══
-# 注入点：reserve 只解析 input/output/perRequest，cache_read_price 坏值会随快照进入结算；
-# bill() 严格校验必须拒绝：不扣款、不写台账/usage log、不释放预留、转 MANUAL_REVIEW + 高优告警。
-# 修复前：坏字段被默认值补齐或回退实时价，照常扣 7500。
+# 注入点：渠道 cost_discount 坏值。模型价在入口就要过售价轨校验（坏价走 S19），渠道折扣却是 T2
+# 才并入快照的，坏值因此能「合法」写进快照；bill() 严格校验四要素必须拒绝：不扣款、不写台账/
+# usage log、不释放预留、转 MANUAL_REVIEW + 高优告警。修复前：坏字段被默认值补齐或回退实时价。
 echo "[S18] 快照损坏转人工、预留保留"
 seed_reset; fake ok 9906; sleep 1
-q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-crp','openai_compatible','http://127.0.0.1:9906','default','m-crp',1,1,1,30000,90000,'1.0',0,0,0);
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-crp','openai_compatible','http://127.0.0.1:9906','default','m-crp',1,1,1,30000,90000,'{corrupted',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-crp'),'k',1,0,0,0,0);
-   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-crp','2.5','10','{corrupted','0',5000,'manual',0,0,0);" >/dev/null
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-crp','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-crp","messages":[]}')
 sleep 1   # 非流式先响应后计费，等结算落库
 st=$(q "SELECT status FROM gateway_settlements WHERE request_model='m-crp' ORDER BY id DESC LIMIT 1")
@@ -440,6 +452,99 @@ alert=$(grep -c "pricing snapshot invalid" "$WORK/logs/all.log" 2>/dev/null)
   && [ "${rb:-0}" -gt 0 ] && [ "${qr:-0}" -gt 0 ] && [ "$bd" = "0" ] && [ "$nlog" = "0" ] && [ "$ntx" = "0" ] && [ "${alert:-0}" -ge 1 ] \
   && pass "快照损坏：客户端 200、转 MANUAL_REVIEW(action=${ra})、预留保留(account=${rb} token=${qr})、未扣款(balanceΔ=${bd}/台账=${ntx}/日志=${nlog})、告警=${alert}" \
   || fail "快照损坏语义错: code=${code} status=${st} action=${ra} 预留=${rb}/${qr} balanceΔ=${bd} usageLogs=${nlog} consumeTx=${ntx} alert=${alert}"
+
+# ══ S19 坏价入口 fail-fast：绝不带病进 reserve（双轨计价）══
+# cache_read_price 坏值在入口解析售价轨时就被拒：500 model_pricing_invalid、零 settlement、零预留。
+# 若放行，坏价会随快照进入结算，届时只能猜价或转人工——账务事故必须挡在门口。
+# 500 而非 400：请求本身没问题，是运营侧定价数据坏了，归成客户端错误会掩盖事故。
+echo "[S19] 坏价入口 fail-fast"
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-bad','openai_compatible','http://127.0.0.1:9906','default','m-bad',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-bad'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-bad','2.5','10','{corrupted','0',5000,'manual',0,0,0);" >/dev/null
+code=$(curl -s --max-time 20 -o /tmp/s19-body.$$ -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-bad","messages":[]}')
+body=$(cat /tmp/s19-body.$$ 2>/dev/null); rm -f /tmp/s19-body.$$
+ns=$(q "SELECT COUNT(*) FROM gateway_settlements")
+rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+nlog=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+ec=$(echo "$body" | grep -c "model_pricing_invalid")
+alert=$(grep -c "model pricing invalid" "$WORK/logs/all.log" 2>/dev/null)
+[ "$code" = "500" ] && [ "${ec:-0}" -ge 1 ] && [ "$ns" = "0" ] && [ "${rb:-0}" = "0" ] && [ "${qr:-0}" = "0" ] \
+  && [ "$bd" = "0" ] && [ "$nlog" = "0" ] && [ "${alert:-0}" -ge 1 ] \
+  && pass "坏价入口拒绝：500/model_pricing_invalid、零 settlement(${ns})、零预留(${rb}/${qr})、未扣款(${bd})、告警=${alert}" \
+  || fail "坏价未入口 fail-fast: code=${code} body=${body} settlements=${ns} 预留=${rb}/${qr} balanceΔ=${bd} logs=${nlog} alert=${alert}"
+
+# ══ S20 双轨计价：收入按售价轨（saleOverride）、成本按官方价 × 渠道折扣 ══
+# 官方 2.5/10、售价覆盖 5/20、渠道折扣 0.8：charged 必须是 15000（售价轨）、cost 必须是 6000
+# （官方轨 7500 × 0.8）；预留也按售价轨；广场展示售价而非官方成本价；毛利为正 → 无倒挂告警。
+echo "[S20] 双轨计价（售价/成本分离）"
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-sale','openai_compatible','http://127.0.0.1:9906','default','m-sale',1,1,1,30000,90000,'0.8',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-sale'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,sale_override,source,deleted,created_at,updated_at) VALUES ('m-sale','2.5','10','0','0',5000,'{\"input\":\"5\",\"output\":\"20\"}','manual',0,0,0);" >/dev/null
+BODY='{"model":"m-sale","messages":[]}'
+# 预期预留：输入上界（请求体字节数）× 售价 5 + 输出上限 5000 × 售价 20，向上取整
+exp_res=$(BODY="$BODY" python3 -c 'import os;b=len(os.environ["BODY"].encode());tc=lambda t,p:(t*p+999999)//1000000;print(tc(b,5000000)+tc(5000,20000000))')
+code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d "$BODY")
+sleep 1
+sc=$(q "SELECT charged FROM gateway_settlements WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
+sco=$(q "SELECT cost FROM gateway_settlements WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
+rs=$(q "SELECT reserved_amount FROM gateway_settlements WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
+lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
+lco=$(q "SELECT cost FROM gateway_usage_logs WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+cat5=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c '"inputPrice":"5"')
+inv=$(grep -c "margin inversion" "$WORK/logs/all.log" 2>/dev/null)
+[ "$code" = "200" ] && [ "$sc" = "15000" ] && [ "$lc" = "15000" ] && [ "$sco" = "6000" ] && [ "$lco" = "6000" ] \
+  && [ "$bd" = "15000" ] && [ "$tu" = "15000" ] && [ "$rs" = "$exp_res" ] && [ "${cat5:-0}" -ge 1 ] && [ "${inv:-0}" = "0" ] \
+  && pass "双轨：收入=${sc}（售价 5/20）、成本=${sco}（官方 7500 × 0.8）、预留=${rs}、余额Δ=${bd}、广场展售价、无毛利倒挂" \
+  || fail "双轨计价错: code=$code charged=${sc}/${lc} cost=${sco}/${lco} 预留=${rs}(期望${exp_res}) balanceΔ=${bd} quotaUsed=${tu} 广场售价=${cat5} inversion=${inv}"
+
+# ══ S21 发布闸门：售价低于官方成本 → 拒绝发布（毛利底线）══
+echo "[S21] 毛利闸门（发布期）"
+seed_reset
+JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+low=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"1\"}"}')
+nlow=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate'")
+hi=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"5\",\"output\":\"20\"}"}')
+nhi=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate'")
+[ "$low" = "400" ] && [ "$nlow" = "0" ] && [ "$hi" = "200" ] && [ "$nhi" = "1" ] \
+  && pass "毛利闸门：售价低于官方成本被拒(400/未落库)、合法售价通过(200/落库=${nhi})" \
+  || fail "毛利闸门错: 低价=${low}(落库${nlow}) 合法=${hi}(落库${nhi})"
+
+# ══ S22 全局加价率 + 毛利下限（env 运营开关）══
+# 重启网关带 NEWGATE_SALE_MARKUP=2.0 / NEWGATE_MIN_MARGIN=1.5：
+#  - 无 saleOverride 的模型售价 = 官方价 × 2 → 收入翻倍（官方 2.5/10 → 售价 5/20 → charged 15000），
+#    而成本仍按官方价轨（7500）——加价率只动收入轨，不污染成本核算；
+#  - 发布底线抬到官方 × 1.5（官方 2.5 → 售价底线 3.75）。
+echo "[S22] 全局加价率 / 毛利下限"
+stop_app; boot_app NEWGATE_SALE_MARKUP=2.0 NEWGATE_MIN_MARGIN=1.5
+seed_reset
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-mk','openai_compatible','http://127.0.0.1:9906','default','m-mk',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-mk'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-mk','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+BODY='{"model":"m-mk","messages":[]}'
+exp_res=$(BODY="$BODY" python3 -c 'import os;b=len(os.environ["BODY"].encode());tc=lambda t,p:(t*p+999999)//1000000;print(tc(b,5000000)+tc(5000,20000000))')
+code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d "$BODY")
+sleep 1
+sc=$(q "SELECT charged FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
+sco=$(q "SELECT cost FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
+rs=$(q "SELECT reserved_amount FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+[ "$code" = "200" ] && [ "$sc" = "15000" ] && [ "$sco" = "7500" ] && [ "$bd" = "15000" ] && [ "$rs" = "$exp_res" ] \
+  && pass "加价率 2.0：收入=${sc}（官方×2）、成本=${sco}（官方轨不变）、预留=${rs}、余额Δ=${bd}" \
+  || fail "加价率未生效: code=$code charged=${sc}(期望15000) cost=${sco}(期望7500) 预留=${rs}(期望${exp_res}) balanceΔ=${bd}"
+JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+low=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate2","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"3\"}"}')
+nlow=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate2'")
+hi=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate2","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"4\"}"}')
+nhi=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate2'")
+[ "$low" = "400" ] && [ "$nlow" = "0" ] && [ "$hi" = "200" ] && [ "$nhi" = "1" ] \
+  && pass "毛利下限 1.5：售价 3（<2.5×1.5=3.75）被拒(400)、售价 4 通过(200/落库=${nhi})" \
+  || fail "毛利下限错: 售价3=${low}(落库${nlow}) 售价4=${hi}(落库${nhi})"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

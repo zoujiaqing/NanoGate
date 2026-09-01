@@ -10,7 +10,8 @@
       "WebSearch",
       "Read(//Users/zoujiaqing/projects/Neton/neton/**)",
       "Bash(timeout 400 ./gradlew :neton-security:macosArm64Test)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(cd /Users/zoujiaqing/projects/Neton/neton-application-module-gateway *)"
     ]
   }
 }
