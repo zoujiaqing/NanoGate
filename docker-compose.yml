@@ -74,6 +74,10 @@ services:
       NEWGATE_CHANNEL_KEY_ENC_KEY: ${CHANNEL_KEY_ENC_KEY:-}
       # 自托管且上游在内网时才打开（默认拒绝内网地址以防 SSRF）
       NEWGATE_ALLOW_PRIVATE_UPSTREAM: ${ALLOW_PRIVATE_UPSTREAM:-false}
+      # 双轨计价：售价 = sale_override 或官方价 × 加价率（收入）；成本 = 官方价 × 渠道折扣
+      NEWGATE_SALE_MARKUP: ${SALE_MARKUP:-1}
+      # 发布闸门：售价低于「官方成本 × 此倍率」的定价不得保存
+      NEWGATE_MIN_MARGIN: ${MIN_MARGIN:-1}
     ports:
       - "${NEWGATE_PORT:-7080}:7080"
 
