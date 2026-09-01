@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok
 """
 import json, os, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +61,14 @@ class H(BaseHTTPRequestHandler):
                     "id": "r1", "object": "chat.completion", "model": body.get("model", "?"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+                }); return
+            if MODE == "embok":
+                # embeddings 响应：usage 只有 prompt_tokens（没有 completion）——计费不得凭空补出输出 tokens
+                self._json(200, {
+                    "object": "list",
+                    "data": [{"object": "embedding", "index": 0, "embedding": [0.01, -0.02, 0.03]}],
+                    "model": body.get("model", "?"),
+                    "usage": {"prompt_tokens": 7, "total_tokens": 7},
                 }); return
             # ok
             if stream:

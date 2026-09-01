@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NewGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
+# NanoGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；依赖本机 5432、
 #   固定应用端口 7080、固定 fake 端口 9920–9991。真正 CI 应改用 PostgreSQL service/container +
@@ -47,7 +47,7 @@ seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_p
 
 fake() { MODE="$1" PORT="$2" python3 "$HERE/fakes.py" >/dev/null 2>&1 & PIDS+=($!); }
 
-echo "═══ NewGate 可靠性 harness (DB=$DB) ═══"
+echo "═══ NanoGate 可靠性 harness (DB=$DB) ═══"
 
 # ── 前置：编译 + 隔离库 + 迁移 + 基础令牌/账户 ──
 echo "[build] linking app…"
@@ -545,6 +545,47 @@ nhi=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate2'")
 [ "$low" = "400" ] && [ "$nlow" = "0" ] && [ "$hi" = "200" ] && [ "$nhi" = "1" ] \
   && pass "毛利下限 1.5：售价 3（<2.5×1.5=3.75）被拒(400)、售价 4 通过(200/落库=${nhi})" \
   || fail "毛利下限错: 售价3=${low}(落库${nlow}) 售价4=${hi}(落库${nhi})"
+
+# ══ S23 端点能力路由：embeddings 只落到声明了该能力的渠道（V007）══
+# 此前 /v1/embeddings 只要模型名命中就路由：打到只会 chat 的上游必然 404，而钱已预留、日志已脏、重试还撞三遍同一堵墙。
+#  - m-emb 同时挂在 chat-only 与 chat,embeddings 两个渠道 → 必须选中后者（用 usage_logs.channel_id 举证）；
+#    embeddings 响应只有 prompt_tokens → charged 只按 7 个输入 token，不得凭空补出输出费用；
+#  - m-chatonly 只挂在 chat-only 渠道 → /v1/embeddings 直接 404 model_not_found，零 settlement、零预留
+#    （不是 503：配置不变就永远不会可用，503 只会让客户端按退避策略一直撞墙）；
+#  - 同一渠道的 /v1/chat/completions 照常可用 → 能力过滤不误伤对话。
+echo "[S23] 端点能力路由（embeddings）"
+stop_app; boot_app
+seed_reset
+fake embok 9971; fake ok 9972; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('c-chatonly','openai_compatible','http://127.0.0.1:9972','default','m-emb,m-chatonly','chat',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-emb','openai_compatible','http://127.0.0.1:9971','default','m-emb','chat,embeddings',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
+   ((SELECT id FROM gateway_channels WHERE name='c-chatonly'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-emb'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES
+   ('m-emb','1','1','0','0',5000,'manual',0,0,0),('m-chatonly','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
+code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/embeddings" -H "$AUTH" -H "$CT" -d '{"model":"m-emb","input":"hello"}')
+sleep 1
+ch=$(q "SELECT c.name FROM gateway_usage_logs l JOIN gateway_channels c ON c.id=l.channel_id WHERE l.request_model='m-emb' ORDER BY l.id DESC LIMIT 1")
+pt=$(q "SELECT prompt_tokens FROM gateway_usage_logs WHERE request_model='m-emb' ORDER BY id DESC LIMIT 1")
+ct=$(q "SELECT completion_tokens FROM gateway_usage_logs WHERE request_model='m-emb' ORDER BY id DESC LIMIT 1")
+lg=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-emb' ORDER BY id DESC LIMIT 1")
+code2=$(curl -s --max-time 20 -o /tmp/s23-body.$$ -w "%{http_code}" -X POST "$U/v1/embeddings" -H "$AUTH" -H "$CT" -d '{"model":"m-chatonly","input":"hello"}')
+b2=$(cat /tmp/s23-body.$$ 2>/dev/null); rm -f /tmp/s23-body.$$
+nf=$(echo "$b2" | grep -c "model_not_found")
+ns=$(q "SELECT COUNT(*) FROM gateway_settlements WHERE request_model='m-chatonly'")
+rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+[ "$code" = "200" ] && [ "$ch" = "c-emb" ] && [ "$pt" = "7" ] && [ "${ct:-0}" = "0" ] && [ "$lg" = "7" ] \
+  && [ "$code2" = "404" ] && [ "${nf:-0}" -ge 1 ] && [ "$ns" = "0" ] && [ "${rb:-0}" = "0" ] \
+  && pass "能力路由：embeddings 落到 ${ch}（charged=${lg}/prompt=${pt}/completion=${ct}）、chat-only 模型 404 model_not_found 且零 settlement(${ns})/零预留(${rb})" \
+  || fail "能力路由错: emb=${code}(渠道=${ch} charged=${lg} tokens=${pt}/${ct}) 无能力=${code2}(${b2}) settlements=${ns} 预留=${rb}"
+code3=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-chatonly","messages":[]}')
+sleep 1
+ch3=$(q "SELECT c.name FROM gateway_usage_logs l JOIN gateway_channels c ON c.id=l.channel_id WHERE l.request_model='m-chatonly' ORDER BY l.id DESC LIMIT 1")
+lg3=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-chatonly' ORDER BY id DESC LIMIT 1")
+[ "$code3" = "200" ] && [ "$ch3" = "c-chatonly" ] && [ "$lg3" = "1500" ] \
+  && pass "能力过滤不误伤对话：chat/completions 仍走 ${ch3}（charged=${lg3}）" \
+  || fail "chat 路由被误伤: code=${code3} 渠道=${ch3} charged=${lg3}(期望1500)"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
