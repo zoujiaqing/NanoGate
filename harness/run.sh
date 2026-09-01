@@ -394,5 +394,28 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
 unpriced=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c "m-unpriced")
 [ "$unpriced" = "0" ] && pass "未定价模型不出现在模型广场" || fail "未定价模型泄漏到广场(${unpriced})"
 
+# ══ S17 在途改价按预留快照计价（V004 §7.1）══
+# 慢上游 2s 才响应：在「已预留、未结算」窗口把模型价涨 10 倍、分组倍率改 2。
+# 若 bill() 重查价表会扣 (25×1000+100×500)×2=150000；快照语义必须仍是 7500。
+echo "[S17] 在途改价按快照计价"
+seed_reset; fake slowok 9905; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-snap','openai_compatible','http://127.0.0.1:9905','default','m-snap',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-snap'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-snap','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+( curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-snap","messages":[]}' >/tmp/s17-code.$$ ) & CURL_PID=$!
+sleep 1   # 上游 2s 慢响应，此刻请求必然在途（已预留、未结算）
+q "UPDATE gateway_model_prices SET input_price='25', output_price='100' WHERE model='m-snap';
+   UPDATE gateway_groups SET ratio='2.0' WHERE name='default';" >/dev/null
+wait "$CURL_PID"; sleep 1
+code=$(cat /tmp/s17-code.$$ 2>/dev/null); rm -f /tmp/s17-code.$$
+lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-snap' ORDER BY id DESC LIMIT 1")
+ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+q "UPDATE gateway_groups SET ratio='1.0' WHERE name='default';" >/dev/null   # 还原倍率，不污染后续场景/库状态
+[ "$code" = "200" ] && [ "$lc" = "7500" ] && [ "$lc" = "$ta" ] && [ "$lc" = "$bd" ] && [ "$lc" = "$tu" ] \
+  && pass "在途改价/改倍率仍按预留快照计费 charged=${lc}（重查价表会扣 150000）、四项一致" \
+  || fail "在途改价计费错: code=$code charged=${lc} debit=${ta} balanceΔ=${bd} quotaUsed=${tu}（期望 7500）"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

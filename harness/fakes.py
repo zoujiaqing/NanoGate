@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | err500 | err403 | err429 | bigstream
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort
 """
 import json, os, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,6 +54,14 @@ class H(BaseHTTPRequestHandler):
                 self._bigstream(); return
             if MODE == "midabort":
                 self._midabort(); return
+            if MODE == "slowok":
+                # 慢响应：拖长首响应时间，制造「请求在途」窗口（供在途改价等场景）
+                time.sleep(float(os.environ.get("SLOW_DELAY", "2")))
+                self._json(200, {
+                    "id": "r1", "object": "chat.completion", "model": body.get("model", "?"),
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+                }); return
             # ok
             if stream:
                 self._okstream(body.get("model", "?"))
