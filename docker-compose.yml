@@ -44,7 +44,7 @@ services:
     build:
       context: ..
       dockerfile: newgate/Dockerfile
-    image: newgate:latest
+    image: nanogate:latest
     restart: "no"
     depends_on:
       postgres:
@@ -58,7 +58,7 @@ services:
     build:
       context: ..
       dockerfile: newgate/Dockerfile
-    image: newgate:latest
+    image: nanogate:latest
     restart: unless-stopped
     depends_on:
       migrate:
