@@ -26,30 +26,25 @@ Kotlin/Native + Neton 框架重写（new-api 是 Go，难维护）。核心能�
 | `neton-application-front-gateway` | 网关管理台页面 | 同组织 |
 | `neton-application-client-{gateway,member,payment}` | C 端模块（gateway=产品，后两个=通用） | 同组织 |
 
-⚠️ **“全部已推送”不成立（2026-09-01 实测）**：以下仓有未推送提交，代码只在本机：
-- `neton`：main 领先 origin 6 个提交（框架模块化重构：Ktor server/client 拆独立模块、
-  hyper4k 适配入主仓、多值 Header 模型、conformance suite）
-- `neton-application-module-gateway`：领先 1（适配多值 Header）
-- `neton-application-module-member`：领先 1（单设备登录）
-- `neton-application-module-payment`：`feat/payment-platform-refactor` 分支领先 1（适配多值 Header）
-
-**后果**：CI 从 GitHub checkout 的是旧版框架，绿的是旧代码；本机聚合构建用的是新框架。
-推送这批提交前，不要在 CI 结果上做判断。
-另：`module-system` 的短信宝（smsbao）SMS 实现是**未提交的 WIP**，从未入过基线。
+⚠️ 2026-09-01 已全部推送完毕（含此前领先的框架重构与适配提交）。
+另：`module-system` 的短信宝（smsbao）SMS 实现于 2026-09-01 接手时才首次提交（此前是未提交
+WIP，从未入过基线），未经过完整评审，上线前需重点看。
 
 ### `NewGate/` — 产品发行版（fork 装配）
 
 | 目录 | 说明 | 远端 |
 |---|---|---|
 | `NewGate/` | 设计文档、harness、docker-compose、DEPLOY.md | `zoujiaqing/NewGate`（GitHub 已建仓） |
-| `newgate` | 后端发行版（fork 自 neton-application） | ⚠️ origin 指向本地路径 |
+| `newgate` | 后端发行版（fork 自 neton-application） | ⚠️ origin 指向本地路径，本地领先 5 提交未推 |
 | `newgate-front` | 管理台发行版 | ⚠️ 同上 |
 | `newgate-client` | 用户控制台发行版 | ⚠️ 同上 |
 | `new-api` | 参考源码，已 gitignore | — |
 
 > ⚠️ **三个 fork 的 origin 指向 fork 来源的本地路径**（`../Neton/neton-application*`）。
-> 直接 `git push` 会把产品代码注入通用底座仓。推送前必须先改 remote。
-> `zoujiaqing/NewGate` 在 GitHub 上已存在（CI 的 `backend-ci.yml` 已在引用它）。
+> 直接 `git push` 会把产品代码注入通用底座仓——**已在 2026-09-01 验证拦截，不要推**。
+> 需先在 GitHub 建仓（建议 `zoujiaqing/newgate-backend` / `newgate-front` / `newgate-client`，
+> `zoujiaqing/newgate` 已被根仓占用——GitHub 仓名大小写不敏感），再改 origin 推送。
+> 本机无 `gh`、无 GitHub token，建仓需手工在网页操作。
 
 ### 关键设计文档
 
@@ -161,12 +156,12 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - `harness/run.sh` 的 `PGPASS` 默认值还叫 `privchat`（可被环境变量覆盖；应用配置本身已
   清理干净——`database.conf` 默认 `newgate:newgate@localhost`，`application.conf` 名为
   `newgate`，JWT secret 是显式 `REPLACE_ME` 占位）
-- **框架拆分迁移修复（未提交，2026-09-01）**：neton 未推送的 6 个重构提交把 Ktor
-  server/client 拆出 `neton-http`，导致本机聚合构建编译失败。已修：
+- **框架拆分迁移修复（已提交，2026-09-01）**：neton 的 6 个重构提交（已推送）把 Ktor
+  server/client 拆出 `neton-http`，曾导致本机聚合构建编译失败。已修：
   - `module-system`/`module-payment`/`module-gateway`：build.gradle.kts 补 `neton-http-ktor`
     依赖；`SmsProvider.kt`、`AlipayPayPlatform.kt`、`SifangPayPlatform.kt` 补 `import neton.http.client.create`
   - `newgate/application`：补 `neton-http-ktor` 依赖；`Main.kt` 改 `http(::KtorHttpAdapter) { }`
-  修后 23/23 全绿。**这批改动还停在工作区，推送前需按仓提交。**
+  修后 23/23 全绿。模块仓修复已推送；**newgate 发行版仓的修复已提交但未推送**（无可推远端，见下）。
 
 **已知未闭环（V004 设计文档 §6 有详述）：**
 - `C3′`：拿到 usage 但 payload 落库失败且进程崩溃 → usage 永久丢失，只能人工处理。
