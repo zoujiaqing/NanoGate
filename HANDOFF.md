@@ -119,7 +119,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   断连计费、worker 恢复、TTL 转人工、限流、IP 白名单、原生认证、用户端越权防护等。
   **改动账务或流式代码后必须跑这个。**
   2026-09-01 接手时实测 **23/23 全绿**（已含下述框架拆分迁移修复）。
-  ⚠️ 若断言大面积 404，先查 8080 是否被残留网关进程占用（`lsof -nP -iTCP:8080 -sTCP:LISTEN`）——
+  ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用（`lsof -nP -iTCP:7080 -sTCP:LISTEN`）——
   旧进程应答会让所有场景假性失败。
 - **CI（`newgate/.github/workflows/backend-ci.yml`）已跑测试**：macOS job 编译 +
   `:module-gateway` / `:module-system` 单元测试；Linux job 用真实 PostgreSQL service 跑

@@ -2,7 +2,7 @@
 # NewGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；依赖本机 5432、
-#   固定应用端口 8080、固定 fake 端口 9920–9991。真正 CI 应改用 PostgreSQL service/container +
+#   固定应用端口 7080、固定 fake 端口 9920–9991。真正 CI 应改用 PostgreSQL service/container +
 #   动态分配应用/​fake 端口（列为紧接着的下一提交，见 SPEC「仍待办」）。
 set -uo pipefail
 
@@ -17,7 +17,7 @@ LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="newgate_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
-AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:8080"
+AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:7080"
 PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"
 export PGPASSWORD="$PGPASS" PGHOST
 PASS=0; FAIL=0; PIDS=()
@@ -416,6 +416,30 @@ q "UPDATE gateway_groups SET ratio='1.0' WHERE name='default';" >/dev/null   # �
 [ "$code" = "200" ] && [ "$lc" = "7500" ] && [ "$lc" = "$ta" ] && [ "$lc" = "$bd" ] && [ "$lc" = "$tu" ] \
   && pass "在途改价/改倍率仍按预留快照计费 charged=${lc}（重查价表会扣 150000）、四项一致" \
   || fail "在途改价计费错: code=$code charged=${lc} debit=${ta} balanceΔ=${bd} quotaUsed=${tu}（期望 7500）"
+
+# ══ S18 快照损坏不得按实时价扣款 → MANUAL_REVIEW 保留预留（V004 §7.1）══
+# 注入点：reserve 只解析 input/output/perRequest，cache_read_price 坏值会随快照进入结算；
+# bill() 严格校验必须拒绝：不扣款、不写台账/usage log、不释放预留、转 MANUAL_REVIEW + 高优告警。
+# 修复前：坏字段被默认值补齐或回退实时价，照常扣 7500。
+echo "[S18] 快照损坏转人工、预留保留"
+seed_reset; fake ok 9906; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-crp','openai_compatible','http://127.0.0.1:9906','default','m-crp',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-crp'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-crp','2.5','10','{corrupted','0',5000,'manual',0,0,0);" >/dev/null
+code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-crp","messages":[]}')
+sleep 1   # 非流式先响应后计费，等结算落库
+st=$(q "SELECT status FROM gateway_settlements WHERE request_model='m-crp' ORDER BY id DESC LIMIT 1")
+ra=$(q "SELECT retry_action FROM gateway_settlements WHERE request_model='m-crp' ORDER BY id DESC LIMIT 1")
+rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+nlog=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-crp'")
+ntx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='consume'")
+alert=$(grep -c "pricing snapshot invalid" "$WORK/logs/all.log" 2>/dev/null)
+[ "$code" = "200" ] && [ "$st" = "MANUAL_REVIEW" ] && [ "$ra" = "FINALIZE" ] \
+  && [ "${rb:-0}" -gt 0 ] && [ "${qr:-0}" -gt 0 ] && [ "$bd" = "0" ] && [ "$nlog" = "0" ] && [ "$ntx" = "0" ] && [ "${alert:-0}" -ge 1 ] \
+  && pass "快照损坏：客户端 200、转 MANUAL_REVIEW(action=${ra})、预留保留(account=${rb} token=${qr})、未扣款(balanceΔ=${bd}/台账=${ntx}/日志=${nlog})、告警=${alert}" \
+  || fail "快照损坏语义错: code=${code} status=${st} action=${ra} 预留=${rb}/${qr} balanceΔ=${bd} usageLogs=${nlog} consumeTx=${ntx} alert=${alert}"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

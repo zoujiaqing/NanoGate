@@ -2,7 +2,7 @@
 #
 #   1) cp .env.example .env  然后按注释填必须改的三个密钥
 #   2) docker compose up -d
-#   3) 访问 http://localhost:8080
+#   3) 访问 http://localhost:7080
 #
 # 镜像构建上下文是父目录（Gradle composite build 需要看到同级的 neton 与各模块仓库）。
 
@@ -75,7 +75,7 @@ services:
       # 自托管且上游在内网时才打开（默认拒绝内网地址以防 SSRF）
       NEWGATE_ALLOW_PRIVATE_UPSTREAM: ${ALLOW_PRIVATE_UPSTREAM:-false}
     ports:
-      - "${NEWGATE_PORT:-8080}:8080"
+      - "${NEWGATE_PORT:-7080}:7080"
 
 volumes:
   postgres-data:
