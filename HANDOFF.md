@@ -1,11 +1,17 @@
-# NewGate 项目交接
+# NanoGate 项目交接（曾用名 NewGate）
+
+> **2026-09-02 改名**：产品更名 NewGate → **NanoGate**。根仓 GitHub 已改名为 `zoujiaqing/nanogate`；
+> 代码仓规划为 `nanogate-backend` / `nanogate-frontend` / `nanogate-client`。
+> **本地目录（`NewGate/`、`newgate/` 等）、`NEWGATE_*` 环境变量、隔离库名暂不改**：
+> `harness/run.sh` 依赖 `$ROOT/newgate` 路径，环境变量是后端配置契约，动了会破 23 断言基线。
+> 下文路径里的 NewGate/newgate 均为本地目录名，非产品名。
 
 > 最后核实：2026-09-01。本文以代码与 `harness/` 实测为准；与代码冲突的历史文档（尤其
 > `SPEC.md` 末尾的「待办」段落）已过时，见第五节。
 
 ## 一、这是什么
 
-对标 [new-api](https://github.com/QuantumNous/new-api) 的**开源 LLM API 中转站**，用
+对标 [new-api](https://github.com/QuantumNous/new-api) 的**开源 LLM API 中转站（产品名 NanoGate）**，用
 Kotlin/Native + Neton 框架重写（new-api 是 Go，难维护）。核心能力：任意入站协议 → 任意上游
 协议的 3×3 转发（OpenAI / Anthropic / Gemini），带计费、额度、渠道容错。
 
@@ -34,7 +40,7 @@ WIP，从未入过基线），未经过完整评审，上线前需重点看。
 
 | 目录 | 说明 | 远端 |
 |---|---|---|
-| `NewGate/` | 设计文档、harness、docker-compose、DEPLOY.md | `zoujiaqing/NewGate`（GitHub 已建仓） |
+| `NewGate/` | 设计文档、harness、docker-compose、DEPLOY.md | `zoujiaqing/nanogate`（由 `zoujiaqing/NewGate` 改名） |
 | `newgate` | 后端发行版（fork 自 neton-application） | ⚠️ origin 指向本地路径，本地领先 5 提交未推 |
 | `newgate-front` | 管理台发行版 | ⚠️ 同上 |
 | `newgate-client` | 用户控制台发行版 | ⚠️ 同上 |
@@ -42,9 +48,9 @@ WIP，从未入过基线），未经过完整评审，上线前需重点看。
 
 > ⚠️ **三个 fork 的 origin 指向 fork 来源的本地路径**（`../Neton/neton-application*`）。
 > 直接 `git push` 会把产品代码注入通用底座仓——**已在 2026-09-01 验证拦截，不要推**。
-> 需先在 GitHub 建仓（建议 `zoujiaqing/newgate-backend` / `newgate-front` / `newgate-client`，
-> `zoujiaqing/newgate` 已被根仓占用——GitHub 仓名大小写不敏感），再改 origin 推送。
-> 本机无 `gh`、无 GitHub token，建仓需手工在网页操作。
+> 需在 GitHub 建 `zoujiaqing/nanogate-backend` / `nanogate-frontend` / `nanogate-client`
+> （本机无 `gh`、无 token，建仓需手工在网页操作），建好后改 origin 推送；
+> 后端仓本地领先 5 个提交（含全部发行版历史）。
 
 ### 关键设计文档
 
@@ -118,6 +124,8 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - **CI（`newgate/.github/workflows/backend-ci.yml`）已跑测试**：macOS job 编译 +
   `:module-gateway` / `:module-system` 单元测试；Linux job 用真实 PostgreSQL service 跑
   整个可靠性 harness。「只编译不跑测试」已是历史状态。
+  ⚠️ 该 CI 从未在 GitHub 实际运行过（后端仓未推），且其 checkout 平铺路径与
+  `settings.gradle.kts` 的 `Neton/*` 目录约定不一致，首次推送后需修。
 
 ## 五、⚠️ SPEC.md 的「待办」段落已过时
 

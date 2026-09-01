@@ -1,6 +1,7 @@
-# NewGate 部署
+# NanoGate 部署
 
 单机 Docker 部署。PostgreSQL 与 Redis 都在 compose 内，不需要另外准备数据库。
+（产品曾用名 NewGate；下文目录名 `NewGate/`、`newgate/` 为本地布局名，暂不随改名变动。）
 
 ## 依赖仓库布局
 
