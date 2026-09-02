@@ -2,8 +2,9 @@
 # NanoGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；依赖本机 5432、
-#   固定应用端口 7080、固定 fake 端口 9920–9991。真正 CI 应改用 PostgreSQL service/container +
-#   动态分配应用/​fake 端口（列为紧接着的下一提交，见 SPEC「仍待办」）。
+#   固定应用端口 7080、固定 fake 端口 9920–9991、固定隔离 Redis 端口 6399。真正 CI 应改用
+#   PostgreSQL/Redis service/container + 动态分配端口（列为紧接着的下一提交，见 SPEC.md 末「待办」段）。
+#   Redis 是「每次拉起一个独立实例」：开发机上 6379 往往有别的项目在用，绝不能往里写 harness 的键。
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -41,6 +42,11 @@ trap cleanup EXIT INT TERM
 pass() { echo "  ✅ $1"; PASS=$((PASS+1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
+# Redis 断言助手：只碰本次拉起的隔离实例的隔离 db。键名带 keyPrefix（配置里可变），
+# 故一律用 *ngrl:* 通配匹配，不把前缀写死在断言里。
+rc() { redis-cli -p "$REDIS_PORT" -n "$REDIS_DB" "$@" 2>/dev/null; }
+rksum() { local k v s=0; for k in $(rc --scan --pattern "$1"); do v=$(rc get "$k"); s=$((s + ${v:-0})); done; echo "$s"; }
+rkdel() { local k; for k in $(rc --scan --pattern "$1"); do rc del "$k" >/dev/null; done; }
 seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions,gateway_settlements RESTART IDENTITY;
   UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
   UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
@@ -66,6 +72,28 @@ debug = false
 [migration]
 history_table = "neton_schema_history"
 EOF
+# ── 隔离 Redis：限流计数是 S24 的断言对象，必须落在本 harness 独占的实例里 ──
+# 不隔离的后果很实际：开发机 6379 的 db0 里混着别的项目的键（谁也不敢 flush），
+# 而 harness 的 rpm/tpm 计数会被上一轮残留污染，断言变成看运气。
+# 关持久化（--save '' --appendonly no）+ 数据目录放在 work 里，进程记进 PIDS 由 cleanup 收尾。
+# 没装 redis-server 不让整个 harness 失败：网关会退化成进程内计数（单实例语义不变），
+# 只有真正依赖 Redis 的 S24 显式跳过。
+REDIS_PORT="${NEWGATE_REDIS_PORT:-6399}"; REDIS_DB=15; REDIS_OK=0
+mkdir -p "$WORK/redis"
+cat > "$WORK/config/redis.conf" <<EOF
+host = "127.0.0.1"
+port = $REDIS_PORT
+database = $REDIS_DB
+keyPrefix = "ngharness"
+debug = false
+EOF
+if command -v redis-server >/dev/null 2>&1; then
+  redis-server --port "$REDIS_PORT" --save '' --appendonly no --dir "$WORK/redis" >"$LOGS/redis.log" 2>&1 & PIDS+=($!)
+  for i in $(seq 1 40); do redis-cli -p "$REDIS_PORT" ping 2>/dev/null | grep -q PONG && { REDIS_OK=1; break; }; sleep 0.25; done
+  [ "$REDIS_OK" = "1" ] || echo "  ⚠️  redis-server 10s 内未就绪（端口 $REDIS_PORT 被占？见 $LOGS/redis.log）；限流退化为进程内计数，S24 跳过" >&2
+else
+  echo "  ⚠️  未安装 redis-server（brew install redis）：限流退化为进程内计数，S24 跳过" >&2
+fi
 ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ) || { echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1; }
 # 基础令牌 + 账户（member 用户 id=1 由迁移种子提供；harness 直插 gateway 令牌）
 q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
@@ -343,21 +371,36 @@ q "UPDATE gateway_tokens SET rpm_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/d
   && pass "RPM=3：前 3 个 200、后 2 个 429、仅 3 条计费（被限流的不调上游）" \
   || fail "RPM 限流错: codes=${codes} 200=${n200} 429=${n429} 计费条数=${lg}"
 
-# ══ S14 令牌 IP 白名单 ══
-echo "[S14] IP 白名单"
+# ══ S14 令牌 IP 白名单：X-Forwarded-For 信任边界 ══
+# 白名单只能建立在**传输层对端**之上：XFF 由客户端自由填写，无条件采信最左项等于
+# 「一个请求头就能把自己伪装成白名单里的 IP」——那比没有白名单更糟（它给运营者虚假的安全感）。
+#  - A 段（默认：未配可信代理）→ 转发头一律忽略，伪造 XFF 必须被拒；
+#  - B 段（NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1，即 curl 的对端）→ 才采信 XFF，且从**右**往左剥链：
+#    客户端自己塞在链首的白名单 IP 不算数（真实部署里反代会把客户端真实 IP 追加到链尾，
+#    剥链必须停在第一个不可信地址）。
+echo "[S14] IP 白名单 + XFF 信任边界"
 seed_reset
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-ip','openai_compatible','http://127.0.0.1:9880','default','m-ip',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ip'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-ip','0','0','0','0',100,5000,'manual',0,0,0);
    UPDATE gateway_tokens SET allowed_ips='203.0.113.7' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
-deny=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
+spoof=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7" -d '{"model":"m-ip","messages":[]}')
+plain=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ip","messages":[]}')
+lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+[ "$spoof" = "403" ] && [ "$plain" = "403" ] && [ "$lg" = "0" ] \
+  && pass "未配可信代理：伪造 XFF=203.0.113.7（名单内）被拒 ${spoof}、无转发头也被拒 ${plain}、零计费" \
+  || fail "XFF 信任边界失效: 伪造名单内IP=${spoof}(期望403) 无头=${plain}(期望403) 计费=${lg}(期望0)"
+stop_app; boot_app NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1
 allow=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7" -d '{"model":"m-ip","messages":[]}')
+deny=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
+# 链首伪造：客户端先写一个名单内 IP，反代再追加它自己的真实地址 → 剥链应停在后者
+prepend=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7, 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
 sleep 1   # 非流式先响应后计费（延迟优先，资金已由预留担保），等账落库再断言
 lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 q "UPDATE gateway_tokens SET allowed_ips='' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
-[ "$deny" = "403" ] && [ "$allow" = "200" ] && [ "$lg" = "1" ] \
-  && pass "IP 白名单：名单外 403、名单内 200、仅 1 条计费" \
-  || fail "IP 白名单错: 名单外=${deny} 名单内=${allow} 计费条数=${lg}"
+[ "$allow" = "200" ] && [ "$deny" = "403" ] && [ "$prepend" = "403" ] && [ "$lg" = "1" ] \
+  && pass "可信代理剥链：真客户端 203.0.113.7 → ${allow}、名单外 → ${deny}、名单内IP塞链首仍 → ${prepend}、仅 ${lg} 条计费" \
+  || fail "可信代理剥链错: 名单内=${allow}(期望200) 名单外=${deny}(期望403) 链首伪造=${prepend}(期望403) 计费=${lg}(期望1)"
 
 # ══ S15 /v1/models 真数据 + 原生认证载体 ══
 echo "[S15] /v1/models 与原生认证"
@@ -586,6 +629,77 @@ lg3=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-chatonly'
 [ "$code3" = "200" ] && [ "$ch3" = "c-chatonly" ] && [ "$lg3" = "1500" ] \
   && pass "能力过滤不误伤对话：chat/completions 仍走 ${ch3}（charged=${lg3}）" \
   || fail "chat 路由被误伤: code=${code3} 渠道=${ch3} charged=${lg3}(期望1500)"
+
+# ══ S24 原子限流计数：Redis 里的账必须与 ledger 完全一致 ══
+# 计数器曾是 get + set 读-改-写：并发下两个请求读到同一旧值、各自 +N 再写回，增量被吞掉。
+# TPM 少记的每个 token 都是真金白银的成本敞口，所以这里不只看「有没有限流」（S13 已看），
+# 而是把 Redis 里的计数与账本对账：
+#  - 20 并发 → RPM 必须精确等于 20（读-改-写会少计）、TPM 必须等于 SUM(prompt+completion)；
+#  - 窗口键必须带 TTL（incr 与 expire 分两条命令时，进程在中间崩溃会留下永不过期的死键）；
+#  - 并发占用归还后键必须被删干净：多归还一次不得变成负数（负数 = 白送并发额度）。
+echo "[S24] Redis 原子限流计数"
+if [ "$REDIS_OK" != "1" ]; then
+  echo "  ⏭️  跳过：没有隔离 redis-server（限流已退化为进程内计数，单实例语义不变、多实例不共享）"
+else
+  seed_reset; fake ok 9974; sleep 1
+  q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-atom','openai_compatible','http://127.0.0.1:9974','default','m-atom',1,1,1,30000,90000,'1.0',0,0,0);
+     INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-atom'),'k',1,0,0,0,0);
+     INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-atom','2.5','10','0','0',5000,'manual',0,0,0);
+     UPDATE gateway_tokens SET rpm_limit=1000, tpm_limit=NULL, concurrency_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+  TID=$(q "SELECT id FROM gateway_tokens WHERE key_hash='${TOKEN_HASH}'")
+  sleep 2   # 等前序场景的在途结算落定，否则它们的 recordTokens 会混进本轮计数
+  rkdel "*ngrl:rpm:${TID}:*"; rkdel "*ngrl:tpm:${TID}:*"; rkdel "*ngrl:cc:${TID}"
+  seq 1 20 | xargs -P 20 -I{} curl -s --max-time 20 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-atom","messages":[]}'
+  sleep 2   # 非流式：先响应后结算，recordTokens 发生在结算之后
+  n=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1")
+  dbt=$(q "SELECT COALESCE(SUM(prompt_tokens+completion_tokens),0) FROM gateway_usage_logs WHERE user_id=1")
+  rpm=$(rksum "*ngrl:rpm:${TID}:*")   # 跳分钟窗口也要算全，否则边界上会假失败
+  tpm=$(rksum "*ngrl:tpm:${TID}:*")
+  ttl=$(rc ttl "$(rc --scan --pattern "*ngrl:rpm:${TID}:*" | head -1)")
+  [ "$n" = "20" ] && [ "$rpm" = "20" ] && [ "$tpm" = "$dbt" ] && [ "$dbt" != "0" ] && [ "${ttl:-0}" -gt 0 ] && [ "${ttl:-0}" -le 120 ] \
+    && pass "20 并发：RPM=${rpm}（精确 20，无丢增量）、TPM=${tpm} == 账本 token 总数 ${dbt}、窗口键 TTL=${ttl}s" \
+    || fail "原子计数错: 计费=${n}(期望20) RPM=${rpm}(期望20) TPM=${tpm}(期望${dbt}) TTL=${ttl}(期望1..120)"
+  q "UPDATE gateway_tokens SET concurrency_limit=3 WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+  rkdel "*ngrl:cc:${TID}"
+  codes=$(seq 1 12 | xargs -P 12 -I{} curl -s --max-time 20 -o /dev/null -w "%{http_code}\n" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-atom","messages":[]}')
+  sleep 2
+  nok=$(echo "$codes" | grep -c "^200$"); n429=$(echo "$codes" | grep -c "^429$")
+  ccn=$(rc --scan --pattern "*ngrl:cc:${TID}" | grep -c ngrl)
+  led=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1")
+  q "UPDATE gateway_tokens SET rpm_limit=NULL, concurrency_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+  # 429 的具体个数取决于调度时序（假上游太快时可能一个也不限），故只断言可对账的部分
+  [ $((nok + n429)) -eq 12 ] && [ "$ccn" = "0" ] && [ "$led" = "$((20 + nok))" ] \
+    && pass "并发额度生命周期：12 并发下 200=${nok}/429=${n429}、结束后并发键已删（无泄漏、无负数）、计费条数与 200 数对账" \
+    || fail "并发计数错: 200=${nok} 429=${n429}(合计应12) 残留并发键=${ccn}(期望0) 计费=${led}(期望$((20 + nok)))"
+fi
+
+# ══ S25 渠道写入的 SSRF 校验（管理员 API 全链路）══
+# NetGuard 的字面量/域名解析边界已在单测里穷举（含真 getaddrinfo 的 smoke）；这里验的是**接线**：
+# 控制器确实调了校验、新增的 Logger 构造注入没有破 DI（KSP 注入少一个绑定只有真跑才暴露）。
+# 域名 → DNS 复查这一层无法在 harness 里确定性触发（本机 DNS 可能是 fake-IP 模式，对任何
+# 名字都返回 198.18.0.0/15），所以公网域名用例只区分「放行」与「因解析失败而 fail-closed」，
+# 后者是 DNS 不可用时的预期行为，不计失败。
+echo "[S25] 渠道 SSRF 校验（admin API）"
+JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+mkch() { curl -s --max-time 10 -o "/tmp/s25-$2-$$" -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" \
+  -H "Authorization: Bearer $JWT" -H "$CT" -d "{\"name\":\"s25-$2\",\"type\":\"openai_compatible\",\"baseUrl\":\"$1\"}"; }
+meta=$(mkch "http://169.254.169.254/latest/meta-data" meta)
+loop=$(mkch "http://[::1]:9974/v1" loop)
+pub=$(mkch "http://8.8.8.8:8080/v1" pub)
+nbad=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name IN ('s25-meta','s25-loop')")
+npub=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s25-pub'")
+[ "$meta" = "400" ] && [ "$loop" = "400" ] && [ "$nbad" = "0" ] && [ "$pub" = "200" ] && [ "$npub" = "1" ] \
+  && pass "SSRF：云元数据 169.254.169.254 与 [::1] 被拒(400/未落库)、公网字面量正常创建(200/落库=${npub})" \
+  || fail "SSRF 校验错: 元数据=${meta}(期望400) ipv6回环=${loop}(期望400) 未落库=${nbad}(期望0) 公网=${pub}(期望200/落库${npub})"
+dom=$(mkch "https://api.openai.com/v1" dom); reason=$(cat "/tmp/s25-dom-$$" 2>/dev/null)
+rm -f "/tmp/s25-"*"-$$"
+if [ "$dom" = "200" ]; then
+  pass "域名渠道经 DNS 复查后放行（api.openai.com）"
+elif echo "$reason" | grep -q "could not be resolved"; then
+  echo "  ⚠️  本机解析不出 api.openai.com → 按 fail-closed 拒绝（DNS 不可用时的预期行为，不计失败）" >&2
+else
+  fail "域名渠道被意外拒绝: ${dom} ${reason}"
+fi
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
