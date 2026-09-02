@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # NanoGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
-# 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；依赖本机 5432、
-#   固定应用端口 7080、固定 fake 端口 9920–9991、固定隔离 Redis 端口 6399。真正 CI 应改用
-#   PostgreSQL/Redis service/container + 动态分配端口（列为紧接着的下一提交，见 SPEC.md 末「待办」段）。
+# 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；库位置由
+#   PGUSER/PGPASS/PGHOST/PGPORT 指定（默认本机 5432），其余端口是写死的：应用 7080、
+#   fake 9920–9991、隔离 Redis 6399。CI 跑的是同一个脚本（postgres 用 service 容器，见
+#   newgate/.github/workflows/backend-ci.yml）：一次性 runner 上写死端口不会撞，但本机并行跑
+#   多份 harness 会（动态端口仍在 SPEC.md 末「待办」段）。
 #   Redis 是「每次拉起一个独立实例」：开发机上 6379 往往有别的项目在用，绝不能往里写 harness 的键。
 set -uo pipefail
 
@@ -19,8 +21,10 @@ DB="newgate_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
 AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:7080"
-PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"
-export PGPASSWORD="$PGPASS" PGHOST
+PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"; PGPORT="${PGPORT:-5432}"
+# PGPORT 必须一起 export：createdb/dropdb/psql 与应用的 DSN 都靠它找库。写死 5432 等于假定
+# 目标库一定在默认端口上（CI 的 postgres 服务容器、或本机跑在非默认端口的集群都不成立）。
+export PGPASSWORD="$PGPASS" PGHOST PGPORT
 PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
@@ -67,7 +71,7 @@ cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
 cat > "$WORK/config/database.conf" <<EOF
 [default]
 driver = "POSTGRESQL"
-uri = "postgresql://$PGUSER:$PGPASS@$PGHOST:5432/$DB"
+uri = "postgresql://$PGUSER:$PGPASS@$PGHOST:$PGPORT/$DB"
 debug = false
 [migration]
 history_table = "neton_schema_history"
@@ -110,7 +114,9 @@ stop_app() {
   [ -n "$APP_PID" ] || return 0
   pkill -P "$APP_PID" 2>/dev/null; kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null
   # 端口必须真的空出来，否则新实例 bind 失败（表现为「未就绪」，误判成代码问题）
-  for i in $(seq 1 20); do lsof -nP -iTCP:7080 -sTCP:LISTEN >/dev/null 2>&1 || return 0; sleep 0.5; done
+  # 不用 lsof/ss 探端口：前者 GitHub 的 ubuntu runner 不一定装（缺了就静默「立刻返回端口已空」），
+  # 后者 macOS 没有。bash 内建的 /dev/tcp 两端都可用；连不上（ECONNREFUSED）即为端口已释放。
+  for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/7080") 2>/dev/null || return 0; sleep 0.5; done
   echo "  ⚠️  端口 7080 仍被占用，重启网关可能失败" >&2
 }
 echo "[boot] starting gateway…"
