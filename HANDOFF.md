@@ -74,7 +74,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 数据库           PostgreSQL（MySQL 已明确退出范围，见 SPEC「存量问题」）
 ```
 
-**五条必须知道的坑：**
+**六条必须知道的坑：**
 
 1. **sqlx4k 不支持 NUMERIC 解码**，碰到就 `panic=abort` 整进程崩溃。所有小数列一律用
    `VARCHAR`。这是未修的上游 P0（issue 草稿：`NewGate/docs/issues/sqlx4k-numeric-decode-p0.md`）。
@@ -94,6 +94,12 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
    redis 恒为 null——**不报错，只是限流静默退化成进程内计数**（多实例部署等于没限）。
    修法是模块手写 `init.{Id}RuntimeBootstrap`（KSP 约定，在 logics 之后、routes 之前调用）重绑一次：
    gateway 已加 `GatewayRuntimeBootstrap`。给 @Logic 类新增可选依赖时必须走这条路。
+6. **全局关掉了 Kotlin 默认层级模板**（`gradle.properties` 里 `kotlin.mpp.applyDefaultHierarchyTemplate=false`）：
+   `nativeMain` / `appleMain` / `linuxMain` 这些中间源集**不存在**。写 expect/actual 时得在模块自己的
+   build.gradle.kts 里 `val posixMain by creating { dependsOn(commonMain.get()) }`，再把具体目标源集
+   （`macosArm64Main` / `linuxX64Main` / `linuxArm64Main`）`by getting { dependsOn(posixMain) }` 挂上去；
+   `mingwX64Main` 由 target 声明自带，直接放 `src/mingwX64Main/kotlin` 即可（gateway 的平台 DNS
+   解析就是这么接的）。直接去 get `nativeMain` 会报 `KotlinSourceSet with name 'nativeMain' not found`。
 
 ## 四、已完成的部分
 
@@ -138,11 +144,27 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   2026-09-02 实测 **37/37 全绿**（已含下述框架拆分迁移修复）。
   ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用（`lsof -nP -iTCP:7080 -sTCP:LISTEN`）——
   旧进程应答会让所有场景假性失败。
-- **CI（`newgate/.github/workflows/backend-ci.yml`）已跑测试**：macOS job 编译 +
-  `:module-gateway` / `:module-system` 单元测试；Linux job 用真实 PostgreSQL service 跑
-  整个可靠性 harness。「只编译不跑测试」已是历史状态。
-  ⚠️ 该 CI 从未在 GitHub 实际运行过（后端仓未推），且其 checkout 平铺路径与
-  `settings.gradle.kts` 的 `Neton/*` 目录约定不一致，首次推送后需修。
+- **CI：三个仓都有 workflow（2026-09-02 重写）**
+  - 后端 `newgate/.github/workflows/backend-ci.yml`：macOS job 编译 + `:module-gateway` /
+    `:module-system` 单测；Linux job 用真实 PostgreSQL service + 隔离 Redis 跑整个可靠性 harness，
+    失败上传日志。两个 job 都缓存 `~/.konan`（Kotlin/Native 工具链 ~1GB，不缓存每轮重下）。
+  - 前端 `newgate-front` / `newgate-client` 各一份 `frontend-ci.yml`：pnpm 11 + Node 24，
+    `install --frozen-lockfile` → typecheck → build（本机已实测三步全绿）。
+    ⚠️ 两仓的 `pnpm-workspace.yaml` 里 `allowBuilds` 原本是脚手架占位文本，pnpm 11 会直接
+    报 `ERR_PNPM_IGNORED_BUILDS` 并以 exit 1 结束 install（esbuild 不落二进制 → `pnpm registry` 的 tsx
+    也跑不了），已改成 `true`。
+  - **checkout 布局是硬约束**：fork 放 `dist/<repo>`（两层深），canonical 仓放 workspace 根的 `Neton/*`。
+    后端 `settings.gradle.kts` 的 `../../Neton/*`、前端 `apps/*/package.json` 的
+    `file:../../../../Neton/*` 都按这个相对深度解析，差一层就装不起来。旧 workflow 的平铺路径
+    （`neton`、`neton-application-module-*` 直接放根）是错的，且漏了 geolite4k / module-system /
+    module-infra 三个必选 checkout，已修。
+  ⚠️ **仍未真跑过**：三个 fork 的 GitHub 仓还没建（origin 仍指向本地路径）。建好后需在每个仓
+  配 secret `NETON_CI_TOKEN`（fine-grained PAT，对 netonframework / neton-application 只读）：
+  canonical 仓里有私有仓（如 module-gateway、front-gateway），`actions/checkout` 跨仓拉私有仓时
+  `GITHUB_TOKEN` 无效。workflow 已写成 `secrets.NETON_CI_TOKEN || secrets.GITHUB_TOKEN`，全公开时不配也行。
+  ⚠️ 两个前端仓的 `pnpm-lock.yaml` 把 tarball 地址固定在 `registry.npmmirror.com`（维护者本地
+  registry 就是这个镜像）。GitHub runner 能访问但偏慢；要换官方源，得在没有全局 mirror 配置的
+  环境重新生成 lockfile。
 
 ## 五、⚠️ SPEC.md 的「待办」段落已过时
 
@@ -168,7 +190,8 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - 真实支付接入（现在只有 mock 充值，且需 `NEWGATE_ENABLE_MOCK_RECHARGE=true` 才启用）；
   payment/member 的充值与 gateway 额度未接通
 - 用户注册登录流（控制台只做了资料页，无自助注册）
-- 三个发行版仓（`newgate` / `newgate-front` / `newgate-client`）的正式远端未配置
+- 三个发行版仓（`newgate` / `newgate-front` / `newgate-client`）的正式远端未配置（CI workflow 已写好，
+  建仓 + 配 `NETON_CI_TOKEN` 后即可真跑）
 
 **功能缺口：**
 - Azure OpenAI 原生（当前走 OpenAiAdapter）
@@ -199,6 +222,8 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
    需要本机 5432 的 PostgreSQL（Homebrew postgresql@16 即可），凭据走 `PGUSER`/`PGPASS` 环境变量；
    另需 `redis-server`（`brew install redis`）——没装不会失败，但 S24 会跳过、限流退化为进程内计数。
 2. **配 remote**：`newgate` / `newgate-front` / `newgate-client` 三个仓的 origin 仍指向
-   `../Neton/*` 本地路径，推送产品代码前必须先改成正式远端。
+   `../Neton/*` 本地路径，推送产品代码前必须先改成正式远端（在 GitHub 建空的
+   `nanogate-backend` / `nanogate-frontend` / `nanogate-client`，然后
+   `git remote set-url origin git@github.com:zoujiaqing/<repo>.git && git push -u origin main`）。
 3. **提交规范**：简短英文单行，无 AI 痕迹（无 `Co-Authored-By`、无工具名）。全部历史已按此
    清理过，包括 force-push 重写了 `netonframework/neton` 的公共历史。
