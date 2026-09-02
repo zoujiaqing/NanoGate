@@ -1,3 +1,6 @@
+# 本地 AI 工具的个性化权限配置（含本机绝对路径与历史命令），不入库
+.claude/settings.local.json
+
 new-api/
 newgate/
 newgate-front/

@@ -23,12 +23,12 @@ Kotlin/Native + Neton 框架重写（new-api 是 Go，难维护）。核心能�
 
 | 目录 | 说明 | 远端 |
 |---|---|---|
-| `neton` | Kotlin/Native Web 框架本体（186 commits） | `netonframework/neton` |
+| `neton` | Kotlin/Native Web 框架本体（194 commits） | `netonframework/neton` |
 | `neton-application` | 后端应用底座 | `neton-application/neton-application` |
 | `neton-application-front` | 管理台前端底座 | 同组织 |
 | `neton-application-client` | **C 端控制台底座** | 同组织 |
 | `neton-application-module-{member,payment,platform}` | 通用后端模块 | 同组织 |
-| `neton-application-module-gateway` | **网关后端（NewGate 核心，49 commits）** | 同组织 |
+| `neton-application-module-gateway` | **网关后端（NanoGate 核心，57 commits）** | 同组织 |
 | `neton-application-front-gateway` | 网关管理台页面 | 同组织 |
 | `neton-application-client-{gateway,member,payment}` | C 端模块（gateway=产品，后两个=通用） | 同组织 |
 
