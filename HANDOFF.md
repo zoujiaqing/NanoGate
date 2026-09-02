@@ -3,10 +3,10 @@
 > **2026-09-02 改名**：产品更名 NewGate → **NanoGate**。根仓 GitHub 已改名为 `zoujiaqing/nanogate`；
 > 代码仓规划为 `nanogate-backend` / `nanogate-frontend` / `nanogate-client`。
 > **本地目录（`NewGate/`、`newgate/` 等）、`NEWGATE_*` 环境变量、隔离库名暂不改**：
-> `harness/run.sh` 依赖 `$ROOT/newgate` 路径，环境变量是后端配置契约，动了会破 23 断言基线。
+> `harness/run.sh` 依赖 `$ROOT/newgate` 路径，环境变量是后端配置契约，动了会破 37 断言基线。
 > 下文路径里的 NewGate/newgate 均为本地目录名，非产品名。
 
-> 最后核实：2026-09-01。本文以代码与 `harness/` 实测为准；与代码冲突的历史文档（尤其
+> 最后核实：2026-09-02。本文以代码与 `harness/` 实测为准；与代码冲突的历史文档（尤其
 > `SPEC.md` 末尾的「待办」段落）已过时，见第五节。
 
 ## 一、这是什么
@@ -74,7 +74,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 数据库           PostgreSQL（MySQL 已明确退出范围，见 SPEC「存量问题」）
 ```
 
-**三条必须知道的坑：**
+**五条必须知道的坑：**
 
 1. **sqlx4k 不支持 NUMERIC 解码**，碰到就 `panic=abort` 整进程崩溃。所有小数列一律用
    `VARCHAR`。这是未修的上游 P0（issue 草稿：`NewGate/docs/issues/sqlx4k-numeric-decode-p0.md`）。
@@ -89,6 +89,11 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
    build.gradle.kts 需加 `implementation("com.netonstream:neton-http-ktor")`，且文件需能解析到
    `neton.http.client.create`（显式 import 或 `neton.http.client.*`）。system/payment/gateway
    已按此修好。
+5. **KSP 的 @Logic 装配跳过带默认值的构造参数**（`LogicProcessor` 里 `if (p.hasDefault) continue`，
+   视为「自 provision」）。所以 `class RateLimiter(log, redis: RedisClient? = null)` 生成出来只传 log，
+   redis 恒为 null——**不报错，只是限流静默退化成进程内计数**（多实例部署等于没限）。
+   修法是模块手写 `init.{Id}RuntimeBootstrap`（KSP 约定，在 logics 之后、routes 之前调用）重绑一次：
+   gateway 已加 `GatewayRuntimeBootstrap`。给 @Logic 类新增可选依赖时必须走这条路。
 
 ## 四、已完成的部分
 
@@ -102,6 +107,16 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   CAS 状态转换，两阶段 worker（避免锁序反转），崩溃恢复
 - **安全**：CSPRNG token、渠道 Key AES-GCM 加密（`GatewayCrypto.seal/open`）、IP 白名单实际
   校验（`NetGuard.ipAllowed`）、SSRF `isPrivateHost`、RPM/TPM/并发限流（`RateLimiter.kt`）
+- **安全三件套（2026-09-02）**：
+  - **XFF 信任边界**：框架新增 `HttpRequest.peerAddress`（真实 TCP 对端，不被 XFF 污染；此前
+    `remoteAddress` 取的就是 XFF 最左值 = 客户端可控）。`NetGuard.clientIp` 只信
+    `NEWGATE_TRUSTED_PROXIES` 里的代理，从右往左剥链；未配则**完全忽略**转发头。
+    ⚠️ 空列表 = 谁都不信（与 `ipAllowed` 的「空 = 不限制」相反）。S14 两阶段断言
+  - **DNS 解析型 SSRF**：注入式 `HostResolver`（posix `getaddrinfo`；mingw 显式降级为不解析），
+    解析失败 fail-closed，任一结果落内网即拒。**挡不住 DNS rebinding**，那层只能靠部署侧出网
+    过滤（DEPLOY.md 有写）。S25 断言
+  - **原子限流计数**：`INCRBY` + 条件 `EXPIRE` 一次 Lua 执行（此前读-改-写并发下丢增量 = 限流可
+    绕过），`DECRBY` 带下限（防负数白送额度、防留下 TTL=-1 的永久键）。S24 断言
 - **三个路由组**：`admin`（管理台）、`app`（用户控制台，归属强制取 identity）、`gateway`
   （`/` 根挂载，`Bearer sk-`）
 - **原生认证载体**：`x-api-key`、`x-goog-api-key` 已映射
@@ -114,11 +129,13 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 ### 验证与 CI
 
-- **`NewGate/harness/run.sh` — 一条命令，16 场景 23 断言。**
-  隔离临时库 + 可注入故障的假上游（`fakes.py`）+ 真实网关。覆盖并发账务四项不变量、故障转移、
-  断连计费、worker 恢复、TTL 转人工、限流、IP 白名单、原生认证、用户端越权防护等。
+- **`NewGate/harness/run.sh` — 一条命令，25 场景 37 断言。**
+  隔离临时库 + 隔离 Redis 实例（6399/db15/前缀 `ngharness`，`--save ''`，PID 受控，**绝不碰开发机
+  6379**）+ 可注入故障的假上游（`fakes.py`）+ 真实网关。覆盖并发账务四项不变量、故障转移、
+  断连计费、worker 恢复、TTL 转人工、限流（含 Redis 原子计数）、IP 白名单 + XFF 信任边界、
+  SSRF（含 DNS 复查）、原生认证、用户端越权防护等。
   **改动账务或流式代码后必须跑这个。**
-  2026-09-01 接手时实测 **23/23 全绿**（已含下述框架拆分迁移修复）。
+  2026-09-02 实测 **37/37 全绿**（已含下述框架拆分迁移修复）。
   ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用（`lsof -nP -iTCP:7080 -sTCP:LISTEN`）——
   旧进程应答会让所有场景假性失败。
 - **CI（`newgate/.github/workflows/backend-ci.yml`）已跑测试**：macOS job 编译 +
@@ -134,10 +151,10 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 | SPEC 末尾说"未完成" | 实际 |
 |---|---|
-| IP 白名单仅字段无校验 | ✅ 已校验（S14 断言） |
-| RPM/TPM/并发未实现 | ✅ 已实现（S13 断言） |
+| IP 白名单仅字段无校验 | ✅ 已校验（S14 断言，含 XFF 信任边界） |
+| RPM/TPM/并发未实现 | ✅ 已实现（S13 断言；S24 断言 Redis 原子计数） |
 | 渠道 Key 明文存储 | ✅ AES-GCM 加密 |
-| SSRF 无校验 | ✅ `isPrivateHost` |
+| SSRF 无校验 | ✅ `isPrivateHost` + DNS 解析复查（S25 断言） |
 | `/v1/models` 返回空 | ✅ 真数据（S15 断言） |
 | 原生认证载体未映射 | ✅ 已映射（S15 断言） |
 | 未定价模型免费放行 | ✅ 拒绝（S16 断言） |
@@ -178,8 +195,9 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 ## 七、给接手者的三条建议
 
-1. **先跑 harness**（`cd NewGate && bash harness/run.sh`），23 绿是当前基线。任何改动后回归它。
-   需要本机 5432 的 PostgreSQL（Homebrew postgresql@16 即可），凭据走 `PGUSER`/`PGPASS` 环境变量。
+1. **先跑 harness**（`cd NewGate && bash harness/run.sh`），37 绿是当前基线。任何改动后回归它。
+   需要本机 5432 的 PostgreSQL（Homebrew postgresql@16 即可），凭据走 `PGUSER`/`PGPASS` 环境变量；
+   另需 `redis-server`（`brew install redis`）——没装不会失败，但 S24 会跳过、限流退化为进程内计数。
 2. **配 remote**：`newgate` / `newgate-front` / `newgate-client` 三个仓的 origin 仍指向
    `../Neton/*` 本地路径，推送产品代码前必须先改成正式远端。
 3. **提交规范**：简短英文单行，无 AI 痕迹（无 `Co-Authored-By`、无工具名）。全部历史已按此
