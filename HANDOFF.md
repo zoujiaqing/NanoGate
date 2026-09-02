@@ -41,16 +41,27 @@ WIP，从未入过基线），未经过完整评审，上线前需重点看。
 | 目录 | 说明 | 远端 |
 |---|---|---|
 | `NewGate/` | 设计文档、harness、docker-compose、DEPLOY.md | `zoujiaqing/nanogate`（由 `zoujiaqing/NewGate` 改名） |
-| `newgate` | 后端发行版（fork 自 neton-application） | ⚠️ origin 指向本地路径，本地领先 5 提交未推 |
-| `newgate-front` | 管理台发行版 | ⚠️ 同上 |
-| `newgate-client` | 用户控制台发行版 | ⚠️ 同上 |
+| `newgate` | 后端发行版（fork 自 neton-application） | ⚠️ origin 仍指向本地路径；本地领先 8 提交未推 |
+| `newgate-front` | 管理台发行版 | ⚠️ 同上（fork-local 历史已重写，领先 4 提交） |
+| `newgate-client` | 用户控制台发行版 | ⚠️ 同上（领先 4 提交） |
 | `new-api` | 参考源码，已 gitignore | — |
 
-> ⚠️ **三个 fork 的 origin 指向 fork 来源的本地路径**（`../Neton/neton-application*`）。
-> 直接 `git push` 会把产品代码注入通用底座仓——**已在 2026-09-01 验证拦截，不要推**。
-> 需在 GitHub 建 `zoujiaqing/nanogate-backend` / `nanogate-frontend` / `nanogate-client`
-> （本机无 `gh`、无 token，建仓需手工在网页操作），建好后改 origin 推送；
-> 后端仓本地领先 5 个提交（含全部发行版历史）。
+> ⚠️ **三个 fork 的 origin 仍指向 fork 来源的本地路径**（`../Neton/neton-application*`）。
+> 直接 `git push` 会把产品代码注入通用底座仓——已在 2026-09-01 验证拦截，不要推。
+> 本机 `gh` 已装（2.99.0）但**未登录**（`gh auth status` 报 not logged into any hosts），
+> 这是建仓与推送唯一的阻塞项。登录后：建 `zoujiaqing/nanogate-backend` /
+> `nanogate-admin` / `nanogate-client` 三个**公开**仓，每个 fork 先 `git remote rename origin upstream`
+> （保留向 canonical 合并的能力）再 `git remote add origin` 指向新仓推送；
+> 每个仓还需设 `NETON_CI_TOKEN` secret（workflow 要 checkout 私有 canonical 仓）。
+>
+> 发布前三项已完成（2026-09-02，待提交）：四仓 Apache-2.0 `LICENSE`、三份产品 README
+> 重写为 NanoGate 身份（修了 `docs/ENGINEERING_RULES.md` 死链与 `includeBuild` 误述）、
+> privchat 引用清理（三个产品仓已 0）。
+>
+> ⚠️ **公开不等于可自建**：`module-infra`、`module-gateway`、
+> `front-{gateway,member,payment,platform}`、`client-gateway` 七个 canonical 仓仍是私有
+> （2026-09-02 匿名探测确认），外人 clone 不全就构建不出镜像、装不起前端。
+> 已写进各 README；要真开源就得把这七个仓也转公开，或改为发布制品。
 
 ### 关键设计文档
 
@@ -142,8 +153,9 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   SSRF（含 DNS 复查）、原生认证、用户端越权防护等。
   **改动账务或流式代码后必须跑这个。**
   2026-09-02 实测 **37/37 全绿**（已含下述框架拆分迁移修复）。
-  ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用（`lsof -nP -iTCP:7080 -sTCP:LISTEN`）——
-  旧进程应答会让所有场景假性失败。
+  ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用——旧进程应答会让所有场景假性失败。
+  macOS 上 `lsof -nP -iTCP:7080 -sTCP:LISTEN` 最直接；但**别把 lsof 写进脚本**（ubuntu runner
+  不一定装，缺了会静默变成「端口已空」），`run.sh` 里用的是 bash 内建的 `/dev/tcp` 探测。
 - **CI：三个仓都有 workflow（2026-09-02 重写）**
   - 后端 `newgate/.github/workflows/backend-ci.yml`：macOS job 编译 + `:module-gateway` /
     `:module-system` 单测；Linux job 用真实 PostgreSQL service + 隔离 Redis 跑整个可靠性 harness，

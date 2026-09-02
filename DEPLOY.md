@@ -5,19 +5,37 @@
 
 ## 依赖仓库布局
 
-镜像用 Gradle composite build，构建上下文必须能看到同级的框架与模块仓库：
+镜像用 Gradle composite build，`newgate/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：
+本仓必须正好在那层目录的**两层深处**，框架与六个 canonical 模块必须落在同层的 `Neton/` 下。
+外层目录名（`Neton`、`NewGate`）也是契约的一部分——`newgate/Dockerfile` 的 `COPY` 源同样写死了它们。
 
 ```
 projects/
-├── neton/                              # 框架
-├── neton-application-module-member/
-├── neton-application-module-payment/
-├── neton-application-module-platform/
-├── neton-application-module-gateway/
-└── NewGate/
-    ├── newgate/                        # 应用（Dockerfile 在此）
-    └── docker-compose.yml
+├── Neton/
+│   ├── neton/                              # 框架（includeBuild）
+│   ├── geolite4k/                          # GeoIP（includeBuild）
+│   ├── neton-application-module-system/
+│   ├── neton-application-module-infra/
+│   ├── neton-application-module-member/
+│   ├── neton-application-module-payment/
+│   ├── neton-application-module-platform/
+│   └── neton-application-module-gateway/   # NanoGate 的核心模块
+└── NewGate/                                # 本仓（含 docker-compose.yml）
+    ├── newgate/                            # 后端发行版（Dockerfile 在此）
+    ├── newgate-front/                      # 管理台
+    └── newgate-client/                     # 用户控制台
 ```
+
+> ⚠️ 八个仓里有六个是公开的（`netonframework/neton`、`netonframework/geolite4k`、
+> `neton-application/neton-application-module-{system,member,payment,platform}`），但
+> **`neton-application-module-infra` 与 `neton-application-module-gateway` 目前是私有仓**。
+> 没有这两个仓的读权限就 clone 不全、也就构建不出镜像；它们转公开之前，本仓的公开只是
+> 「源码可读」，不是「人人可自建」。前端同理（见各自 README）。
+
+> ⚠️ 下文 Docker 路径**尚未在实机验证过**（修正时的开发机上 Docker daemon 未运行）。
+> `COPY` 布局是按 `settings.gradle.kts` 的路径推导修正的，此前它既漏了三个必需仓、
+> 又把应用放在了 `../../Neton` 解不到的深度。首次 `docker compose build` 请当作待验证项，
+> 失败时先看是不是布局问题。
 
 ## 启动
 
@@ -141,15 +159,20 @@ docker compose up -d
 - RPM / TPM / 并发计数走服务端 Lua 脚本（`INCRBY` 与 `EXPIRE` 一次执行）：并发下不丢增量，
   也不会因为进程在两条命令之间崩溃而留下永不过期的计数键。Redis 抖动时降级为进程内计数并告警，
   不会让请求整体失败。
-- 与其他 Neton 应用共用 Redis 时用 `keyPrefix`（`config/redis.conf`，根级平铺、**不要**写 `[redis]` 段）
-  隔开命名空间；限流键形如 `<prefix>:ngrl:rpm:<tokenId>:<分钟窗口>`，窗口键带 120s TTL 自动消失。
+- 与其他 Neton 应用共用 Redis 时用 `keyPrefix` 隔开命名空间；限流键形如
+  `<prefix>:ngrl:rpm:<tokenId>:<分钟窗口>`，窗口键带 120s TTL 自动消失。
+  本发行版**没附带** `config/redis.conf`（框架按「文件名 = 命名空间」可选加载，缺文件就走默认值），
+  要设前缀有两条路：在 `newgate/application/config/` 下自建 `redis.conf`（根级平铺
+  `keyPrefix = "nanogate"`，**不要**写 `[redis]` 段），或直接给环境变量 `NETON_REDIS__KEYPREFIX`。
 - 别把网关和其他项目混在同一个 db 里再做 `flushdb`：harness 就是因此自带一个隔离实例
   （独立端口 + 独立 db + 独立 `keyPrefix` + 关持久化）。
 
 ## 升级
 
 ```bash
-git -C .. pull --rebase   # 各依赖仓库同理
+git pull --rebase                       # 本仓（NewGate/，compose 与文档）
+git -C newgate pull --rebase            # 后端发行版（嵌套仓，不归上面那条管）
+for r in ../Neton/*/; do git -C "$r" pull --rebase; done   # 框架与各 canonical 模块
 docker compose build
 docker compose up -d
 ```
