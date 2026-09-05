@@ -98,7 +98,16 @@ if command -v redis-server >/dev/null 2>&1; then
 else
   echo "  ⚠️  未安装 redis-server（brew install redis）：限流退化为进程内计数，S24 跳过" >&2
 fi
-( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ) || { echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1; }
+if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
+  # NETON-DB-VARIANT mismatch 不是配置错，而是链接进二进制的 neton-database variant 陈旧：
+  # link 任务可能判 UP-TO-DATE 而复用旧产物（kexe 里的字符串不是明文，无法直接取证）。
+  # 不提示的话，这个错会被当成 database.conf 写错去查，白白耗掉很久。
+  if grep -q 'NETON-DB-VARIANT' "$LOGS/migrate.log"; then
+    echo "  ⚠️  variant 陈旧：重链一次即可 ——" >&2
+    echo "     ( cd \"$NEWGATE\" && ./gradlew :application:clean && ./gradlew \"$LINK_TASK\" -Pneton.database.driver=postgres )" >&2
+  fi
+  echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
+fi
 # 基础令牌 + 账户（member 用户 id=1 由迁移种子提供；harness 直插 gateway 令牌）
 q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
    INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT (key_hash) DO NOTHING;" >/dev/null
@@ -260,7 +269,7 @@ b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 [ -n "$ref" ] && [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
   && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
   || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
-# settlement 终态：FINALIZED + 预留归零（V004 核心不变量）
+# settlement 终态：FINALIZED + 预留归零（V004-durable-settlement-design 的核心不变量）
 st=$(q "SELECT status FROM gateway_settlements ORDER BY id DESC LIMIT 1")
 rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
 qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
@@ -455,7 +464,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
 unpriced=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c "m-unpriced")
 [ "$unpriced" = "0" ] && pass "未定价模型不出现在模型广场" || fail "未定价模型泄漏到广场(${unpriced})"
 
-# ══ S17 在途改价按预留快照计价（V004 §7.1）══
+# ══ S17 在途改价按预留快照计价（V004-durable-settlement-design §7.1）══
 # 慢上游 2s 才响应：在「已预留、未结算」窗口把模型价涨 10 倍、分组倍率改 2。
 # 若 bill() 重查价表会扣 (25×1000+100×500)×2=150000；快照语义必须仍是 7500。
 echo "[S17] 在途改价按快照计价"
@@ -478,7 +487,7 @@ q "UPDATE gateway_groups SET ratio='1.0' WHERE name='default';" >/dev/null   # �
   && pass "在途改价/改倍率仍按预留快照计费 charged=${lc}（重查价表会扣 150000）、四项一致" \
   || fail "在途改价计费错: code=$code charged=${lc} debit=${ta} balanceΔ=${bd} quotaUsed=${tu}（期望 7500）"
 
-# ══ S18 快照损坏不得按实时价扣款 → MANUAL_REVIEW 保留预留（V004 §7.1）══
+# ══ S18 快照损坏不得按实时价扣款 → MANUAL_REVIEW 保留预留（V004-durable-settlement-design §7.1）══
 # 注入点：渠道 cost_discount 坏值。模型价在入口就要过售价轨校验（坏价走 S19），渠道折扣却是 T2
 # 才并入快照的，坏值因此能「合法」写进快照；bill() 严格校验四要素必须拒绝：不扣款、不写台账/
 # usage log、不释放预留、转 MANUAL_REVIEW + 高优告警。修复前：坏字段被默认值补齐或回退实时价。
@@ -595,7 +604,9 @@ nhi=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate2'")
   && pass "毛利下限 1.5：售价 3（<2.5×1.5=3.75）被拒(400)、售价 4 通过(200/落库=${nhi})" \
   || fail "毛利下限错: 售价3=${low}(落库${nlow}) 售价4=${hi}(落库${nhi})"
 
-# ══ S23 端点能力路由：embeddings 只落到声明了该能力的渠道（V007）══
+# ══ S23 端点能力路由：embeddings 只落到声明了该能力的渠道 ══
+# capabilities 列在 sql/*/V001__baseline.sql 的「原 V007__channel_capabilities」段 ——
+# 迁移已合并成单 baseline（ff36f49），别再按 V007 去找文件。
 # 此前 /v1/embeddings 只要模型名命中就路由：打到只会 chat 的上游必然 404，而钱已预留、日志已脏、重试还撞三遍同一堵墙。
 #  - m-emb 同时挂在 chat-only 与 chat,embeddings 两个渠道 → 必须选中后者（用 usage_logs.channel_id 举证）；
 #    embeddings 响应只有 prompt_tokens → charged 只按 7 个输入 token，不得凭空补出输出费用；
