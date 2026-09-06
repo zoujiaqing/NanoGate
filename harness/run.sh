@@ -55,7 +55,21 @@ seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_p
   UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
   UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
 
-fake() { MODE="$1" PORT="$2" python3 "$HERE/fakes.py" >/dev/null 2>&1 & PIDS+=($!); }
+# fake 是后台拉起的，bind 需要时间；以前每个调用点靠 `sleep 1` 等它，机器一忙就踩空。
+# 踩空的症状会漂到断言里、指向错误的原因：实测 S8 的上游没起来 → relay 失败 → 没有 consume
+# 台账 → ref 为空 → 那条手插的 ref='' 既不撞唯一约束、又数出 cnt=1、余额也不动，看起来跟
+# 「幂等约束失效」一模一样。所以在这里等端口真能连上（最多 5s）；25 个调用点的 sleep 一律
+# 保留不动，只会更稳。探测用 bash 内建的 /dev/tcp 而不是 nc：本脚本本来就依赖 bash
+# （数组、$(seq)），不该为此再引入一个 CI 上未必存在的外部命令。
+fake() {
+  MODE="$1" PORT="$2" python3 "$HERE/fakes.py" >/dev/null 2>&1 & PIDS+=($!)
+  local i
+  for i in $(seq 1 50); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$2") >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  echo "⚠️  上游 fake :$2 起不来（5s 内端口没开）—— 这条场景的断言会指向错误的原因" >&2
+}
 
 echo "═══ NanoGate 可靠性 harness (DB=$DB) ═══"
 
@@ -263,24 +277,31 @@ seed_reset; fake ok 9900; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-idem','openai_compatible','http://127.0.0.1:9900','default','m-idem',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-idem'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-idem','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
-curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-idem","messages":[]}'; sleep 1
+h8=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-idem","messages":[]}'); sleep 1
 ref=$(q "SELECT ref FROM gateway_quota_transactions WHERE type='consume' ORDER BY id DESC LIMIT 1")
 b1=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-# 重放：手动以同一 ref 再插一条台账 → 唯一约束应拒绝（模拟重试/outbox 重放不重复扣）
-duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO gateway_quota_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
-cnt=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$ref'")
-b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-{ echo "$duperr" | grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref"; } && rejected=1 || rejected=0
-[ -n "$ref" ] && [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
-  && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
-  || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
-# settlement 终态：FINALIZED + 预留归零（V004-durable-settlement-design 的核心不变量）
-st=$(q "SELECT status FROM gateway_settlements ORDER BY id DESC LIMIT 1")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
-qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
-[ "$st" = "FINALIZED" ] && [ "$rb" = "0" ] && [ "$qr" = "0" ] \
-  && pass "settlement 终态 FINALIZED、预留归零(account=$rb token=$qr)" \
-  || fail "settlement 终态错: status=$st reservedBalance=$rb quotaReserved=$qr"
+if [ "$h8" != "200" ] || [ -z "$ref" ]; then
+  # 前置不成立就**别**去断言幂等：请求没成功就不会有 consume 台账，ref 为空会让下面那条手插的
+  # ref='' 既不撞唯一约束、又数出 cnt=1、余额也不动 —— 症状跟「约束失效」完全一样。
+  # 这条场景真这么误报过一次（真因是上游 fake 没起来），所以把前置单独判掉、只报一条准的。
+  fail "S8 前置没成立：relay HTTP=$h8(期望200)、consume ref='${ref:-空}' —— 请求没成功，幂等约束与结算终态这次都没被测到（不是约束失效）"
+else
+  # 重放：手动以同一 ref 再插一条台账 → 唯一约束应拒绝（模拟重试/outbox 重放不重复扣）
+  duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO gateway_quota_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
+  cnt=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$ref'")
+  b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+  { echo "$duperr" | grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref"; } && rejected=1 || rejected=0
+  [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
+    && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
+    || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
+  # settlement 终态：FINALIZED + 预留归零（V004-durable-settlement-design 的核心不变量）
+  st=$(q "SELECT status FROM gateway_settlements ORDER BY id DESC LIMIT 1")
+  rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+  qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+  [ "$st" = "FINALIZED" ] && [ "$rb" = "0" ] && [ "$qr" = "0" ] \
+    && pass "settlement 终态 FINALIZED、预留归零(account=$rb token=$qr)" \
+    || fail "settlement 终态错: status=$st reservedBalance=$rb quotaReserved=$qr"
+fi
 
 # ══ S9 上游 midstream abort（真实 partial 语义）══
 # 上游发 2 块后关连接、未发 [DONE] → 网关须判 PARTIAL：partial 日志、per-request 价四项账务一致、Key 计失败、
@@ -819,20 +840,42 @@ gone=$(q "SELECT deleted FROM gateway_groups WHERE id=$DEL26")
 [ "$d0" = "200" ] && [ "$gone" = "1" ] \
   && pass "无引用的组可删（HTTP=${d0}、deleted=${gone}）" \
   || fail "无引用组删不掉: HTTP=${d0} deleted=${gone}"
-# 用户级例外：gateway_group_overrides 目前只有 SQL + 表对象（还没有管理端 CRUD），
-# 所以直接按 a5 解析器第 2 步会读到的形态插一行。漏了这条检查就会留下悬空 group_code。
-q "INSERT INTO gateway_group_overrides (user_id,group_code,remark,created_at,updated_at) VALUES (1,'vip26','大客户谈判价',0,0)" >/dev/null
-d1=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+# 三类引用必须**分别**被证明。GroupController.delete 的检查顺序是 令牌覆盖 → 用户级例外 → 渠道 CSV，
+# 先命中的先返回，所以只要令牌覆盖还在，「测用户级例外」那一发拿到的其实是令牌那条原因 ——
+# 409 是对的，原因却不是：把用户级例外那个 if 整块删掉，这条也照样绿。它此前正是这个状态
+# （S27 把令牌的 group_override 设成 vip26 后一直没清，d1 与 d2 因此都在证明同一件事）。
+# 于是每一发只留一类引用，并断言 409 的 message **点名**是哪一类 —— 点名才是真守卫。
+q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH'" >/dev/null
+
+# (1) 只剩用户级例外。走管理端 API 建（写路径本身由 S48 覆盖），要的是「生产上真会出现的那种引用」，
+#     而不是一行手写 SQL —— 手写 SQL 正是悬空 group_code 的来源。
+c28=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip26","remark":"大客户谈判价"}')
+d1=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+m1=$(head -c 300 "$GB" 2>/dev/null)
 a1=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
-q "DELETE FROM gateway_group_overrides WHERE user_id=1" >/dev/null
-d2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+rm28=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
+
+# (2) 只剩令牌覆盖
+q "UPDATE gateway_tokens SET group_override='vip26' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+d2=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+m2=$(head -c 300 "$GB" 2>/dev/null)
 a2=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
 q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH'" >/dev/null
-d3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+
+# (3) 只剩渠道 CSV（c-grp 的 groups 一直是 'default,vip26'）
+d3=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
+m3=$(head -c 300 "$GB" 2>/dev/null)
 a3=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
-[ "$d1" = "409" ] && [ "$a1" = "0" ] && [ "$d2" = "409" ] && [ "$a2" = "0" ] && [ "$d3" = "409" ] && [ "$a3" = "0" ] \
-  && pass "三类引用都拦住删除(409)：用户级例外、令牌覆盖、渠道 CSV，组均仍在(deleted=0)" \
-  || fail "删除保护有洞: 例外=${d1}(期望409)/deleted=${a1} 令牌=${d2}(期望409)/deleted=${a2} 渠道=${d3}(期望409)/deleted=${a3}"
+p1=$(printf '%s' "$m1" | grep -c 'per-user override')
+p2=$(printf '%s' "$m2" | grep -c 'token group override')
+p3=$(printf '%s' "$m3" | grep -c 'channel(s)')
+[ "$c28" = "200" ] && [ "$rm28" = "200" ] \
+  && [ "$d1" = "409" ] && [ "$a1" = "0" ] && [ "$p1" = "1" ] \
+  && [ "$d2" = "409" ] && [ "$a2" = "0" ] && [ "$p2" = "1" ] \
+  && [ "$d3" = "409" ] && [ "$a3" = "0" ] && [ "$p3" = "1" ] \
+  && pass "三类引用分别被证明（各 409、组均仍在 deleted=0、message 各点名一类）：用户级例外(建=${c28}/撤=${rm28}) 点名=${p1}、令牌覆盖 点名=${p2}、渠道 CSV 点名=${p3}" \
+  || fail "删除保护没分开证明: 建例外=${c28}(期望200) 撤例外=${rm28}(期望200) 例外=${d1}(期望409)/deleted=${a1}/点名=${p1}(期望1) 令牌=${d2}(期望409)/deleted=${a2}/点名=${p2}(期望1) 渠道=${d3}(期望409)/deleted=${a3}/点名=${p3}(期望1) m1=${m1:0:110} m2=${m2:0:110} m3=${m3:0:110}"
 
 echo "[S29] 用户不能自行提组"
 # 自助建 Key 的 DTO（CreateMyTokenRequest）里没有 groupOverride 字段，TokenLogic.issue 也不收这个参数。
@@ -1529,6 +1572,145 @@ k3=no; printf '%s' "$b3" | grep -q 'gateway:group:create' && k3=yes
   || fail "授权巡检不过: 发额度=${h1}(期望403，点名=${k1}) 退款=${h2}(期望403，点名=${k2}) 建组=${h3}(期望403，点名=${k3}) 余额=${bal47a}→${bal47b}(期望不变) 台账=${nled47a}→${nled47b}(期望不变) 组=${ngrp47a}→${ngrp47b}(期望不变) bodies='${b1:0:80}'|'${b2:0:80}'|'${b3:0:80}'"
 
 rm -f "$GB"
+
+echo "[S48] 用户级计价例外：管理端能写、写了真的改变计价，悬空组写不进去"
+# 这一条补的是两层空白：
+#   ① 写路径此前**根本不存在** —— gateway_group_overrides 只有 SQL + 表对象 + 解析器第 2 步的读，
+#      运营要给人配谈判价只能手工改库，而手工改库正是悬空 group_code 的来源。
+#   ② 解析顺序的**第 2 层此前零端到端覆盖**：整个 run.sh 里这张表只出现在 S28 的两行裸 SQL
+#      （插入 → 测删除守卫 → 删掉），从来没有任何场景断言过「配了例外之后计价真的变了」。
+#      S26 覆盖的是第 1 层（令牌覆盖）、第 3 层（会员组）、第 4 层（default），第 2 层被跳过了。
+# 所以核心断言不是「接口返回 200」，而是**倍率真的生效**：先量一次基线，配例外后再量一次，
+# 断言后者恰好是前者的 ratio 倍。用比值而不是写死金额：金额取决于模型价与 token 数，
+# 写死期望值会把「定价变了」误报成「例外没生效」（S27 已经因为 normalize 剔尾零踩过一次）。
+stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+GJWT=$(admin_jwt)
+# 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 member_users(1) 的会员组是 S26 留下的
+# 未映射组，基线那一发会变成 403 而不是按 default 计价。关掉它，比较才是干净的两层：例外 vs default。
+seed_reset; fake ok 9948; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c48','openai_compatible','http://127.0.0.1:9948','default,vip48','m-grp',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c48'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
+   UPDATE gateway_groups SET deleted=0, ratio='1.0' WHERE code='default';
+   DELETE FROM gateway_group_overrides WHERE user_id IN (1,2);
+   UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+g48=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"code":"vip48","name":"谈判价三倍","ratio":"3.0"}')
+VIP48=$(GID vip48)
+b0=$(relay26); sleep 1; base=$(charged26)
+cr=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip48","remark":"S48 大客户谈判价"}')
+row48=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=1")
+b1=$(relay26); sleep 1; with48=$(charged26)
+[ "$g48" = "200" ] && [ -n "$VIP48" ] && [ "$b0" = "200" ] && [ "$cr" = "200" ] && [ "$row48" = "vip48" ] \
+  && [ "$b1" = "200" ] && [ -n "$base" ] && [ "$base" -gt 0 ] && [ "$with48" = "$((base*3))" ] \
+  && pass "用户级例外真的改变计价（解析第 2 层，此前零覆盖）：建组=${g48}(id=${VIP48}) 基线 relay=${b0} charged=${base}（default ratio 1.0）→ 管理端配例外=${cr} 且库里 group_code=${row48} → relay=${b1} charged=${with48}，恰好是基线的 3 倍（vip48 ratio 3.0）" \
+  || fail "例外没生效: 建组=${g48}(期望200) VIP48=${VIP48} 基线=${b0}/${base} 配例外=${cr}(期望200) 库里=${row48}(期望vip48) 例外后=${b1}/${with48}(期望$(( ${base:-0} * 3 ))) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# 悬空 group_code 必须在**写入时**就被拒。放它进去的代价不是脏数据，是该用户此后每一个请求
+# 都 500 billing_group_config_broken（第 2 层命中却找不到活组，且不回落）。
+# 超长 remark 同理：到了驱动那一层三方言处置不一致（报错 / 静默截断），截断会把备注变成半句话。
+dang=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":2,"groupCode":"ghost48","remark":"悬空"}')
+blank=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":2,"groupCode":"   "}')
+LONGR48=$(python3 -c 'print("x"*257)')
+longr=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"userId\":2,\"groupCode\":\"vip48\",\"remark\":\"$LONGR48\"}")
+nonpos=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":0,"groupCode":"vip48"}')
+n2=$(q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id IN (0,2)")
+[ "$dang" = "400" ] && [ "$blank" = "400" ] && [ "$longr" = "400" ] && [ "$nonpos" = "400" ] && [ "$n2" = "0" ] \
+  && pass "写入校验在驱动之前：悬空组=${dang}、空白组=${blank}、257 字 remark=${longr}、userId=0 均 400（非 500），且一行也没写进去（user 0/2 共 ${n2} 条）" \
+  || fail "写入校验不对: 悬空=${dang}(期望400) 空白=${blank}(期望400) 超长remark=${longr}(期望400) userId=0=${nonpos}(期望400) 写入行数=${n2}(期望0) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# 主键就是 userId，所以「同一用户第二条」只能是冲突。这里要同时守住两件事：
+# ① 是 409 而不是 500（撞主键的驱动异常未被归类的话，框架会兜底成 500 + "Internal Server Error"，
+#    message 不进信封，管理端只看到一片空白）；② 被拒的那一发**没把旧行改掉**。
+dup=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"default","remark":"第二条"}')
+still=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=1")
+upd=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X PUT "$U/admin/gateway/group-override/update" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"default","remark":"改回默认价"}')
+now48=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=1")
+b2=$(relay26); sleep 1; back=$(charged26)
+[ "$dup" = "409" ] && [ "$still" = "vip48" ] && [ "$upd" = "200" ] && [ "$now48" = "default" ] \
+  && [ "$b2" = "200" ] && [ "$back" = "$base" ] \
+  && pass "一人一条：重复 create=${dup}（409 而非 500）且旧行仍是 ${still} 没被踩；update 才是改它的入口=${upd} → ${now48}，且计价跟着回到基线（charged ${with48}→${back}，等于基线 ${base}）" \
+  || fail "唯一性/更新不对: 重复create=${dup}(期望409) 被拒后库里=${still}(期望vip48) update=${upd}(期望200) 现值=${now48}(期望default) relay=${b2} charged=${back}(期望=${base}) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# 最后两件事：撤销真的是硬删（表无 deleted 列），以及 app 组一条也不许有 ——
+# 自助用户能设自己的计费组就等于自己给自己打折。404 而不是 403：路由就不应该存在，
+# 403 反而会告知攻击者「这条路对，只是你不够权」。
+del=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
+gone48=$(q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id=1")
+del2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
+nfbody=$(curl -s --max-time 10 "$U/admin/gateway/group-override/get/1" -H "Authorization: Bearer $GJWT")
+ac1=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/group-override/create" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip48"}')
+ac2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/group-override/list" -H "Authorization: Bearer $GJWT")
+ac3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/app/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
+leak48=$(q "SELECT COUNT(*) FROM gateway_group_overrides")
+[ "$del" = "200" ] && [ "$gone48" = "0" ] && [ "$del2" = "404" ] \
+  && printf '%s' "$nfbody" | grep -q '"data":null' \
+  && [ "$ac1" = "404" ] && [ "$ac2" = "404" ] && [ "$ac3" = "404" ] && [ "$leak48" = "0" ] \
+  && pass "撤销是硬删且 app 组不暴露：delete=${del} 且行已消失(${gone48})、再删=${del2}（404 而非 500）、get 回 ${nfbody}；app 组下 create/list/delete 均 ${ac1}/${ac2}/${ac3}（路由不存在，不是 403），全表剩 ${leak48} 行" \
+  || fail "撤销/暴露不对: delete=${del}(期望200) 删后行数=${gone48}(期望0) 再删=${del2}(期望404) get回显='${nfbody:0:80}'(期望 data:null) app组 create=${ac1} list=${ac2} delete=${ac3}（均期望404）全表行数=${leak48}(期望0)"
+
+rm -f "$GB"
+
+# ══ S49 权限 → 菜单 → 页面 的接线完整性（常驻哨兵）══
+# 前面 48 个场景断言的都是「跑起来的行为」，这一条断言的是「能不能被委派」。
+# rbac-spec §1.4 冻结了权限只能经 菜单 → 角色 → 用户 继承，禁止 User→Permission 与
+# Role→Permission 直连。所以一个 @Permission 串如果没有 system_menus 行，它就无法被授予任何
+# 角色 —— 只有 super_admin 的 *:*:* 通配能过。**这个洞不会让任何一条行为断言变红**：
+# 接口照样 200，因为跑 harness 用的就是超级管理员。它只能靠「数注解、数种子」看见。
+# 三道：① 每个 @Permission 都有菜单种子 ② 每个二级菜单的 component 都有前端页面
+# ③ 根目录与二级菜单都 status=1（前端 buildRouteMap/buildNav 对 status!==1 直接 continue，
+#    而列默认值是 0 —— 漏写这一位，菜单既不进侧栏也不进路由表，且不报任何错；
+#    根目录被跳时整棵子树跟着不可达）。
+echo "[S49] 权限→菜单→页面 接线完整性"
+NETON="$NEWGATE/../../Neton"
+GWSRC="$NETON/neton-application-module-gateway/src/commonMain/kotlin"
+GWMANIFEST="$NETON/neton-application-front-gateway/src/manifest.ts"
+A1=/tmp/s49-annot-$$; A2=/tmp/s49-seeded-$$; A3=/tmp/s49-comp-$$; A4=/tmp/s49-keys-$$
+if [ -d "$GWSRC" ]; then
+  # 注解集只取字面量形式。已核实本模块 44 处 @Permission 全是字面量、无 @Permission(CONST)
+  # 写法，也无全限定名 —— 后者（@neton.core.annotations.Permission）曾在 payment 骗过一次扫描，
+  # 把本来有保护的退款端点报成了授权洞。将来换了写法，这里的数字会当场对不上。
+  grep -rhoE '@Permission\("[^"]+"\)' "$GWSRC" | sed 's/@Permission("//;s/")//' | sort -u > "$A1"
+  q "SELECT permission FROM system_menus WHERE permission LIKE 'gateway:%' ORDER BY 1" | sort -u > "$A2"
+  na=$(wc -l < "$A1" | tr -d ' '); ns=$(wc -l < "$A2" | tr -d ' ')
+  miss=$(comm -23 "$A1" "$A2" | tr '\n' ' '); nmiss=$(comm -23 "$A1" "$A2" | wc -l | tr -d ' ')
+  orph=$(comm -13 "$A1" "$A2" | tr '\n' ' '); norph=$(comm -13 "$A1" "$A2" | wc -l | tr -d ' ')
+  # 只卡「有注解无种子」这个方向（它造成真实伤害：权限委派不出去）。
+  # 反方向（有种子无注解）只是一个点了没对应接口的死按钮，不造成越权，所以只报数不判红 ——
+  # 拿它判红会卡住「先播菜单、后接接口」这种合理的施工顺序。
+  [ "$nmiss" = "0" ] \
+    && pass "每个 @Permission 都有菜单种子（注解 ${na} 个唯一串 vs 种子 ${ns} 行，缺口 0）；反向孤儿种子 ${norph} 个 ${orph}——不判红，但应该是 0" \
+    || fail "有注解无菜单种子 ${nmiss} 个（按 rbac-spec §1.4 这些权限无法被授予任何角色，只有 super_admin 能用）: ${miss} | 注解=${na} 种子=${ns}"
+else
+  echo "  ⚠️  跳过注解↔种子比对：$GWSRC 不存在" >&2
+fi
+if [ -f "$GWMANIFEST" ]; then
+  # component 是承重字段：前端 catch-all 拿它去 pageRegistry 取 loader（而 pageRegistry 由
+  # manifest 的 page key 生成）。对不上就是悬空引用，点进去只得到「页面未安装」。
+  q "SELECT component FROM system_menus WHERE component LIKE 'gateway/%' ORDER BY 1" | sort -u > "$A3"
+  grep -oE 'key: "[^"]+"' "$GWMANIFEST" | sed 's/key: "//;s/"//' | sort -u > "$A4"
+  dang=$(comm -23 "$A3" "$A4" | tr '\n' ' '); ndang=$(comm -23 "$A3" "$A4" | wc -l | tr -d ' ')
+  ncomp=$(wc -l < "$A3" | tr -d ' '); nkey=$(wc -l < "$A4" | tr -d ' ')
+  [ "$ndang" = "0" ] \
+    && pass "每个菜单 component 都有前端页面（菜单 ${ncomp} 个 component vs manifest ${nkey} 个 key，悬空 0）" \
+    || fail "菜单引用了不存在的页面 ${ndang} 个（点进去只会得到「页面未安装」）: ${dang} | 菜单 component=${ncomp} manifest key=${nkey}"
+else
+  # CI 只 checkout 后端模块（见 backend-ci.yml），前端仓不在 —— 这道比对在那里无从执行。
+  echo "  ⚠️  跳过 component↔manifest 比对：$GWMANIFEST 不存在（CI 不 checkout 前端仓）" >&2
+fi
+bad49=$(q "SELECT COUNT(*) FROM system_menus WHERE status <> 1 AND (component LIKE 'gateway/%' OR (type = 1 AND path = '/gateway'))")
+n49=$(q "SELECT COUNT(*) FROM system_menus WHERE component LIKE 'gateway/%'")
+[ "$bad49" = "0" ] && [ "$n49" -ge 8 ] \
+  && pass "gateway 菜单全部 status=1（${n49} 个二级菜单均可路由，根目录也未被停用）" \
+  || fail "菜单不可达: status<>1 的 gateway 菜单=${bad49}(期望0) 二级菜单总数=${n49}(期望>=8：V001 的 5 个 + V005 的 3 个)"
+rm -f "$A1" "$A2" "$A3" "$A4"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
