@@ -894,7 +894,7 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
   && pass "缺 channelCode → 400 且不留意图单(${nrc2})，校验在建单之前" \
   || fail "缺 channelCode 处理不对: HTTP=${r2}(期望400) 意图单=${nrc0}->${nrc2}(期望不变)"
 
-# ══ 以下四个场景需要会员组计费与充值汇率，故重启带 env ══
+# ══ 以下五个场景需要会员组计费与充值汇率，故重启带 env ══
 # 重启后重取 JWT（与 :582 / :617 / :700 同一惯例）。后面没有场景了，所以末尾不需要
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
 stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000
@@ -1033,6 +1033,39 @@ ngtx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='wallet:rech
   && [ "$nrc34b" = "$nrc34" ] && [ "$gbal34b" = "$gbal34" ] && [ "$ngtx" = "0" ] \
   && pass "钱包充值 200 只进钱包（pay_wallets.balance=${wbal}）：网关充值单 ${nrc34}→${nrc34b}、网关余额仍 ${gbal34b}、台账无以 wallet: 为 ref 的记录" \
   || fail "两个账本串了: 建单=${w1} 发起=${w2} 回调=${w3} 钱包pay_status=${wps}(期望1) 钱包余额=${wbal}(期望200) 网关充值单=${nrc34}->${nrc34b} 网关余额=${gbal34}->${gbal34b} wallet前缀台账=${ngtx}(期望0)"
+
+echo "[S35] 会员组没配计费组 → 403，且 5xx/4xx 的日志级别分得开"
+# 解析第 3 层的拒绝：member_users.group_id 命中了，但没有 gateway_groups.member_group_id 指向它。
+# 这是部署决策（这批用户没开通），不是故障 —— 配置不变就永远 403，回 5xx 客户端会一直重试撞墙，
+# 与 RelayEngine 里 no_candidate 非 retryable 走 404 是同一条标准（见 GroupReject 的 KDoc）。
+# 拒绝走 respondError、不抛异常，所以框架那条「5xx → 落 infra_api_error_logs」的路径不可达，
+# 日志级别就是运营唯一的告警面 —— 于是级别本身要锁：5xx 类必须 ERROR，403 必须留 WARN。
+# 注意：error.log 收的是 WARN+（不是只有 ERROR），所以断言读级别字段，不读文件归属。
+#
+# 模型名在这里是**无关变量**：S32 的 seed_reset 已 TRUNCATE 掉渠道与价格，此刻没有任何可用模型。
+# 这不是疏漏 —— resolve 在 RelayEngine 里排在选渠道之前（:97 vs :125），拒绝必然先发生。但只有
+# 403 一条断言的话，「403 只是环境反正跑不通的副产品」这个可能排除不掉（S29 犯过同类错）。
+# 所以补一个对照组：把映射还原后同一发请求必须**换个失败原因**，证明解析这一层已经放行、
+# 403 确实由 group_id=9999 造成，而不是普遍坏掉。对照组的期望值是 **503 no_available_channel**
+# 而不是 404：渠道表为空时 noCandidateReason 第一层就返回 NO_CHANNEL_ENABLED，而它的
+# retryable=true（渠道全下线是运维态、可能自行恢复，与「模型根本没配」不同）。
+q "UPDATE member_users SET group_id=9999 WHERE id=1" >/dev/null
+na=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
+  -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
+nabody=$(grep -c "billing_group_not_allowed" "$GB")
+q "UPDATE member_users SET group_id=9926 WHERE id=1" >/dev/null
+ctl=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
+  -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
+ctlbody=$(grep -c "no_available_channel" "$GB")
+sleep 1   # 日志异步落盘，与 S30 等错误日志同理
+loglvl() { grep "reason=$1" "$WORK/logs/all.log" 2>/dev/null | tail -1 | grep -oE " (ERROR|WARN|INFO) " | tr -d ' '; }
+nalvl=$(loglvl NOT_ALLOWED)
+cblvl=$(loglvl CONFIG_BROKEN)
+cbn=$(grep -c "reason=CONFIG_BROKEN" "$WORK/logs/all.log" 2>/dev/null)
+[ "$na" = "403" ] && [ "$nabody" = "1" ] && [ "$ctl" = "503" ] && [ "$ctlbody" = "1" ] \
+  && [ "$nalvl" = "WARN" ] && [ "$cblvl" = "ERROR" ] && [ "${cbn:-0}" -ge 2 ] \
+  && pass "会员组未映射 → 403 billing_group_not_allowed（对照：映射还原后同一发变 503 no_available_channel，已走到选渠道阶段，证明拒绝出自解析层）；告警级别分得开：NOT_ALLOWED=${nalvl}、CONFIG_BROKEN=${cblvl}(${cbn} 行)" \
+  || fail "未映射会员组的处置不对: HTTP=${na}(期望403) body命中=${nabody}(期望1) 对照组=${ctl}(期望503)/${ctlbody}(期望1) NOT_ALLOWED级别=${nalvl}(期望WARN) CONFIG_BROKEN级别=${cblvl}(期望ERROR，${cbn:-0}行)"
 
 rm -f "$GB"
 
