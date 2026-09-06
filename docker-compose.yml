@@ -78,6 +78,28 @@ services:
       NEWGATE_SALE_MARKUP: ${SALE_MARKUP:-1}
       # 发布闸门：售价低于「官方成本 × 此倍率」的定价不得保存
       NEWGATE_MIN_MARGIN: ${MIN_MARGIN:-1}
+      # 前置反代时**必须**设：它决定网关认哪个地址是「客户端」，令牌 IP 白名单完全建在它上面。
+      # 空 = 不信任任何转发头（X-Forwarded-For / X-Real-IP 一律忽略），直连部署留空即可。
+      # 注意这与 IP 白名单的语义相反：白名单空是放开限制，代理名单空是收紧信任。
+      NEWGATE_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # 充值汇率：每 1 单位 pay_orders.price（法币最小单位）发多少 μUSD 额度。
+      # ⚠️ **不设 = 充值功能整个不可用**：每次下单都 500 "quota recharge is not configured"。
+      # 这是有意的 —— 静默按 1:1 发放等于白送钱且不留痕迹，所以账务宁可拒绝也不猜汇率。
+      # 这里故意留空而不填一个数：没有普适默认值（取决于你按什么币种定价），
+      # 而 compose 里写死的默认值会与代码默认值漂移，迟早坑一个人。
+      NEWGATE_QUOTA_PER_PRICE_UNIT: ${QUOTA_PER_PRICE_UNIT:-}
+      # 按会员分组计价的开关。空/false = 所有用户按同一套组倍率计价。
+      # 开着却没绑 MemberGroupPort 会**启动失败**（NanoGate 已绑，见 Main.kt）——
+      # 那是故意的：绑了不生效会被当成解析器的 bug 去查。
+      NEWGATE_MEMBER_GROUP_BILLING: ${MEMBER_GROUP_BILLING:-}
+      # 邀请奖励（μUSD）。空或 0 = 该角色不发奖 —— 默认不发，因为发钱的路径不该因为一次
+      # 升级就自己打开。非法值（1e3 / -5 / 带单位的串）不会被静默当成 0：该角色不发奖并记 ERROR。
+      # 生效值在启动日志里：grep "invite reward attached"。
+      NEWGATE_INVITE_REWARD_INVITER: ${INVITE_REWARD_INVITER:-}
+      NEWGATE_INVITE_REWARD_INVITEE: ${INVITE_REWARD_INVITEE:-}
+      # 有意**不**在这里暴露 NEWGATE_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
+      # （代码里标着「仅测试环境」）。不写进 compose 不是访问控制 —— 变量照样生效 ——
+      # 而是不把「白送钱」放进官方支持的部署面。真要在沙箱里开，自己往 environment 里加一行。
     ports:
       - "${NEWGATE_PORT:-7080}:7080"
 
