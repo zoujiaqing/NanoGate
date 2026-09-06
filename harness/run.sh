@@ -108,7 +108,12 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
   fi
   echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
 fi
-# 基础令牌 + 账户（member 用户 id=1 由迁移种子提供；harness 直插 gateway 令牌）
+# 基础令牌 + 账户（harness 直插 gateway 令牌）。
+# ⚠️ member_users **没有迁移种子**：admin/admin123 那个用户来自 module-infra 的 system_users，
+# member 侧的 id=1 是 S26 自己 INSERT 出来的。这一行原本写的是「member 用户 id=1 由迁移种子
+# 提供」，全仓 SQL 里根本没有那条 INSERT —— 它把一次「能不能开户」的排查带偏了很久。
+# 顺带记下相关事实：member_users_id_seq 由迁移 setval 到 GREATEST(MAX(id),10000)，所以 S26 显式
+# 插的 id=1 与 sms-login 自动注册取到的号（10000 起）不会撞。
 q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
    INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT (key_hash) DO NOTHING;" >/dev/null
 
@@ -1234,6 +1239,216 @@ npe40=$(grep -c "NamedParameterValueNotSupplied" "$WORK/logs/all.log" 2>/dev/nul
   && [ "$npo40b" = "$npo40a" ] && [ "$ntx40" = "0" ] && [ "$bal40b" = "$bal40" ] && [ "${npe40:-0}" = "0" ] \
   && pass "下单失败干净收尾：HTTP=${bad40}（payment 报「不可用的支付通道」）；意图单建了又关了（${nrc40a}→${nrc40b} 行，id=${rid40} pay_status=${ps40}、pay_order_id 未回填）；支付单 ${npo40a}→${npo40b}、台账 ${ntx40} 条、余额 ${bal40}→${bal40b} 均未动；全轮日志无命名参数漏绑(${npe40})" \
   || fail "下单失败没收干净: HTTP=${bad40}(期望400) 意图单=${nrc40a}->${nrc40b}(期望+1) id=${rid40} pay_status=${ps40}(期望2=已关，0=停在待支付就是 close 又抛了) pay_order_id=${poid40}(期望-1=NULL) 支付单=${npo40a}->${npo40b}(期望不变) 台账=${ntx40}(期望0) 余额=${bal40}->${bal40b}(期望不变) 命名参数漏绑=${npe40}(期望0) body=$(head -c 200 "$GB")"
+
+echo "[S41] 台账时间戳：每一行钱都得知道自己是什么时候发生的"
+# QuotaLogic.debitInTx 走 ref 幂等路径时，先插一行哨兵占住 uk_gateway_quota_tx_ref，那条手写
+# SQL 把 created_at 写成了字面量 0，随后的 UPDATE 只回填 balance_after —— 于是**所有**带 ref
+# 的台账（结算 settlement:*、充值 gateway:quota:*、兑换 redeem:*）时间戳都停在 epoch 0。
+# 后果不只是显示成 1970：V001 建 idx_gateway_quota_tx_user(user_id, created_at) 就是为了按时间
+# 查流水，全表同一个值等于这个索引白建，「这个客户上个月花了多少」在台账上无法回答，而台账是
+# 钱的唯一审计来源。走非 ref 路径的行（管理端手工 grant 不填 ref）时间反而是对的 —— 同一张表里
+# 两种行混着，按 created_at 排序会把手工调整整堆排到一端，对账时看不出真实先后。
+#
+# 断言做成**全局不变量**而不是挑一行：哨兵插入是所有 ref 路径共用的那一条 SQL，挑一行只能证明
+# 我挑的那条路径，扫全表才证明这条 SQL 本身。
+#
+# 非空前提只拿 recharge 与 redeem 两类，**不含 settlement**：S32 开头的 seed_reset 会 TRUNCATE
+# gateway_quota_transactions，而结算台账只由 S28 之前的中继场景产生 —— 到本场景时它们已被清掉。
+# 写 nset>0 会因为 harness 的结构而假红，与本 bug 无关；哨兵 SQL 是同一条，证一类即证全部。
+ntx41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+nzero41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE created_at IS NULL OR created_at <= 0")
+nrc41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
+nred41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'redeem:%'")
+min41=$(q "SELECT COALESCE(MIN(created_at),0) FROM gateway_quota_transactions")
+max41=$(q "SELECT COALESCE(MAX(created_at),0) FROM gateway_quota_transactions")
+nowms41=$(python3 -c 'import time;print(int(time.time()*1000))')
+# 时间窗既要「不是 0」也要「单位对」：写成秒的话约 1.7e9，比 nowms 小三个数量级，会被下界抓住。
+# 上界留 10 分钟余量给本机与容器的时钟差；下界留 1 小时覆盖整轮 harness 的耗时。
+lo41=$((nowms41 - 3600000)); hi41=$((nowms41 + 600000))
+[ "$ntx41" -gt 0 ] && [ "$nrc41" -gt 0 ] && [ "$nred41" -gt 0 ] \
+  && [ "$nzero41" = "0" ] && [ "$min41" -ge "$lo41" ] && [ "$max41" -le "$hi41" ] \
+  && pass "台账时间戳全部真实：共 ${ntx41} 行（充值 ${nrc41} / 兑换 ${nred41}），created_at 为空或 <=0 的 ${nzero41} 行；区间 ${min41}..${max41} 落在本轮窗口内（单位是毫秒）" \
+  || fail "台账时间戳不对: 共 ${ntx41} 行(期望>0，否则本场景恒真) 充值=${nrc41}(期望>0) 兑换=${nred41}(期望>0) created_at空或<=0=${nzero41}(期望0) 区间=${min41}..${max41} 期望落在 ${lo41}..${hi41} 内(now=${nowms41}；0=哨兵SQL没填时间，1.7e9量级=单位写成了秒)"
+
+# ════════════════════════════════════════════════════════════════════
+# S42–S45 邀请达成 → 网关额度
+#
+# 这一批盯的是一条**早就写好、却从没被装配过**的发钱链路。member 侧的扩展点
+# （port/MemberInviteRewardPort.kt：事件 / 监听者 / 注册表）一直都在，MemberInviteLogic 也一直在
+# dispatch —— 但全仓没有任何一处 bind 过那个注册表，getOrNull 恒 null，于是邀请被如实记录、
+# 邀请人的累计数也在维护，一份奖励都发不出去，而且**没有一行日志说明这件事**（契约把「未装配」
+# 当合法配置，是有意沉默的）。对网关这种额度就是钱的东西，「拉人双方得额度」是最便宜的获客通道，
+# 而 member 侧的机器全都写好且测过了，缺的只是一个桥和一次 bind。
+#
+# 四个场景各钉一件事：
+#   S42 未配置额度 = 一分不发（且必须证明链路**真的装配了**，否则「零台账」是假绿）
+#   S43 配置后两个角色各恰好一条台账、余额按配置动
+#   S44 重放同一条记录不产生第二条（幂等靠台账 ref 唯一约束，不是靠没人重放）
+#   S45 配置非法必须**响**，且不连累另一个角色
+#
+# 断言一律落在台账行数与余额上，不只落 HTTP 状态：这条链路的失败形态是「200 但没发钱」，
+# 只看状态码的话它永远是绿的。
+# ════════════════════════════════════════════════════════════════════
+
+# 管理端 JWT。重启后旧 token 其实仍然有效（无状态签名、密钥来自配置），但重新登一次能消掉
+# 「401 是因为 token 失效还是因为权限不够」这一整类歧义 —— 下面 S44 正好要断言 401。
+admin_jwt() {
+  curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+    -d '{"username":"admin","password":"admin123"}' \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null
+}
+
+# 注册一个真会员，回显 "<userId> <accessToken>"（失败回显 "0 <原因>"，从不回显空串）。
+#
+# 为什么走 sms-login 而不是 /auth/register：register 要求 USERNAME_PASSWORD ∈
+# authPolicy.registerModes，而 NanoGate 没 bind MemberAuthPolicy，默认策略只含 PHONE_SMS，
+# 用户名注册会被 REGISTER_MODE_DISABLED 拒。sms-login 对不存在的手机号**自动注册**
+# （MemberAuthLogic.smsLogin → registerNewUser），且注册路径直接收 inviteCode ——
+# 一次调用就能走到 dispatchInviteReward，不必先注册再补绑（那是另一条代码路径）。
+#
+# 没有短信通道也走得通：MessageSendLogic.sendVerificationCode 总是**先**把码写进 Redis，
+# 再尝试模板发送，无模板就降级成 dev-mode 的 message_log。所以这里直接从隔离实例把码读出来。
+sms_register() {
+  local mobile="$1" invite="${2:-}" code body resp out
+  # send-sms-code 与 sms-login 各限 5 次/60s/IP，而隔离 Redis 跨 app 重启存活 ——
+  # 本批要注册 6 个用户，不清计数必然撞 429（表现成「注册失败」，会被误判成代码问题）。
+  rkdel "*ngrl:*"
+  curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-sms-code" -H "$CT" \
+    -d "{\"mobile\":\"$mobile\",\"scene\":1}"
+  # 键名带 keyPrefix（ngharness），一律通配匹配，不把前缀写死（与 rksum/rkdel 同一约定）。
+  code=$(rc get "$(rc --scan --pattern "*sms:code:$mobile" | head -1)")
+  if [ -z "$code" ]; then echo "0 NO_SMS_CODE_IN_REDIS"; return 0; fi
+  if [ -n "$invite" ]; then
+    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\",\"inviteCode\":\"$invite\"}"
+  else
+    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\"}"
+  fi
+  resp=$(curl -s --max-time 15 -X POST "$U/app/auth/sms-login" -H "$CT" -d "$body")
+  out=$(printf '%s' "$resp" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(d.get('userId') or 0, d.get('accessToken') or '')" 2>/dev/null)
+  if [ -z "$out" ]; then
+    echo "0 BAD_RESPONSE:$(printf '%s' "$resp" | tr -d '\n' | head -c 160)"
+  else
+    echo "$out"
+  fi
+}
+
+# 取某个用户的专属邀请码（服务端不存在则生成）。
+invite_code_of() {
+  curl -s --max-time 10 "$U/app/member/invite-code/mine" -H "Authorization: Bearer $1" \
+    | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('code') or '')" 2>/dev/null
+}
+
+echo "[S42] 邀请奖励未配置额度：链路已装配，但一分不发"
+# 这个场景真正的难点是：额度为 0 时，「装配了但不发」与「压根没装配」的**账面结果完全一样**
+# （零台账、零额度账户）—— 后者正是修复前的状态。只看台账就是恒绿的假守卫。
+#
+# 两道断言各堵一半，缺一不可：
+#  - attach 日志证明桥被构造并挂上了 ctx，且生效额度确实是 0；
+#  - **skip 日志才证明 member 拿到了注册表并真的回调了监听者**。少了它，只删 bind、留着 attach
+#    的变异照样绿：attach 是 onStart 里无条件跑的，它根本不知道注册表有没有 bind 进 member。
+# all.log 跨重启累积，故 attach 取最后一条 = 当前这次 boot 的配置；skip 用前后计数差归因。
+atk42=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
+atok42=no; printf '%s' "$atk42" | grep -q "inviter=0 invitee=0" && atok42=yes
+skip42a=$(grep -c "invite reward skipped" "$WORK/logs/all.log" 2>/dev/null)
+read -r a42 ta42 <<<"$(sms_register '+8615000042001')"
+c42=$(invite_code_of "$ta42")
+read -r b42 tb42 <<<"$(sms_register '+8615000042002' "$c42")"
+sleep 1
+# 子查询包一层再 COALESCE：不包的话无命中行时 psql 返回**空串**而不是 0，下面的数值比较会炸。
+rid42=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_user_id=$b42),0)")
+inv42=$(q "SELECT COALESCE((SELECT inviter_user_id FROM member_invite_records WHERE id=$rid42),0)")
+nled42=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
+nacc42=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id IN ($a42,$b42)")
+skip42b=$(grep -c "invite reward skipped" "$WORK/logs/all.log" 2>/dev/null)
+# 恰好 +2：两个角色各被评估一次。断「>0」不够 —— 那只证明至少一个角色走到了，
+# 另一个角色的回调丢了（比如 grantRole 写成了 early return 整个事件）就看不出来。
+dskip42=$((skip42b - skip42a))
+[ "$atok42" = "yes" ] && [ -n "$c42" ] && [ "$rid42" -gt 0 ] && [ "$inv42" = "$a42" ] \
+  && [ "$nled42" = "0" ] && [ "$nacc42" = "0" ] && [ "$dskip42" = "2" ] \
+  && pass "未配置额度 → 一分不发，且证明是「评估过而不发」而非「没装配」：邀请链路跑通（记录 ${rid42}，邀请人 ${inv42}=注册出的 ${a42}，码 ${c42}），invite:* 台账 ${nled42} 条、两人额度账户 ${nacc42} 个；attach 日志确认额度为 0，监听者回调日志恰好 +${dskip42}（两个角色各一次 → 注册表确实 bind 进了 member）" \
+  || fail "默认不发奖不成立: attach日志=${atok42}(期望yes，内容 '${atk42:0:120}') 监听者回调增量=${dskip42}(期望2；0=注册表没bind进member或dispatch没跑) 邀请码=${c42:-<空>} 记录id=${rid42}(期望>0) 邀请人=${inv42}(期望=${a42}) invite台账=${nled42}(期望0) 额度账户=${nacc42}(期望0) 注册回显 a=${a42} b=${b42}"
+
+echo "[S43] 配置额度后：两个角色各恰好一条台账，余额按配置动"
+# 保留上一次 boot 的两个计费 env：本批不再中继，但少传一个就等于顺手改了全局计价，
+# 万一后面还要加场景就会踩到一个谁也说不清的差异。
+stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
+  NEWGATE_INVITE_REWARD_INVITER=50000 NEWGATE_INVITE_REWARD_INVITEE=20000
+GJWT=$(admin_jwt)
+atk43=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
+atok43=no; printf '%s' "$atk43" | grep -q "inviter=50000 invitee=20000" && atok43=yes
+read -r a43 ta43 <<<"$(sms_register '+8615000043001')"
+c43=$(invite_code_of "$ta43")
+read -r b43 tb43 <<<"$(sms_register '+8615000043002' "$c43")"
+sleep 1
+rid43=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_user_id=$b43),0)")
+# 一条 SQL 里把「角色 / 类型 / 面额 / 归属 / 时间戳」全钉住：少钉一项就等于允许一种错账。
+# created_at>0 与 S41 是同一件事 —— 发奖走的正是那条 ref 哨兵 SQL。
+ni43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid43:inviter' AND type='invite' AND amount=50000 AND user_id=$a43 AND created_at>0")
+ne43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid43:invitee' AND type='invite' AND amount=20000 AND user_id=$b43 AND created_at>0")
+# 总数必须是 2：只数「各自那一条」的话，同一角色被发两次是看不出来的。
+tot43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
+ba43=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$a43),-1)")
+bb43=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b43),-1)")
+[ "$atok43" = "yes" ] && [ "$rid43" -gt 0 ] && [ "$ni43" = "1" ] && [ "$ne43" = "1" ] && [ "$tot43" = "2" ] \
+  && [ "$ba43" = "50000" ] && [ "$bb43" = "20000" ] \
+  && pass "配置后双角色各一条台账：记录 ${rid43} → inviter(${a43}) 50000 ×${ni43}、invitee(${b43}) 20000 ×${ne43}，invite:* 共 ${tot43} 条，余额 ${ba43}/${bb43}（两人都是从 0 起，所以余额就等于奖励额）" \
+  || fail "奖励入账不对: attach=${atok43}(期望yes，'${atk43:0:120}') 记录id=${rid43}(期望>0) inviter行=${ni43}(期望1) invitee行=${ne43}(期望1) invite台账总数=${tot43}(期望2) 余额 inviter=${ba43}(期望50000) invitee=${bb43}(期望20000) 注册回显 a=${a43} b=${b43}"
+
+echo "[S44] 重放同一条邀请记录：不产生第二条台账"
+# 幂等不能靠「没人会重放」——契约明说奖励失败不回滚、监听者可能再被触发，所以补发入口是必须有的，
+# 而补发入口存在就必然带来「补发会不会二次入账」这个问题。这里直接重放一次已经发成功的记录。
+skip44a=$(grep -c "quota debit idempotent skip" "$WORK/logs/all.log" 2>/dev/null)
+rr44=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST \
+  "$U/admin/member/invite-code/retry-invite-reward/$rid43" -H "Authorization: Bearer $GJWT")
+# 记录不存在必须报错而不是 200：dispatchInviteReward 对缺失记录是 `?: return`（正常链路不该因为
+# 一条脏记录影响注册），但运维手工补发时拿到 200 却什么都没发生，比拿到 400 糟得多。
+ghost44=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
+  "$U/admin/member/invite-code/retry-invite-reward/99999999" -H "Authorization: Bearer $GJWT")
+noauth44=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
+  "$U/admin/member/invite-code/retry-invite-reward/$rid43")
+sleep 1
+tot44=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
+ba44=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$a43),-1)")
+bb44=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b43),-1)")
+skip44b=$(grep -c "quota debit idempotent skip" "$WORK/logs/all.log" 2>/dev/null)
+# 恰好 +2：两个 ref 各被唯一约束挡下一次。断「增加了」不够 —— 那兼容「重放其实什么都没干」；
+# 断「恰好 2」才证明重放真的走到了发钱那一步、并且是被幂等闸门拦下的。
+dskip44=$((skip44b - skip44a))
+[ "$rr44" = "200" ] && [ "$ghost44" = "400" ] && [ "$noauth44" = "401" ] \
+  && [ "$tot44" = "2" ] && [ "$ba44" = "50000" ] && [ "$bb44" = "20000" ] && [ "$dskip44" = "2" ] \
+  && pass "重放幂等：retry-invite-reward(${rid43}) → ${rr44}，台账仍 ${tot44} 条、余额仍 ${ba44}/${bb44}，幂等跳过日志恰好 +${dskip44}（两个 ref 各挡一次，证明重放真走到了发钱那步）；不存在的记录 → ${ghost44}、无凭据 → ${noauth44}" \
+  || fail "重放不幂等或补偿端点不对: 重放=${rr44}(期望200) 不存在记录=${ghost44}(期望400) 无凭据=${noauth44}(期望401) invite台账=${tot44}(期望2) 余额=${ba44}/${bb44}(期望50000/20000) 幂等跳过增量=${dskip44}(期望2) body=$(head -c 160 "$GB")"
+
+echo "[S45] 额度配置非法：该角色不发奖但必须响，且不连累另一个角色"
+# `1e3` 是个很可能的笔误（想写 1000）。把它静默读成「不奖励」的后果是：运营以为活动已上线、
+# 客服按活动口径答复用户，而账上什么都没有 —— 那比不发奖励糟得多。所以非法必须与 0 严格区分。
+stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
+  NEWGATE_INVITE_REWARD_INVITER=1e3 NEWGATE_INVITE_REWARD_INVITEE=20000
+GJWT=$(admin_jwt)
+atk45=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
+atok45=no; printf '%s' "$atk45" | grep -q "inviter=INVALID invitee=20000" && atok45=yes
+mis45a=$(grep -c "invite reward MISCONFIGURED role=inviter" "$WORK/logs/all.log" 2>/dev/null)
+read -r a45 ta45 <<<"$(sms_register '+8615000045001')"
+c45=$(invite_code_of "$ta45")
+read -r b45 tb45 <<<"$(sms_register '+8615000045002' "$c45")"
+sleep 1
+rid45=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_user_id=$b45),0)")
+# 显式断言邀请人就是 a45。今天它必然成立（invite_code_of 拿 a45 自己的 token 调 /mine，
+# 服务端按认证主体解析，结构上不可能返回别人的码），但下面两条断言（邀请人台账 0 条、
+# 邀请人额度账户 0 个）在「a45 压根没参与这次邀请」的世界里**同样为真** —— 那就是空断言，
+# 而 pass 文案还写着「邀请人(a45)」。S42 已经断了这一条，S45 不断就等于把结论押在 helper 的
+# 实现细节上：哪天 /mine 改成能代查，这个场景会绿着失去意义。
+inv45=$(q "SELECT COALESCE((SELECT inviter_user_id FROM member_invite_records WHERE id=$rid45),0)")
+ni45=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid45:inviter'")
+ne45=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid45:invitee' AND type='invite' AND amount=20000 AND user_id=$b45 AND created_at>0")
+bb45=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b45),-1)")
+nacc45=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id=$a45")
+mis45b=$(grep -c "invite reward MISCONFIGURED role=inviter" "$WORK/logs/all.log" 2>/dev/null)
+dmis45=$((mis45b - mis45a))
+[ "$atok45" = "yes" ] && [ "$rid45" -gt 0 ] && [ "$inv45" = "$a45" ] && [ "$ni45" = "0" ] && [ "$nacc45" = "0" ] && [ "$dmis45" = "1" ] \
+  && [ "$ne45" = "1" ] && [ "$bb45" = "20000" ] \
+  && pass "配置非法响而不发：attach 报 inviter=INVALID，邀请人(${inv45}=注册出的 ${a45}) 台账 ${ni45} 条、额度账户 ${nacc45} 个、MISCONFIGURED 日志 +${dmis45}；同一条记录的被邀请人(${b45}) 照拿 20000（余额 ${bb45}）—— 一个角色配错不连累另一个" \
+  || fail "非法配置处理不对: attach=${atok45}(期望yes，'${atk45:0:120}') 记录id=${rid45}(期望>0) 邀请人=${inv45}(期望=${a45}) inviter台账=${ni45}(期望0) inviter额度账户=${nacc45}(期望0) MISCONFIGURED增量=${dmis45}(期望1) invitee行=${ne45}(期望1) invitee余额=${bb45}(期望20000) 注册回显 a=${a45} b=${b45}"
 
 rm -f "$GB"
 
