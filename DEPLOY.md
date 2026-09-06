@@ -219,7 +219,48 @@ docker compose up -d
 
 迁移脚本一旦应用到保留数据库即冻结，升级只会追加新脚本，不会改写已应用的脚本。
 
+**beta1 是这条规则的唯一例外，而且打破得很彻底**：本发行版六个模块里有五个（gateway /
+infra / member / payment / platform）把全部历史脚本按顺序拼成了一个 `V001__baseline.sql`，
+原文件删除。所以 **beta1 之前建起来的库无法原地升级，只能重建**。引擎按 SHA-256 逐字节
+比对（一字节变化即视为脚本变更），对已应用脚本的不一致直接 fail-fast：`migrate status`
+退出码 3，正常启动的 precheck 在 `Neton.run` 之前就打 `STARTUP ABORTED` 并 `exitProcess(1)`，
+不会绑定任何端口。一个停在 7 月的库跑出来是 `6 changed / 27 missing_on_disk / 4 pending`。
+
+**不要靠改 `neton_schema_history` 的 checksum 来「重新盖章」过关**——那条路在本发行版会造出
+一个能启动、但缺表的库，比拒绝启动糟得多。原因是 squash 之后**版本号槽位被复用**了：
+gateway 的 `V002` 在 beta1 之前是 `seed_menus`（内容已并入 baseline），之后是
+`group_billing_identity`（给 `gateway_groups` 加 `code` / `member_group_id`、建
+`gateway_group_overrides`）。把 V002 的 checksum 盖成新值，等于宣称这份从没跑过的脚本已经
+应用，引擎会跳过它：应用照常启动，然后在第一次查询 `gateway_groups.code` 时才炸。实测那个
+7 月的库，`gateway_groups` 只有 id/name/ratio/description/deleted/created_at/updated_at，
+而 `gateway_group_overrides`、`gateway_settlements`、`gateway_redemption_codes` 三张表不存在。
+
+升级 beta1 之前的库，正确动作是重建；数据要留就先自己导出来（`gateway_channels` /
+`gateway_tokens` / 钱包与订单表），迁移跑完再导回：
+
+```bash
+dropdb <dbname> && createdb <dbname>
+./application.kexe migrate up     # 或交给 compose 里的一次性 migrate 服务
+```
+
+beta1 之后冻结规则重新生效：新增能力一律追加 V005、V006……，不再改写已应用的文件。
+
+另注：`migrate status` 的 summary 只统计 executed / pending / changed / failed 四类，
+`missing_on_disk` 不在其中，所以 `0 executed, 4 pending, 6 changed, 0 failed` 加不回 history
+表的行数。判断状态要看逐行输出，别只看 summary。
+
 ## 数据库
 
-只支持 **PostgreSQL**。交付形态固定为本 compose，因此不承担多方言成本；
-`sql/mysql/` 冻结在 V003，不作为支持目标。
+只支持 **PostgreSQL**。交付形态固定为本 compose，因此不承担多方言成本。
+
+`module-gateway` 是唯一同时带 `sql/mysql/` 与 `sql/sqlite/` 的模块（两边都已到 V004），
+但这两方言**跑不起来**，也不是支持目标：其余模块（system / infra / member / payment /
+platform / cs）的 `neton.migration.dialects` 都硬编码 `postgresql`，而 `system_users` /
+`system_roles` / `system_menus` 只由 `module-infra` 的 postgresql V001 建。所以
+`-Pneton.database.driver=mysql` 能编过、驱动也能连上，却会在 gateway 第一条碰
+`system_menus` 的迁移上失败。本发行版从不设置 `neton.database.driver`（默认 postgres），
+那两个目录里的 SQL 连编进二进制都不会。
+
+结论：改 schema **只需改 `sql/postgresql/`**。那两个目录是历史遗留，别照着它们补新脚本 ——
+补齐了也跑不到，只会让人误以为 mysql 是支持目标。要真支持 mysql，得先给 infra 等模块
+补方言（含 `system_menus` 的建表），那是一个独立的、比 gateway 大得多的工程。
