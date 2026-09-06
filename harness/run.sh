@@ -894,7 +894,8 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
   && pass "缺 channelCode → 400 且不留意图单(${nrc2})，校验在建单之前" \
   || fail "缺 channelCode 处理不对: HTTP=${r2}(期望400) 意图单=${nrc0}->${nrc2}(期望不变)"
 
-# ══ 以下五个场景需要会员组计费与充值汇率，故重启带 env ══
+# ══ 以下场景跑在带 env 的这次启动上：S31–S35 需要会员组计费与充值汇率，故重启带 env；
+# 其后的兑换码场景（S36+）复用同一次启动与同一个 admin JWT。
 # 重启后重取 JWT（与 :582 / :617 / :700 同一惯例）。后面没有场景了，所以末尾不需要
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
 stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000
@@ -1066,6 +1067,173 @@ cbn=$(grep -c "reason=CONFIG_BROKEN" "$WORK/logs/all.log" 2>/dev/null)
   && [ "$nalvl" = "WARN" ] && [ "$cblvl" = "ERROR" ] && [ "${cbn:-0}" -ge 2 ] \
   && pass "会员组未映射 → 403 billing_group_not_allowed（对照：映射还原后同一发变 503 no_available_channel，已走到选渠道阶段，证明拒绝出自解析层）；告警级别分得开：NOT_ALLOWED=${nalvl}、CONFIG_BROKEN=${cblvl}(${cbn} 行)" \
   || fail "未映射会员组的处置不对: HTTP=${na}(期望403) body命中=${nabody}(期望1) 对照组=${ctl}(期望503)/${ctlbody}(期望1) NOT_ALLOWED级别=${nalvl}(期望WARN) CONFIG_BROKEN级别=${cblvl}(期望ERROR，${cbn:-0}行)"
+
+echo "[S36] 兑换码：生成 → 兑换 → 入账，重复兑换只入一次"
+# 台账的 type='redeem' 与「ref = 兑换码」从 V001 起就预留着，此前没有任何代码会产生这种记录。
+# 这里锁的不变量是「一码一次」：断言的不只是响应码，而是**拒绝 + 余额不变 + 台账仍一条**
+# 三件事同时成立（与 S26 锁静默回落、S32 锁并发回调同一套路数）—— 只看状态码的话，
+# 重复入账照样能返回 409。
+gen36=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":50000,"count":3,"note":"S36 活动码"}')
+batch36=$(printf '%s' "$gen36" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('batchId',''))" 2>/dev/null)
+c36=$(printf '%s' "$gen36" | python3 -c "import sys,json;print(' '.join((json.load(sys.stdin).get('data') or {}).get('codes',[])))" 2>/dev/null)
+c1=$(echo "$c36" | cut -d' ' -f1)
+# DB 存无分隔大写裸码、返回给运营的是分组展示形态，两边靠 normalize 对齐。这两条断的是设计本身：
+# 只按字面量比对的话，运营发出去的码用户照着输入却兑不了，而后台看那张码明明还是未用。
+raw36=$(q "SELECT code FROM gateway_redemption_codes WHERE batch_id='$batch36' ORDER BY id LIMIT 1")
+c1bare=$(printf '%s' "$c1" | tr -d '-' | tr 'a-z' 'A-Z')
+bal36=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+red36() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+d1=$(red36 "{\"code\":\"$c1\"}"); sleep 1
+bal36a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+tx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
+st1=$(q "SELECT status FROM gateway_redemption_codes WHERE code='$raw36'")
+uu1=$(q "SELECT COALESCE(used_user_id,0) FROM gateway_redemption_codes WHERE code='$raw36'")
+d2=$(red36 "{\"code\":\"$c1\"}"); sleep 1
+bal36b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+tx2=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
+[ -n "$batch36" ] && [ "$c1bare" = "$raw36" ] && [ "$c1bare" != "$c1" ] \
+  && [ "$d1" = "200" ] && [ "$bal36a" = "$((bal36+50000))" ] && [ "$tx1" = "1" ] && [ "$st1" = "1" ] && [ "$uu1" = "1" ] \
+  && [ "$d2" = "409" ] && [ "$bal36b" = "$bal36a" ] && [ "$tx2" = "1" ] \
+  && pass "兑换码入账：展示形态 ${c1} 归一后对上裸码 ${raw36}；首发 200 余额 ${bal36}→${bal36a}(+50000)、台账 ${tx1} 条、码已用且记了 used_user_id=${uu1}；重复兑换 409 且余额仍 ${bal36b}、台账仍 ${tx2} 条" \
+  || fail "兑换码入账不对: batch=${batch36} 展示码=${c1} 裸码=${raw36} 归一=${c1bare} 首发=${d1}(期望200) 余额=${bal36}->${bal36a}->${bal36b}(期望+50000后不变) 台账=${tx1}/${tx2}(期望1/1) 码状态=${st1}(期望1) used_user_id=${uu1}(期望1) 重兑=${d2}(期望409)"
+
+echo "[S37] 5 路并发兑同一张码：只有一发成功，账只入一次"
+# 这是兑换码唯一的真风险：两个人（或同一个人开两个窗口）同时兑同一张码。
+# 三层幂等在这里靠的是 ② 乐观锁占位（UPDATE ... WHERE status=未用，只有一个请求拿到 1 行）；
+# 极端竞态下还有 ③ 台账 ref 唯一约束兜底 —— 撞约束会让整个事务回滚、码状态退回未用，
+# 所以失败形态只能是「没兑上」，不会是「码没了钱也没到」。
+# 与 S32 同理：必须 wait 到具体 PID，裸 wait 会等上 fake 服务器与网关。
+gen37=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":30000,"count":1}')
+c37=$(printf '%s' "$gen37" | python3 -c "import sys,json;print(((json.load(sys.stdin).get('data') or {}).get('codes') or [''])[0])" 2>/dev/null)
+raw37=$(printf '%s' "$c37" | tr -d '-' | tr 'a-z' 'A-Z')
+bal37=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+RC=/tmp/s37-codes-$$; : > "$RC"; RB=""
+for i in 1 2 3 4 5; do
+  curl -s --max-time 20 -o /dev/null -w "%{http_code}\n" -X POST "$U/app/gateway/redeem" \
+    -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$c37\"}" >> "$RC" & RB="$RB $!"
+done
+wait $RB; sleep 1
+ok37=$(grep -c '^200$' "$RC"); rm -f "$RC"
+bal37a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+tx37=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw37'")
+st37=$(q "SELECT status FROM gateway_redemption_codes WHERE code='$raw37'")
+[ "$ok37" = "1" ] && [ "$tx37" = "1" ] && [ "$bal37a" = "$((bal37+30000))" ] && [ "$st37" = "1" ] \
+  && pass "5 路并发兑同一张码（${ok37}/5 返回200）只入账一次：余额 ${bal37}→${bal37a}(+30000)、台账 ${tx37} 条、码状态已用" \
+  || fail "并发兑换没幂等: 200数=${ok37}(期望1) 台账=${tx37}(期望1) 余额=${bal37}->${bal37a}(期望+30000) 码状态=${st37}(期望1)"
+
+echo "[S38] 兑换码止损：作废/过期码兑不动，已用码不能作废，整批作废只动未用的"
+# 作废是运营的止损手段（码外泄、活动取消）。这里锁三件事：
+#  ① 作废与过期的码兑不动，且**余额与台账都不动** —— 只断 4xx 的话，「拒了但钱也发了」照样过；
+#  ② 已用的码不能作废：那是历史事实，改它等于篡改账务（要收回额度得另记一条调整台账）；
+#  ③ 整批作废只影响未用的 —— 一刀切会把已核销的记录改脏，按批统计的核销额也就不可信了。
+gen38=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":20000,"count":3,"note":"S38"}')
+batch38=$(printf '%s' "$gen38" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('batchId',''))" 2>/dev/null)
+c38=$(printf '%s' "$gen38" | python3 -c "import sys,json;print(' '.join((json.load(sys.stdin).get('data') or {}).get('codes',[])))" 2>/dev/null)
+a1=$(echo "$c38" | cut -d' ' -f1); a2=$(echo "$c38" | cut -d' ' -f2); a3=$(echo "$c38" | cut -d' ' -f3)
+b1=$(printf '%s' "$a1" | tr -d '-' | tr 'a-z' 'A-Z'); b2=$(printf '%s' "$a2" | tr -d '-' | tr 'a-z' 'A-Z'); b3=$(printf '%s' "$a3" | tr -d '-' | tr 'a-z' 'A-Z')
+id2=$(q "SELECT id FROM gateway_redemption_codes WHERE code='$b2'")
+red38() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+adm38() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/$1" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" ${2:+-d "$2"}; }
+# 出生即过期的码不允许造：它能创建成功就是一行永远兑不了的死数据，而运营看不出来
+exp38=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":20000,"count":1,"expiresAt":1000}')
+bal38=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+u1=$(red38 "{\"code\":\"$a1\"}"); sleep 1
+bal38a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+dis2=$(adm38 "disable/$id2")
+u2=$(red38 "{\"code\":\"$a2\"}"); sleep 1
+disUsed=$(adm38 "disable/$(q "SELECT id FROM gateway_redemption_codes WHERE code='$b1'")")
+bal38b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+# 台账按这三张码的 ref 精确点名（不是按面额筛）：断的是「本批三张码里，只有首发那张产生过钱」。
+# 这一条是 409 那几发的**钱侧**证据 —— 余额不变只说明当下没动，台账不多才说明拒得干净。
+tx38=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref IN ('redeem:$b1','redeem:$b2','redeem:$b3')")
+# 过期只能靠 SQL 造：API 拒绝生成已过期的码（上面已断），而“时间流逝”无法等
+q "UPDATE gateway_redemption_codes SET expires_at=1000 WHERE code='$b3'" >/dev/null
+st38=$(curl -s --max-time 20 -X GET "$U/admin/gateway/redemption/stats/$batch38" -H "Authorization: Bearer $GJWT")
+expn=$(printf '%s' "$st38" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(f\"{d.get('total')}/{d.get('used')}/{d.get('disabled')}/{d.get('expired')}/{d.get('unused')}\")" 2>/dev/null)
+u3=$(red38 "{\"code\":\"$a3\"}"); sleep 1
+bal38c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+db38=$(adm38 "disable-batch" "{\"batchId\":\"$batch38\"}")
+dbn=$(grep -o '"disabled":[0-9]*' "$GB" | cut -d: -f2 | head -1)
+fin=$(q "SELECT string_agg(status::text,',' ORDER BY id) FROM gateway_redemption_codes WHERE batch_id='$batch38'")
+[ "$exp38" = "400" ] && [ "$u1" = "200" ] && [ "$bal38a" = "$((bal38+20000))" ] && [ "$dis2" = "200" ] \
+  && [ "$u2" = "409" ] && [ "$disUsed" = "409" ] && [ "$u3" = "409" ] \
+  && [ "$bal38b" = "$bal38a" ] && [ "$bal38c" = "$bal38a" ] && [ "$tx38" = "1" ] && [ "$expn" = "3/1/1/1/0" ] \
+  && [ "$dbn" = "1" ] && [ "$fin" = "1,2,2" ] \
+  && pass "止损边界：过期码不允许生成(${exp38})；首发入账 ${bal38}→${bal38a}(+20000)；作废码兑=${u2}、过期码兑=${u3}、作废已用码=${disUsed} 均 409 且余额始终 ${bal38c}、本批台账只 ${tx38} 条；批次统计 total/used/disabled/expired/unused=${expn}；整批作废只动了 ${dbn} 张未用的，最终状态=${fin}（已用那张没被改脏）" \
+  || fail "止损边界不对: 过期码生成=${exp38}(期望400) 首发=${u1}(期望200) 余额=${bal38}->${bal38a}->${bal38b}->${bal38c}(期望+20000后全不变) 本批台账=${tx38}(期望1) 作废=${dis2}(期望200) 兑作废码=${u2}(期望409) 作废已用码=${disUsed}(期望409) 兑过期码=${u3}(期望409) 统计=${expn}(期望3/1/1/1/0) 整批作废=${db38}/disabled=${dbn}(期望1) 最终状态=${fin}(期望1,2,2)"
+
+echo "[S39] 兑换码权限边界：用户不能造码，app 组不暴露管理路由，塞面额不生效"
+# 兑换码是能直接变成钱的凭据，所以「谁能生成」就是钱的安全边界。
+#  ① 网关令牌（sk-）调管理端生成 → 必须拒；
+#  ② app 路由组下不存在生成/作废路由 → 404，而不是 403（403 等于向用户承认这个路由存在）；
+#  ③ 兑换请求里塞 quotaMicro：@Body 用默认 Json 解码（ignoreUnknownKeys=false），多一个键会 400，
+#     但那是框架的解码宽严、不是这里要守的东西（S29 犯过把框架行为当业务断言的错）。
+#     所以只断不变量：无论注入请求结局如何，入账的面额只能是生成时定的那个。
+genSk=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
+  -H "$AUTH" -H "$CT" -d '{"quotaMicro":50000,"count":1}')
+appGen=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":50000,"count":1}')
+appDis=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/redemption/disable/1" \
+  -H "Authorization: Bearer $GJWT" -H "$CT")
+gen39=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":10000,"count":1,"note":"S39 内部备注"}')
+c39=$(printf '%s' "$gen39" | python3 -c "import sys,json;print(((json.load(sys.stdin).get('data') or {}).get('codes') or [''])[0])" 2>/dev/null)
+raw39=$(printf '%s' "$c39" | tr -d '-' | tr 'a-z' 'A-Z')
+n39a=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
+inj39=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$c39\",\"quotaMicro\":99999999}")
+sleep 1
+n39b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
+# 面额按**这张码的 ref** 取，不是全表 MAX：S36/S37/S38 各留了不同面额的台账，
+# MAX 会读到 S36 的 50000 —— 那等于拿别人的数在比，「注入的面额没生效」这条断言恒真。
+amt39=$(q "SELECT COALESCE(MAX(amount),0) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw39'")
+# 运营备注不得进用户侧响应（note 里写着活动名/客户名，泄露给用户是信息外流）
+leak39=$(grep -c "S39 内部备注" "$GB")
+# 两种世界都得对：注入被拒（400）则台账不得多一条、且这张码名下零台账；
+# 注入被接受（200）则入账必为生成时定的 10000。
+if [ "$inj39" = "200" ]; then amtok=$([ "$amt39" = "10000" ] && echo yes || echo no)
+else amtok=$([ "$n39b" = "$n39a" ] && [ "$amt39" = "0" ] && echo yes || echo no); fi
+[ "$genSk" != "200" ] && [ "$appGen" = "404" ] && [ "$appDis" = "404" ] \
+  && [ "$amtok" = "yes" ] && [ "$leak39" = "0" ] \
+  && pass "权限与注入边界：网关令牌造码=${genSk}（非200）；app 组下生成=${appGen}、作废=${appDis} 均 404（路由不存在，不是403）；塞面额兑换=${inj39}，该码名下台账面额=${amt39}（全局台账 ${n39a}→${n39b} 条），客户端定的 99999999 没生效；运营备注未泄露(${leak39})" \
+  || fail "权限边界不对: 网关令牌造码=${genSk}(期望非200) app组生成=${appGen}(期望404) app组作废=${appDis}(期望404) 注入兑换=${inj39} 台账=${n39a}->${n39b} 该码面额=${amt39}(amtok=${amtok}) 备注泄露=${leak39}(期望0)"
+
+echo "[S40] 下单失败 → 意图单必须被关掉，且真实原因不被清理动作盖掉"
+# QuotaRechargeLogic.close 的 SQL 里有 :waiting，而参数表里一度没有它 —— sqlx4k 抛
+# NamedParameterValueNotSupplied，于是 catch 块里的清理动作自己炸了：真实原因（渠道不可用）
+# 被一条 sqlx4k 内部错误盖掉，意图单停在待支付，正是那行注释说要消除的对账噪声。
+# 这条路径此前**完全没被覆盖**：S30 的 r1 在建单前就抛（汇率未配）、r2 在 controller 校验就拒
+# （缺 channelCode），两条都到不了 close。一个因为没测试而藏住的 bug，修好后就得有测试。
+#
+# 用未知渠道触发：payment 的 submit 在 resolveRoute 失败时抛 BadRequestException(→400)，
+# 且抛在 PayOrderTable.insert 之前，所以支付单侧不留痕 —— 干净的「下单失败」。
+nrc40a=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
+npo40a=$(q "SELECT COUNT(*) FROM pay_orders")
+bal40=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bad40=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_40"}')
+sleep 1
+nrc40b=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
+rid40=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
+ps40=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$rid40")
+poid40=$(q "SELECT COALESCE(pay_order_id,-1) FROM gateway_quota_recharges WHERE id=$rid40")
+npo40b=$(q "SELECT COUNT(*) FROM pay_orders")
+ntx40=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='gateway:quota:$rid40'")
+bal40b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+# 全轮日志扫描：命名参数漏绑这类 bug 在编译期与启动期都不报错，只在执行到那一行时 500。
+# 这一条同时守住 close 与 S38 的 disable-batch（两者都犯过）。
+npe40=$(grep -c "NamedParameterValueNotSupplied" "$WORK/logs/all.log" 2>/dev/null)
+[ "$bad40" = "400" ] && [ "$nrc40b" = "$((nrc40a+1))" ] && [ "$ps40" = "2" ] && [ "$poid40" = "-1" ] \
+  && [ "$npo40b" = "$npo40a" ] && [ "$ntx40" = "0" ] && [ "$bal40b" = "$bal40" ] && [ "${npe40:-0}" = "0" ] \
+  && pass "下单失败干净收尾：HTTP=${bad40}（payment 报「不可用的支付通道」）；意图单建了又关了（${nrc40a}→${nrc40b} 行，id=${rid40} pay_status=${ps40}、pay_order_id 未回填）；支付单 ${npo40a}→${npo40b}、台账 ${ntx40} 条、余额 ${bal40}→${bal40b} 均未动；全轮日志无命名参数漏绑(${npe40})" \
+  || fail "下单失败没收干净: HTTP=${bad40}(期望400) 意图单=${nrc40a}->${nrc40b}(期望+1) id=${rid40} pay_status=${ps40}(期望2=已关，0=停在待支付就是 close 又抛了) pay_order_id=${poid40}(期望-1=NULL) 支付单=${npo40a}->${npo40b}(期望不变) 台账=${ntx40}(期望0) 余额=${bal40}->${bal40b}(期望不变) 命名参数漏绑=${npe40}(期望0) body=$(head -c 200 "$GB")"
 
 rm -f "$GB"
 
