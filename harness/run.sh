@@ -1782,5 +1782,141 @@ case "$m50" in *"无效"*) okmsg=1;; *) okmsg=0;; esac
   || fail "脱敏形同虚设: 兑 /page 给的串 HTTP=${d50}(期望404) message='${m50}'(期望含「无效」) 余额=${bal50}->${bal50a}(期望不变) 台账=${ntx50}(期望0) /disable 返回='${dcode50}'(期望等于 /page 的 '${rcode1}')"
 rm -f "$P50"
 
+# ══ S51 额度撤回：能发就得能收，收了要真收得住 ══
+# 缺口：QuotaController 到本轮之前只有 grant，没有反向操作。运营误发额度（金额多打一个 0）
+# 之后没有任何受支持的撤回路径，剩下唯一的工具是直接改库 —— 而台账是只增不改的审计链，
+# balance_after 逐行累加，改掉一行会让它之后所有行的 balance_after 全部失真，等于把
+# 「钱的唯一审计来源」弄坏。所以这条场景锁的不是「有个撤回接口」，而是撤回真的落在账上。
+#
+# 撤回的语义与 settle 一致（无条件扣、允许转负）而不是与 consume 一致（不足即拒）。
+# 块 C 因此断言的是**转负成功**：若哪天有人把它改成看起来更安全的「余额不足即拒」，块 C 与
+# 块 G 会一起红 —— 那种改法会让撤回在最需要它的场景下失效（误发的额度被用户赶紧花掉就撤不
+# 回来了），而拒绝的理由听起来永远像是谨慎。
+echo "[S51] 额度撤回：真扣钱、幂等、允许转负、非法入参与越权一律挡住"
+GJWT=$(admin_jwt)
+# 零角色主体自建，不沿用 S46 的 csjwt：S51 要能独立成立，不该因为 S46 改了 token 就连带失败。
+q "INSERT INTO system_users (id, username, password_hash, nickname, status, created_at, updated_at) SELECT 951, 'cs_s51', password_hash, 'S51 客服', 1, 0, 0 FROM system_users WHERE id=1 ON CONFLICT (id) DO NOTHING" >/dev/null
+csjwt51=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+  -d '{"username":"cs_s51","password":"admin123"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+csrole51=$(q "SELECT COUNT(*) FROM system_user_roles WHERE user_id=951")
+# 环境自建，且**不跑 seed_reset**：它会 TRUNCATE gateway_quota_transactions，而台账正是本场景
+# 的断言对象。渠道/定价/上游都用 S51 独占的名字与端口，不碰 S48 留下的那套。
+fake ok 9951; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c51','openai_compatible','http://127.0.0.1:9951','default','m-rv51',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c51'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rv51','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+rv51() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/quota/revoke" \
+  -H "Authorization: Bearer $1" -H "$CT" -d "$2"; }
+relay51() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
+  -H "$AUTH" -H "$CT" -d '{"model":"m-rv51","messages":[]}'; }
+msg51() { python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null; }
+# relay 的错误信封与 admin 的不是同一个形状，取值函数因此必须分开：
+#   admin 走框架统一信封，message 在顶层；
+#   relay 走 respondError → inbound.errorBody，OpenAiAdapter 产出
+#   {"error":{"message":...,"type":"<code>","code":"<code>"}} —— 顶层没有 message。
+# 共用一个抽取函数正是本场景第一版翻红的成因：402 拿到了、reserved 归零了、余额没动了，
+# 唯独理由是空串，于是「撤回真的挡住了请求」这条最关键的因果看起来像没成立。
+# 分开之后，将来哪个信封改了只会红对应的那一块，不会让两类断言互相污染。
+rmsg51() { python3 -c "import json;d=json.load(open('$GB'));e=d.get('error') or {};print(e.get('message') or '')" 2>/dev/null; }
+rtype51() { python3 -c "import json;d=json.load(open('$GB'));e=d.get('error') or {};print(e.get('type') or '')" 2>/dev/null; }
+
+# ── 块 G 的前半：撤回**之前**必须先证明这条路是通的 ──
+# 没有这一发对照，后面的 402 可以来自任何原因（渠道挂了、定价缺失、上游没起），
+# 而场景会绿着放行一个「谁都调不通」的接口。与 S46 的 admin 对照同一个道理。
+rpre51=$(relay51); sleep 1
+
+# ── 块 A：撤回真扣钱、台账 type='revoke'、balance_after 对得上、reserved_balance 不被碰 ──
+bala51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+resa51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+hA51=$(rv51 "$GJWT" '{"userId":1,"amount":30000,"ref":"revoke:s51-a"}'); sleep 1
+balA51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+resA51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+rowA51=$(q "SELECT amount||'|'||balance_after FROM gateway_quota_transactions WHERE ref='revoke:s51-a' AND type='revoke'")
+nA51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-a'")
+# voA51 取的是 revokedAmount，期望值 **30000 而不是 -30000**：撤回量恒正，而台账的 amount 是
+# 「余额变动了多少」（带符号，撤回为负，就是上面 rowA51 期望里的 -30000）。
+# 第一版断言把两者当成同一个东西，于是其余五项真实数字全对、只有这一项不符而翻红。
+# 字段当时叫 amount，与台账同名不同义 —— 歧义活在 JSON 里，而我是照着 JSON 字段名写的断言，
+# 所以光在 Kotlin 侧加 KDoc 兜不住，已把它改名成 revokedAmount（理由写在 VO 的类级 KDoc 里）。
+voA51=$(python3 -c "import json;d=json.load(open('$GB')).get('data') or {};print(d.get('balance'),d.get('revokedAmount'),d.get('ref'))" 2>/dev/null)
+[ "$hA51" = "200" ] && [ "$balA51" = "$((bala51-30000))" ] && [ "$rowA51" = "-30000|$balA51" ] && [ "$nA51" = "1" ] \
+  && [ "$resA51" = "$resa51" ] && [ "$voA51" = "$balA51 30000 revoke:s51-a" ] \
+  && pass "撤回真扣钱：余额 ${bala51}→${balA51}(-30000)、台账 1 行 type=revoke amount=-30000 balance_after=${balA51}、reserved_balance ${resa51}→${resA51} 未被碰、响应与库一致（${voA51}）" \
+  || fail "撤回没落在账上: HTTP=${hA51}(期望200) 余额=${bala51}->${balA51}(期望比前值少 30000) 台账行='${rowA51}'(期望 -30000|${balA51}) 台账数=${nA51}(期望1) reserved=${resa51}->${resA51}(期望不变) 响应='${voA51}'(期望 '${balA51} 30000 revoke:s51-a'，中间一项是恒正的撤回量)"
+
+# ── 块 B：同 ref 重放只扣一次 ──
+# ref 是撤回唯一的幂等键，所以它必填（块 E 断言）。运营在后台双击一次就是双扣的话，
+# 台账上看不出这是两次还是一次 —— 与 S36 的重兑、S8 的重复 ref 同一套路数。
+hB51=$(rv51 "$GJWT" '{"userId":1,"amount":30000,"ref":"revoke:s51-a"}'); sleep 1
+balB51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nB51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-a'")
+[ "$hB51" = "200" ] && [ "$balB51" = "$balA51" ] && [ "$nB51" = "1" ] \
+  && pass "同 ref 重放幂等：HTTP=${hB51}（幂等跳过不报错）、余额仍 ${balB51}、台账仍 ${nB51} 行" \
+  || fail "撤回不幂等: HTTP=${hB51}(期望200) 余额=${balA51}->${balB51}(期望不变) 台账=${nB51}(期望1)"
+
+# ── 块 D+E：非法入参给干净的 400，且零副作用 ──
+# 负数 amount 不是输入卫生问题：revoke(-50000) 就是一次发放，持有 gateway:quota:revoke 的人
+# 借此绕过 gateway:quota:grant，两个权限的分离形同虚设。所以拒绝理由必须**点名 grant**，
+# 与 S47 要求点名权限串同理 —— 只断 400 的话，任何一处校验失败都长得一样。
+balD51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nledD51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+hD51=$(rv51 "$GJWT" '{"userId":1,"amount":-50000,"ref":"revoke:s51-d"}'); mD51=$(msg51)
+hE51=$(rv51 "$GJWT" '{"userId":1,"amount":1000,"ref":""}'); mE51=$(msg51)
+hE251=$(rv51 "$GJWT" '{"userId":1,"amount":0,"ref":"revoke:s51-e2"}'); mE251=$(msg51)
+sleep 1
+balD51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nledD51b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+case "$mD51" in *"gateway:quota:grant"*) okD51=1;; *) okD51=0;; esac
+[ "$hD51" = "400" ] && [ "$okD51" = "1" ] && [ "$hE51" = "400" ] && [ "$hE251" = "400" ] \
+  && [ "$balD51b" = "$balD51" ] && [ "$nledD51b" = "$nledD51" ] \
+  && pass "非法入参一律 400 且零副作用：负数 amount=${hD51}（理由点名 gateway:quota:grant）、空 ref=${hE51}、零 amount=${hE251}；余额仍 ${balD51b}、台账仍 ${nledD51b} 行" \
+  || fail "非法入参没挡住: 负数=${hD51}(期望400) 点名grant=${okD51}(期望1，message='${mD51}') 空ref=${hE51}(期望400，'${mE51}') 零amount=${hE251}(期望400，'${mE251}') 余额=${balD51}->${balD51b}(期望不变) 台账=${nledD51}->${nledD51b}(期望不变)"
+
+# ── 块 F：零角色主体必须 403 且点名权限，admin 对照 200 ──
+balF51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+hF51=$(rv51 "$csjwt51" '{"userId":1,"amount":1000,"ref":"revoke:s51-f"}'); mF51=$(msg51); sleep 1
+balF51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nF51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-f'")
+case "$mF51" in *"gateway:quota:revoke"*) okF51=1;; *) okF51=0;; esac
+[ -n "$csjwt51" ] && [ "$csrole51" = "0" ] && [ "$hF51" = "403" ] && [ "$okF51" = "1" ] \
+  && [ "$balF51b" = "$balF51" ] && [ "$nF51" = "0" ] && [ "$hA51" = "200" ] \
+  && pass "撤回要授权不只是认证：零角色账号（角色数 ${csrole51}）登录成功但撤回=${hF51} 且理由点名 gateway:quota:revoke、余额仍 ${balF51b}、台账 ${nF51} 行；同一接口换 super_admin → ${hA51}" \
+  || fail "撤回的授权边界不对: cs登录=$([ -n "$csjwt51" ] && echo yes || echo no)(期望yes) 角色数=${csrole51}(期望0) HTTP=${hF51}(期望403) 点名权限=${okF51}(期望1，message='${mF51}') 余额=${balF51}->${balF51b}(期望不变) 台账=${nF51}(期望0) admin对照=${hA51}(期望200)"
+
+# ── 块 C：撤到转负也必须成功（这是与 consume 的分界线）──
+balC51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+over51=$((balC51 + 50000))
+hC51=$(rv51 "$GJWT" "{\"userId\":1,\"amount\":${over51},\"ref\":\"revoke:s51-c\"}"); sleep 1
+balC51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+availC51=$(q "SELECT balance - reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+voC51=$(python3 -c "import json;d=json.load(open('$GB')).get('data') or {};print(d.get('balance'),d.get('available'))" 2>/dev/null)
+[ "$hC51" = "200" ] && [ "$balC51b" = "-50000" ] && [ "$availC51" = "-50000" ] && [ "$voC51" = "-50000 -50000" ] \
+  && pass "撤到转负成功（不是「余额不足被拒」）：余额 ${balC51} 撤 ${over51} → ${balC51b}、可用余额 ${availC51}、响应 balance/available 与库一致" \
+  || fail "撤回在余额不足时被拒了（语义被改成了 consume 那一套）: HTTP=${hC51}(期望200) 余额=${balC51}->${balC51b}(期望-50000) 可用=${availC51}(期望-50000) 响应='${voC51}' message='$(msg51)'"
+
+# ── 块 G 的后半：撤回生效 = 用户真的用不了了 ──
+# 数字变了不等于功能生效。这一发证明撤回落在了一条真实的商业通路上：余额转负后新请求必须
+# 402 insufficient_quota。顺带把 402 这条路径第一次纳入 harness —— 此前 run.sh 里没有任何
+# 场景断言过余额不足，而它是「没钱就不给调上游」唯一的闸门。
+# 还要断言 402 之后 reserved_balance 归零：reserve 失败时 SettlementLogic 会补偿撤销刚占的
+# token 预留（净效果为零），若那道补偿被改掉，这里会留下泄漏的预留，用户后续充值也用不掉。
+hG51=$(relay51); sleep 1
+mG51=$(rmsg51)
+tG51=$(rtype51)
+resG51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+balG51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nlogG51=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-rv51'")
+ntxG51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='consume' AND created_at > 0")
+# type 精确断言 insufficient_quota，message 还须含 balance：RelayEngine 里 402（账户余额不足）与
+# 429（token 预算耗尽）共用同一个 error.type，只断 type 分不清这一发到底是被「撤回扣掉的账户
+# 余额」挡的、还是被某个 token 的预算挡的。而本场景要证的因果恰恰是前者 —— 撤回动的是
+# gateway_quota_accounts.balance，与 token 预算无关。message 含 balance 才把这条因果钉死。
+case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
+[ "$rpre51" = "200" ] && [ "$hG51" = "402" ] && [ "$tG51" = "insufficient_quota" ] && [ "$okG51" = "1" ] \
+  && [ "$resG51" = "0" ] && [ "$balG51" = "$balC51b" ] \
+  && pass "撤回真的生效：撤回前 relay=${rpre51}（对照，证明渠道/定价/上游都正常）→ 撤到转负后 relay=${hG51} type=${tG51} 理由='${mG51}'（是账户余额不足，不是 token 预算）；402 之后 reserved_balance=${resG51}（无泄漏预留）、余额仍 ${balG51}、m-rv51 用量日志 ${nlogG51} 行" \
+  || fail "撤回没落到真实通路上: 撤回前 relay=${rpre51}(期望200，若不是则本块环境就没搭好) 撤回后=${hG51}(期望402) type='${tG51}'(期望 insufficient_quota) 理由含balance=${okG51}(期望1，message='${mG51}') reserved=${resG51}(期望0) 余额=${balC51b}->${balG51}(期望不变) 用量日志=${nlogG51} consume台账=${ntxG51}"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
