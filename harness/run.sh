@@ -1712,5 +1712,75 @@ n49=$(q "SELECT COUNT(*) FROM system_menus WHERE component LIKE 'gateway/%'")
   || fail "菜单不可达: status<>1 的 gateway 菜单=${bad49}(期望0) 二级菜单总数=${n49}(期望>=8：V001 的 5 个 + V005 的 3 个)"
 rm -f "$A1" "$A2" "$A3" "$A4"
 
+# ══ S50 兑换码列表脱敏：能看列表 ≠ 能兑换 ══
+# 码在库里是明文（model/RedemptionCode.kt 记着理由：运营要能把码导出发给客户）。但 /page 是
+# 给「盘点与审计」用的，不是给「取码」用的 —— 完整码只在 /generate 那一刻下发一次。
+# 脱敏之前 /page 返回的就是完整码，于是 gateway:redemption:list 这条**本来是要给只读审计
+# 角色**的权限，实际含义变成「把库里所有未使用的码兑进自己账户」。码体 99 bit 的熵在这条
+# 通路上完全不起作用：熵防的是「猜」，而列表直接把答案念出来了。
+# 所以头号断言不是字符串比对，而是**拿 /page 返回的串真去兑一次**：脱敏被摘掉，这一发就会
+# 200 并且真入账 —— 字符串断言只能证明「看起来脱敏了」，这一条证明「兑不动」。
+echo "[S50] 兑换码列表脱敏：能看列表不等于能兑换"
+GJWT=$(admin_jwt)
+gen50=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":70000,"count":3,"note":"S50 脱敏"}')
+batch50=$(printf '%s' "$gen50" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('batchId',''))" 2>/dev/null)
+# A：/generate 必须给完整码。脱敏脱到这里就是把功能脱没了 —— 运营只有这一次机会导出。
+gok=0; gtot=0
+for c in $(printf '%s' "$gen50" | python3 -c "import sys,json;print(' '.join((json.load(sys.stdin).get('data') or {}).get('codes',[])))" 2>/dev/null); do
+  gtot=$((gtot+1)); b=$(printf '%s' "$c" | tr -d '-' | tr 'a-z' 'A-Z')
+  [ "${#b}" = "20" ] && [ "$(q "SELECT COUNT(*) FROM gateway_redemption_codes WHERE code='$b'")" = "1" ] && gok=$((gok+1))
+done
+[ -n "$batch50" ] && [ "$gtot" = "3" ] && [ "$gok" = "3" ] \
+  && pass "/generate 下发完整码（${gok}/${gtot} 都是 20 字符裸码且库里查得到），批次 ${batch50}" \
+  || fail "/generate 没给完整码: batch=${batch50} 返回=${gtot}(期望3) 完整且入库=${gok}(期望3)"
+# B：/page 不得泄露。裸形态与展示形态都查，因为泄露哪一种都能兑。
+pg50=$(curl -s --max-time 20 "$U/admin/gateway/redemption/page?pageNo=1&pageSize=50&batchId=$batch50" -H "Authorization: Bearer $GJWT")
+P50=/tmp/s50-page-$$
+printf '%s' "$pg50" | python3 -c "
+import sys,json
+for r in ((json.load(sys.stdin).get('data') or {}).get('list') or []): print(r.get('id'), r.get('code'))
+" > "$P50" 2>/dev/null
+fmt50() { printf '%s' "$1" | sed -E 's/^(.{5})(.{5})(.{5})(.{5})$/\1-\2-\3-\4/'; }
+leak=0
+while read -r b; do
+  [ -n "$b" ] || continue
+  f=$(fmt50 "$b")
+  case "$pg50" in *"$b"*) leak=$((leak+1));; esac
+  case "$pg50" in *"$f"*) leak=$((leak+1));; esac
+done < <(q "SELECT code FROM gateway_redemption_codes WHERE batch_id='$batch50' ORDER BY id")
+nostar=0; misplaced=0; nrows=0
+while read -r rid rcode; do
+  [ -n "$rid" ] || continue
+  nrows=$((nrows+1))
+  case "$rcode" in *"*"*) ;; *) nostar=$((nostar+1));; esac
+  # 首尾两组必须与库里**同一 id** 的码一致：全掩的话客服对不上号，等于把功能删了。
+  # 按 id 对而不是按顺序对：/page 是 id 倒序、/generate 是插入顺序，两边第一行不是同一张码。
+  db=$(q "SELECT code FROM gateway_redemption_codes WHERE id=$rid")
+  [ "$(printf '%s' "$rcode" | cut -c1-5)" = "$(printf '%s' "$db" | cut -c1-5)" ] || misplaced=$((misplaced+1))
+  [ "$(printf '%s' "$rcode" | rev | cut -c1-5 | rev)" = "$(printf '%s' "$db" | rev | cut -c1-5 | rev)" ] || misplaced=$((misplaced+1))
+done < "$P50"
+[ "$nrows" = "3" ] && [ "$leak" = "0" ] && [ "$nostar" = "0" ] && [ "$misplaced" = "0" ] \
+  && pass "/page 不泄露完整码（${nrows} 行；本批 3 张码的裸形态与展示形态在响应体里各 0 次命中、每行都带掩码、首尾两组仍与库里同 id 的码对得上）" \
+  || fail "/page 泄露或脱敏过头: 行数=${nrows}(期望3) 泄露命中=${leak}(期望0) 无掩码行=${nostar}(期望0) 首尾对不上=${misplaced}(期望0)"
+# C：拿 /page 给的串真去兑 —— 必须兑不动、一分不入账。这一条才是脱敏的意义。
+rid1=$(head -1 "$P50" | cut -d' ' -f1); rcode1=$(head -1 "$P50" | cut -d' ' -f2-)
+bal50=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+d50=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$rcode1\"}"); sleep 1
+bal50a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+m50=$(python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null)
+ntx50=$(q "SELECT COUNT(*) FROM gateway_quota_transactions t JOIN gateway_redemption_codes r ON t.ref='redeem:'||r.code WHERE r.batch_id='$batch50'")
+# /disable/{id} 与 /page 共用同一个 toVO，但「共用」是会被改散的，所以单独验一次。
+dis50=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/disable/$rid1" -H "Authorization: Bearer $GJWT")
+dcode50=$(printf '%s' "$dis50" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('code',''))" 2>/dev/null)
+# 404「兑换码无效」而不是 400「格式不正确」：前者是「查不到这张码」，后者意味着脱敏串
+# 归一化后反而变长了 —— 两者都兑不动，但只有前者是设计意图。
+case "$m50" in *"无效"*) okmsg=1;; *) okmsg=0;; esac
+[ "$d50" = "404" ] && [ "$okmsg" = "1" ] && [ "$bal50a" = "$bal50" ] && [ "$ntx50" = "0" ] && [ "$dcode50" = "$rcode1" ] && [ -n "$dcode50" ] \
+  && pass "拿 /page 的脱敏串去兑 → 404「${m50}」、余额 ${bal50}→${bal50a} 一分未动、本批 redeem 台账 ${ntx50} 条；/disable 的响应同样脱敏（${dcode50}）" \
+  || fail "脱敏形同虚设: 兑 /page 给的串 HTTP=${d50}(期望404) message='${m50}'(期望含「无效」) 余额=${bal50}->${bal50a}(期望不变) 台账=${ntx50}(期望0) /disable 返回='${dcode50}'(期望等于 /page 的 '${rcode1}')"
+rm -f "$P50"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
