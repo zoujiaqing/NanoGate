@@ -1450,6 +1450,84 @@ dmis45=$((mis45b - mis45a))
   && pass "配置非法响而不发：attach 报 inviter=INVALID，邀请人(${inv45}=注册出的 ${a45}) 台账 ${ni45} 条、额度账户 ${nacc45} 个、MISCONFIGURED 日志 +${dmis45}；同一条记录的被邀请人(${b45}) 照拿 20000（余额 ${bb45}）—— 一个角色配错不连累另一个" \
   || fail "非法配置处理不对: attach=${atok45}(期望yes，'${atk45:0:120}') 记录id=${rid45}(期望>0) 邀请人=${inv45}(期望=${a45}) inviter台账=${ni45}(期望0) inviter额度账户=${nacc45}(期望0) MISCONFIGURED增量=${dmis45}(期望1) invitee行=${ne45}(期望1) invitee余额=${bb45}(期望20000) 注册回显 a=${a45} b=${b45}"
 
+echo "[S46] 兑换码管理端要授权，不只是认证：零角色的管理端账号必须被挡，且被挡时一行也不写"
+# 为什么这条要紧：@Permission 缺失时框架**完全不做授权检查** —— SecurityPreHandle 第 5 步的条件是
+# `route.permission != null`，而 admin 路由组只保证「你是某个管理端账号」。造码就是造钱，
+# 「一个只有客服权限的账号能造码」等于把印钞机挂在最弱的那把钥匙后面。授权层此前零覆盖：
+# S39 断的是网关令牌 401（认证层）与 app 组 404（路由层），都不是「管理端账号但权限不够」。
+#
+# 主体怎么造：system_users 插一行、**不插 system_user_roles** —— resolvePermissions 对没有任何
+# 角色的用户直接返回 emptySet()（PermissionLogic:37）。于是这个账号能登录（认证过）、token 里
+# 零权限（授权必拒），403 只可能来自授权这一层，归因是干净的。
+# 哈希用 INSERT ... SELECT 从 admin 那行复制：它含 `$`（pbkdf2-sha256$210000$…），经 shell 双引号
+# 插值会被当成变量展开吃掉，于是密码悄悄变了、登录失败，场景会红在「登录」而不是测到授权。
+#
+# 末尾那一发 admin 对照是必需的：少了它，403 可能来自任何原因（路由坏了、body 不合法），
+# 而这个场景会绿着放行一个已经谁都用不了的接口。另一半保险在 S36–S39：它们全程用 admin 造码，
+# 补注解若把 super_admin 的 `*:*:*` 通配也挡住，那四个场景会一起红。
+q "INSERT INTO system_users (id, username, password_hash, nickname, status, created_at, updated_at) SELECT 946, 'cs_s46', password_hash, 'S46 客服', 1, 0, 0 FROM system_users WHERE id=1 ON CONFLICT (id) DO NOTHING" >/dev/null
+csjwt=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+  -d '{"username":"cs_s46","password":"admin123"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+csok46=no; [ -n "$csjwt" ] && csok46=yes
+csrole46=$(q "SELECT COUNT(*) FROM system_user_roles WHERE user_id=946")
+ngen46a=$(q "SELECT COUNT(*) FROM gateway_redemption_codes")
+cs46() { curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U$1" \
+  -H "Authorization: Bearer $csjwt" -H "$CT" -d "$2"; }
+p1=$(cs46 "/admin/gateway/redemption/generate" '{"quotaMicro":50000,"count":3,"note":"S46 越权尝试"}')
+p2=$(cs46 "/admin/gateway/redemption/disable-batch" '{"batchId":"rc-0000000000000000"}')
+p3=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" \
+  "$U/admin/gateway/redemption/page?pageNo=1&pageSize=10" -H "Authorization: Bearer $csjwt")
+sleep 1
+ngen46b=$(q "SELECT COUNT(*) FROM gateway_redemption_codes")
+# 对照：同一个接口、换成 super_admin，必须 200 且真的多出一行。
+GJWT=$(admin_jwt)
+ok46=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":1000,"count":1,"note":"S46 对照"}')
+sleep 1
+ngen46c=$(q "SELECT COUNT(*) FROM gateway_redemption_codes")
+[ "$csok46" = "yes" ] && [ "$csrole46" = "0" ] && [ "$p1" = "403" ] && [ "$p2" = "403" ] && [ "$p3" = "403" ] \
+  && [ "$ngen46b" = "$ngen46a" ] && [ "$ok46" = "200" ] && [ "$ngen46c" = "$((ngen46a+1))" ] \
+  && pass "授权与认证分得开：零角色账号登录成功（认证过了，角色数 ${csrole46}）但造码=${p1}、整批作废=${p2}、列表=${p3} 全 403，且码表 ${ngen46a}→${ngen46b} 一行没多；同一接口换 super_admin → ${ok46} 且 ${ngen46b}→${ngen46c}（+1，注解没把通配挡住）" \
+  || fail "授权边界不对: cs登录=${csok46}(期望yes) 角色数=${csrole46}(期望0) 造码=${p1}(期望403) 整批作废=${p2}(期望403) 列表=${p3}(期望403) 越权后码数=${ngen46b}(期望=${ngen46a}) admin对照=${ok46}(期望200) 对照后码数=${ngen46c}(期望=$((ngen46a+1))) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+echo "[S47] 授权巡检：钱相关的管理端动作一律要权限，且拒绝理由必须点名那条权限"
+# S46 盯的是兑换码。这一条把同一个零权限主体（沿用 S46 造的 cs_s46，同一轮里 token 仍有效）
+# 打到另外三个能动钱的管理端动作上，跨模块盯着“授权注解被摘”这一类回归：
+#   直接发额度 gateway:quota:grant / 发起退款 pay:refund:create / 新建计价组 gateway:group:create
+# 它们今天都带着 @Permission，所以这一轮应该是绿的 —— 价值在以后：谁把注解摘掉了这里就红。
+# 一次性的人工扫描拦不住下一次（本次就是扫出来的），巡检才能。
+#
+# 拒绝理由必须**点名权限串**（框架把 `Permission denied: <permission>` 写进信封）：
+# 403 本身只说明「被拒了」，点名才说明是这一条 @Permission 在起作用 ——
+# 否则路由写错打到别处的 403 与权限生效长得一模一样。
+# 副作用不变量与状态码一起断言：“403 但已经写进去了”比 200 更糟。
+bal47a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nled47a=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+ngrp47a=$(q "SELECT COUNT(*) FROM gateway_groups")
+h1=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/quota/grant" \
+  -H "Authorization: Bearer $csjwt" -H "$CT" -d '{"userId":1,"amount":100000,"ref":"s47-probe"}')
+b1=$(head -c 200 "$GB" 2>/dev/null | tr -d '\n')
+h2=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/pay/refund/create" \
+  -H "Authorization: Bearer $csjwt" -H "$CT" \
+  -d '{"merchantOrderId":"s47-nope","merchantRefundId":"s47-ref","refundAmount":100}')
+b2=$(head -c 200 "$GB" 2>/dev/null | tr -d '\n')
+h3=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
+  -H "Authorization: Bearer $csjwt" -H "$CT" -d '{"code":"s47probe","name":"S47","ratio":"1.0"}')
+b3=$(head -c 200 "$GB" 2>/dev/null | tr -d '\n')
+sleep 1
+bal47b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+nled47b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+ngrp47b=$(q "SELECT COUNT(*) FROM gateway_groups")
+k1=no; printf '%s' "$b1" | grep -q 'gateway:quota:grant' && k1=yes
+k2=no; printf '%s' "$b2" | grep -q 'pay:refund:create' && k2=yes
+k3=no; printf '%s' "$b3" | grep -q 'gateway:group:create' && k3=yes
+[ "$h1" = "403" ] && [ "$h2" = "403" ] && [ "$h3" = "403" ] \
+  && [ "$k1" = "yes" ] && [ "$k2" = "yes" ] && [ "$k3" = "yes" ] \
+  && [ "$bal47b" = "$bal47a" ] && [ "$nled47b" = "$nled47a" ] && [ "$ngrp47b" = "$ngrp47a" ] \
+  && pass "钱端点全在授权后面（零权限主体，拒绝理由各点名一条权限）：发额度=${h1}、退款=${h2}、建组=${h3} 全 403；余额 ${bal47a}→${bal47b}、台账 ${nled47a}→${nled47b} 条、计价组 ${ngrp47a}→${ngrp47b} 个均未动" \
+  || fail "授权巡检不过: 发额度=${h1}(期望403，点名=${k1}) 退款=${h2}(期望403，点名=${k2}) 建组=${h3}(期望403，点名=${k3}) 余额=${bal47a}→${bal47b}(期望不变) 台账=${nled47a}→${nled47b}(期望不变) 组=${ngrp47a}→${ngrp47b}(期望不变) bodies='${b1:0:80}'|'${b2:0:80}'|'${b3:0:80}'"
+
 rm -f "$GB"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
