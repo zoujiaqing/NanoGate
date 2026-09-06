@@ -261,6 +261,10 @@ platform / cs）的 `neton.migration.dialects` 都硬编码 `postgresql`，而 `
 `system_menus` 的迁移上失败。本发行版从不设置 `neton.database.driver`（默认 postgres），
 那两个目录里的 SQL 连编进二进制都不会。
 
+三方言因此**不必保持同版本号**：postgresql 已到 V006，mysql 与 sqlite 停在 V004。差的这两版
+（V005 网关权限菜单、V006 额度撤回菜单）改的正是 `system_menus`，而那两方言就算补齐也仍会在
+第一条碰它的迁移上失败 —— 所以缺的这两版不是待还的债。
+
 结论：改 schema **只需改 `sql/postgresql/`**。那两个目录是历史遗留，别照着它们补新脚本 ——
 补齐了也跑不到，只会让人误以为 mysql 是支持目标。要真支持 mysql，得先给 infra 等模块
 补方言（含 `system_menus` 的建表），那是一个独立的、比 gateway 大得多的工程。
