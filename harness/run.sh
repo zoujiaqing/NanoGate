@@ -1918,5 +1918,66 @@ case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
   && pass "撤回真的生效：撤回前 relay=${rpre51}（对照，证明渠道/定价/上游都正常）→ 撤到转负后 relay=${hG51} type=${tG51} 理由='${mG51}'（是账户余额不足，不是 token 预算）；402 之后 reserved_balance=${resG51}（无泄漏预留）、余额仍 ${balG51}、m-rv51 用量日志 ${nlogG51} 行" \
   || fail "撤回没落到真实通路上: 撤回前 relay=${rpre51}(期望200，若不是则本块环境就没搭好) 撤回后=${hG51}(期望402) type='${tG51}'(期望 insufficient_quota) 理由含balance=${okG51}(期望1，message='${mG51}') reserved=${resG51}(期望0) 余额=${balC51b}->${balG51}(期望不变) 用量日志=${nlogG51} consume台账=${ntxG51}"
 
+# ══ S52 用户控制台接线完整性：装配了的页面必须有侧栏入口，icon 名必须真的存在 ══
+# C 端与 B 端是两套毫不相干的接线，所以 S49 那三道断言对用户控制台一条都不适用：管理台的侧栏
+# 来自数据库（system_menus → buildNav），用户侧的侧栏来自一个静态数组
+# （newgate-client/apps/console/src/config/console.nav.ts），与库、与 RBAC、与权限全无关系
+# —— layout 给 AppShell 传的是 roles={[]} permissions={[]}，每个登录用户看到的都一样。
+# 这个数组此前就是空的：`export const consoleNav: NavItem[] = [];`。后果是 console 装配的 5 个
+# 页面路由全在、组件全能渲染、typecheck 全绿，而用户登录后侧栏一片空白，进入任何一页的唯一
+# 方式是手敲 URL。**没有任何一条既有断言会因此变红** —— 「页面装配了」记在各模块的 manifest.ts
+# 里、「页面有入口」记在 app 的 nav 里，两套文件谁都不检查对方。这与 S49 要抓的洞同构：
+# 能力本身存在，授予它的那根接线断了，而断掉是静默的。
+# 三处静默失配各钉一道：
+# ① 已装配页面 → nav 里有条目（漏了就是只能手敲 URL 的隐形页）；
+# ② nav 条目 → 页面真存在（漏了就是点进去 404 的死链接：页面被删而 nav 忘了跟着改）；
+# ③ icon 名 → app-shell 的 iconMap 里真有这个键。NavItem.icon 的类型是 string|null，写错任何串
+#    typecheck 都放行，resolveIcon 静默回落 CircleDot —— 图标错了不报错，只是侧栏长得不对。
+# ①② 互为守卫：页面集若被算空，① 会假绿（0 个页面自然 0 个无入口）而 ② 立刻红（nav 的 5 条
+# 全成了悬空）。但两边同时算空时①②都绿 —— 那恰好是原始缺陷的形状，所以 ① 另加一条 >=5 的下限。
+# 页面集取自 console 自己 package.json 的 file: 依赖、再读各模块 manifest.ts，不读
+# modules.generated.ts：生成物要跑 pnpm 才有，manifest 是源码、永远在。cs 模块存在于仓库但没进
+# console 的依赖，所以不计入 —— 「装配了什么」由 app 说了算，不由模块自己说了算。
+echo "[S52] 用户控制台接线完整性：页面有入口、入口有页面、icon 名存在"
+CONSOLE52="$ROOT/newgate-client/apps/console"
+NAV52="$CONSOLE52/src/config/console.nav.ts"
+SHELL52="$CONSOLE52/src/components/app-shell.tsx"
+B1=/tmp/s52-mods-$$; B2=/tmp/s52-pages-$$; B3=/tmp/s52-nav-$$; B4=/tmp/s52-icons-$$; B5=/tmp/s52-iconmap-$$
+if [ -f "$CONSOLE52/package.json" ] && [ -f "$NAV52" ] && [ -f "$SHELL52" ]; then
+  grep -oE '"@neton/application-client-[a-z]+": "file:[^"]+"' "$CONSOLE52/package.json" \
+    | sed 's/.*"file://;s/"$//' > "$B1"
+  : > "$B2"
+  # while read 而不是 for $mods：for 靠词分割，而词分割在 zsh 下不发生（整个多行串被当成一个
+  # 路径）。本场景的提取链就是这么断过一次 —— 页面数算成 0，5 条正确的 nav 全被报成悬空入口。
+  while read -r m52; do
+    [ -n "$m52" ] || continue
+    d52=$(cd "$CONSOLE52/$m52" 2>/dev/null && pwd) || continue
+    [ -f "$d52/src/manifest.ts" ] || continue
+    grep -oE 'path: "[^"]+"' "$d52/src/manifest.ts" | sed 's/path: "//;s/"$//' >> "$B2"
+  done < "$B1"
+  sort -u "$B2" -o "$B2"
+  grep -oE 'path: "[^"]+"' "$NAV52" | sed 's/path: "//;s/"$//' | sort -u > "$B3"
+  nm52=$(wc -l < "$B1" | tr -d ' '); np52=$(wc -l < "$B2" | tr -d ' '); nn52=$(wc -l < "$B3" | tr -d ' ')
+  hide=$(comm -23 "$B2" "$B3" | tr '\n' ' '); nhide=$(comm -23 "$B2" "$B3" | wc -l | tr -d ' ')
+  dead=$(comm -13 "$B2" "$B3" | tr '\n' ' '); ndead=$(comm -13 "$B2" "$B3" | wc -l | tr -d ' ')
+  [ "$nhide" = "0" ] && [ "$np52" -ge 5 ] \
+    && pass "每个已装配页面都有侧栏入口（${nm52} 个 client 模块 → ${np52} 个页面 vs nav ${nn52} 条，隐形页 0）" \
+    || fail "隐形页 ${nhide} 个（路由与组件都在、typecheck 也绿，用户却只能手敲 URL 进去）: ${hide} | 页面=${np52}(期望>=5：gateway 3 页 + member 1 页 + payment 1 页) nav=${nn52}"
+  [ "$ndead" = "0" ] \
+    && pass "每条侧栏入口都指向真页面（悬空 0）" \
+    || fail "nav 里有 ${ndead} 条指向不存在的页面（点进去 404）: ${dead} | 页面=${np52} nav=${nn52}"
+  grep -oE 'icon: "[^"]+"' "$NAV52" | sed 's/icon: "//;s/"$//' | sort -u > "$B4"
+  sed -n '/^const iconMap/,/^};/p' "$SHELL52" | grep -oE '^ *"?[A-Za-z-]+"?:' | tr -d ' ":' | sort -u > "$B5"
+  ni52=$(wc -l < "$B4" | tr -d ' '); nk52=$(wc -l < "$B5" | tr -d ' ')
+  badicon=$(comm -23 "$B4" "$B5" | tr '\n' ' '); nbad=$(comm -23 "$B4" "$B5" | wc -l | tr -d ' ')
+  [ "$nbad" = "0" ] && [ "$nk52" -ge 1 ] \
+    && pass "每个 icon 名都在 iconMap 里（nav 用了 ${ni52} 个图标 vs iconMap ${nk52} 个键，非法 0）" \
+    || fail "nav 引用了不存在的 icon ${nbad} 个（NavItem.icon 是自由串，typecheck 放行，resolveIcon 静默回落 CircleDot）: ${badicon} | iconMap 键=${nk52}(期望>=1，为 0 说明提取链断了)"
+else
+  # CI 只 checkout 后端模块（见 backend-ci.yml），用户控制台仓不在 —— 这三道在那里无从执行。
+  echo "  ⚠️  跳过用户控制台接线比对：$CONSOLE52 下文件不齐（CI 不 checkout 前端仓）" >&2
+fi
+rm -f "$B1" "$B2" "$B3" "$B4" "$B5"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
