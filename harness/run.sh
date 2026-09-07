@@ -1588,7 +1588,14 @@ GJWT=$(admin_jwt)
 # 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 member_users(1) 的会员组是 S26 留下的
 # 未映射组，基线那一发会变成 403 而不是按 default 计价。关掉它，比较才是干净的两层：例外 vs default。
 seed_reset; fake ok 9948; sleep 1
-q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c48','openai_compatible','http://127.0.0.1:9948','default,vip48','m-grp',1,1,1,30000,90000,'1.0',0,0,0);
+# ⚠️ 必须先把 member_users(2) 建出来：下面三发「写入校验」用的都是 userId=2，而 create 现在会
+# **先**校验 userId 是不是一个活会员（MemberDirectoryPort，见 S54）。库里没有 id=2 的话，那三发
+# 仍然回 400、行数仍然是 0，但理由从「组码悬空 / 空白 / 超长」悄悄换成「没有这个会员」——
+# 结果码一模一样，三条覆盖就这么静默失效（S28 那次假绿正是这个形状：409 不变、理由全错）。
+# status 显式写 1：DDL 的默认是 0(DISABLED)，与 Kotlin model 的默认 1(NORMAL) 相反。
+q "INSERT INTO member_users (id,nickname,status,deleted,created_at,updated_at) VALUES (2,'s48-second',1,0,0,0)
+     ON CONFLICT (id) DO UPDATE SET status=1, deleted=0;
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c48','openai_compatible','http://127.0.0.1:9948','default,vip48','m-grp',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c48'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
    UPDATE gateway_groups SET deleted=0, ratio='1.0' WHERE code='default';
@@ -1612,6 +1619,11 @@ b1=$(relay26); sleep 1; with48=$(charged26)
 # 超长 remark 同理：到了驱动那一层三方言处置不一致（报错 / 静默截断），截断会把备注变成半句话。
 dang=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":2,"groupCode":"ghost48","remark":"悬空"}')
+# message 必须在**这里**就取走：下面三发共用 $GB，等到断言时里面已经是 userId=0 那一发的响应了
+# —— fail 信息指着错的那半边，比没有信息更坑（S53 块 A 踩过同一类坑）。
+# 点名 'ghost48' 是真守卫：userId=2 现在也是一个合法会员（见上面 seed 的注释），少了这条
+# 断言，一发因「没有这个会员」而回的 400 会冒充「组码悬空」的 400，两者状态码与行数完全一样。
+mdang=$(python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null)
 blank=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":2,"groupCode":"   "}')
 LONGR48=$(python3 -c 'print("x"*257)')
@@ -1621,8 +1633,9 @@ nonpos=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":0,"groupCode":"vip48"}')
 n2=$(q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id IN (0,2)")
 [ "$dang" = "400" ] && [ "$blank" = "400" ] && [ "$longr" = "400" ] && [ "$nonpos" = "400" ] && [ "$n2" = "0" ] \
-  && pass "写入校验在驱动之前：悬空组=${dang}、空白组=${blank}、257 字 remark=${longr}、userId=0 均 400（非 500），且一行也没写进去（user 0/2 共 ${n2} 条）" \
-  || fail "写入校验不对: 悬空=${dang}(期望400) 空白=${blank}(期望400) 超长remark=${longr}(期望400) userId=0=${nonpos}(期望400) 写入行数=${n2}(期望0) body=$(head -c 160 "$GB" 2>/dev/null)"
+  && printf '%s' "$mdang" | grep -q "ghost48" \
+  && pass "写入校验在驱动之前：悬空组=${dang}（message 点名 'ghost48' 而不是 '没有这个会员'）、空白组=${blank}、257 字 remark=${longr}、userId=0 均 400（非 500），且一行也没写进去（user 0/2 共 ${n2} 条）" \
+  || fail "写入校验不对: 悬空=${dang}(期望400) 空白=${blank}(期望400) 超长remark=${longr}(期望400) userId=0=${nonpos}(期望400) 写入行数=${n2}(期望0) 悬空message='${mdang:0:120}'(期望点名 ghost48；若写的是 'no chargeable member' 则本发测的是 S54 那件事、组码校验已失去覆盖)"
 
 # 主键就是 userId，所以「同一用户第二条」只能是冲突。这里要同时守住两件事：
 # ① 是 409 而不是 500（撞主键的驱动异常未被归类的话，框架会兜底成 500 + "Internal Server Error"，
@@ -2062,6 +2075,85 @@ bal53f=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
   && [ "$psE53" = "2" ] && [ "$paE53" = "null" ] && [ "$ntx53e" = "0" ] && [ "$bal53f" = "$bal53e" ] \
   && pass "块E 已关闭的单可读：未知渠道 → 下单 ${bad53}、意图单 ${rid53e} 被 close() 置 pay_status=${psE53db}；回读 ${hE53} payStatus=${psE53} paidAt=${paE53}、台账 ${ntx53e} 条、余额未动(${bal53f})" \
   || fail "块E 已关闭单的回读不对: 下单=${bad53}(期望400) 新单id=${rid53e}(期望!=${RID53}) 库中pay_status=${psE53db}(期望2) 回读=${hE53}(期望200，404 意味着已关闭单被过滤掉了) payStatus=${psE53}(期望2) paidAt=${paE53}(期望null) 台账=${ntx53e}(期望0) 余额=${bal53e}->${bal53f}(期望不变)"
+
+# ══ S54 写用户级计费例外时校验 userId：打错一位数字必须响，不能静默按 default 计价 ══
+# 钉的是 GROUP-OVERRIDE-ADMIN-CRUD-P1 的第一条 follow-up。此前 userId 只校验了正数：
+# 把 10001 打成 100001，create 返回 200，例外静静躺在 gateway_group_overrides 里，而解析器
+# 第 2 层是按**发起请求的那个** userId 查的，永远够不着它 —— 客户继续按 default 组计价，
+# 谈判价没生效而**双方都不报错**：客户按标准价付了钱，运营以为给了折扣。
+#
+# 五块各钉一件事，少一块就有一种「看着对」的实现能溜过去：
+#  A 不存在的 id → 400 且一行也不写。必须是 400 而不是 500：抛 IllegalArgumentException 会被
+#    兜底成 500 + "Internal Server Error"，message 不进信封，管理端只看到一片空白。
+#  B NORMAL 会员 → 200 且例外真的落库。这块是为了证明校验没把合法写入一起挡掉 ——
+#    一个无条件 badRequest 的实现会让 A/C/D 全绿。
+#  C **注销会员 → 400，且库里确实查得到这个会员**。这是本场景的灵魂：member 的自助注销
+#    （MemberAuthLogic.deleteOwnAccount）只把 status 置 DELETED、**不动 deleted 列**，所以
+#    MemberTable.get(id) 对注销会员依然返回非 null —— 一个只判「查得到」的实现会放行它。
+#    那两条 SQL 断言（mbr54c/st54c）把「查得到、status=2、deleted=0」钉成事实，免得块 C
+#    因为别的原因（比如 INSERT 根本没成功）而假绿。
+#  D DISABLED 会员 → 400：判据是白名单 status == NORMAL，不是 status != DELETED。member 的
+#    MemberStatus KDoc 用红字要求这么写 —— 否定式在新增状态时会默默放行，DELETED 当初就是
+#    这么被漏掉的。
+#  E 注销会员的**既有**例外仍可 delete → 拦写入、不拦清理。校验只挂在 create 上：会员注销
+#    之后运营要的正是删掉那条例外，而按当前 status 拦 delete 会让它永远删不掉，谈判价就
+#    永久留在表里指向一个不再存在的客户。
+echo "[S54] 写计费例外校验 userId：不存在/注销/禁用一律 400 且零副作用，既有例外仍可清理"
+# 显式 id 远离 member_users_id_seq（迁移把它 setval 到 GREATEST(MAX(id),10000)，自增从 10001 起，
+# 所以 S26 的 id=1、S48 的 id=2 与 sms_register 拿到的 10000+ 互不相撞，这里同理）。
+# status 必须显式写：DDL 默认 0(DISABLED) 而 Kotlin model 默认 1(NORMAL)，靠默认值会插出一个
+# 与代码语义相反的账号 —— 块 D 就变成在测「DDL 默认值」而不是「禁用」。
+q "INSERT INTO member_users (id,nickname,status,deleted,created_at,updated_at) VALUES
+     (90541,'s54-normal',1,0,0,0),(90542,'s54-deleted',2,0,0,0),(90543,'s54-disabled',0,0,0,0)
+   ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, deleted=0;
+   DELETE FROM gateway_group_overrides WHERE user_id IN (90541,90542,90543,999554);" >/dev/null
+# default 组必须是活的：否则下面每一发的 400 都可能来自组码校验而不是 userId 校验，
+# 四块会一起变成在测另一件事，而且照样绿。
+g54=$(q "SELECT COALESCE(code,'<none>') FROM gateway_groups WHERE code='default' AND deleted=0")
+ov54() { curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"userId\":$1,\"groupCode\":\"default\",\"remark\":\"S54\"}"; }
+jm54() { python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null; }
+row54() { q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id=$1"; }
+
+# ── 块 A：不存在的 id → 400、点名原因、一行也不写 ──
+aA54=$(ov54 999554); mA54=$(jm54); nA54=$(row54 999554)
+[ "$g54" = "default" ] && [ "$aA54" = "400" ] && [ "$nA54" = "0" ] \
+  && printf '%s' "$mA54" | grep -q "no chargeable member" \
+  && pass "块A 打错 id 会响：userId=999554（库里没有）→ ${aA54}、message 点名原因（'${mA54:0:58}…'），一行也没写进去(${nA54})" \
+  || fail "块A 不存在的 userId 没被拦: default组=${g54}(期望default，否则这发测的是组码校验) create=${aA54}(期望400，500 意味着 message 不进信封) 写入行数=${nA54}(期望0) message='${mA54:0:120}'(期望含 'no chargeable member')"
+
+# ── 块 B：NORMAL 会员 → 200 且例外真的落库 ──
+aB54=$(ov54 90541); nB54=$(row54 90541)
+cB54=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=90541")
+[ "$aB54" = "200" ] && [ "$nB54" = "1" ] && [ "$cB54" = "default" ] \
+  && pass "块B 合法写入没被挡：NORMAL 会员 90541 → ${aB54}，库里 ${nB54} 行 group_code=${cB54}（校验不是无条件拒绝）" \
+  || fail "块B 把合法写入也挡了（校验过宽）: create=${aB54}(期望200) 行数=${nB54}(期望1) group_code=${cB54}(期望default) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# ── 块 C：注销会员（status=DELETED 但 deleted=0）→ 400 ──
+mbr54c=$(q "SELECT COUNT(*) FROM member_users WHERE id=90542 AND deleted=0")
+st54c=$(q "SELECT status FROM member_users WHERE id=90542")
+aC54=$(ov54 90542); mC54=$(jm54); nC54=$(row54 90542)
+[ "$mbr54c" = "1" ] && [ "$st54c" = "2" ] && [ "$aC54" = "400" ] && [ "$nC54" = "0" ] \
+  && pass "块C 注销会员挂不上例外：member_users(90542) 确实**查得到**（deleted=0 的行 ${mbr54c} 条）而 status=${st54c}(DELETED) —— 只判存在性的实现会放行它；实际 ${aC54} 且零副作用(${nC54})" \
+  || fail "块C 注销会员被放行了: 库里查得到=${mbr54c}(期望1，0 说明 INSERT 没成、本块在测空气) status=${st54c}(期望2=DELETED) create=${aC54}(期望400，200 意味着判据写成了 MemberTable.get()!=null) 行数=${nC54}(期望0) message='${mC54:0:120}'"
+
+# ── 块 D：DISABLED 会员 → 400（判据是白名单，不是 status != DELETED）──
+st54d=$(q "SELECT status FROM member_users WHERE id=90543")
+aD54=$(ov54 90543); nD54=$(row54 90543)
+[ "$st54d" = "0" ] && [ "$aD54" = "400" ] && [ "$nD54" = "0" ] \
+  && pass "块D 禁用会员也挂不上：status=${st54d}(DISABLED) → ${aD54}、零副作用(${nD54})。判据是 status==NORMAL 白名单，与 member 的登录/刷新同一套，不自创第二套账号可用性规则" \
+  || fail "块D 禁用会员被放行了: status=${st54d}(期望0=DISABLED) create=${aD54}(期望400，200 意味着判据写成了 status!=DELETED 这类否定式) 行数=${nD54}(期望0)"
+
+# ── 块 E：注销会员的**既有**例外仍可 delete（拦写入、不拦清理）──
+# 手工插一行模拟真实时序：例外是会员还正常时建的，人后来注销了。这一行现在指向一个不再
+# 可用的会员，运营要的正是删掉它 —— 所以 delete 不能按当前 status 拦。
+q "INSERT INTO gateway_group_overrides (user_id,group_code,remark) VALUES (90542,'default','S54 注销前建的')" >/dev/null
+pre54e=$(row54 90542)
+aE54=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/90542" -H "Authorization: Bearer $GJWT")
+post54e=$(row54 90542)
+[ "$pre54e" = "1" ] && [ "$aE54" = "200" ] && [ "$post54e" = "0" ] \
+  && pass "块E 清理不受拦：注销会员 90542 的既有例外（手插 ${pre54e} 行）→ delete ${aE54}、行已消失(${post54e})。校验只挂 create，否则这条例外会永久留在表里指向一个不再存在的客户" \
+  || fail "块E delete 被 status 拦了（校验挂错了端点）: 手插后行数=${pre54e}(期望1) delete=${aE54}(期望200，400 意味着 requireChargeableMember 也加到了 delete 上) 删后行数=${post54e}(期望0)"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
