@@ -1979,5 +1979,89 @@ else
 fi
 rm -f "$B1" "$B2" "$B3" "$B4" "$B5"
 
+# ══ S53 充值单回读：跳转付款回来后前端唯一的完成信号，且只能读自己的单 ══
+# POST /app/gateway/recharge 在 displayMode=REDIRECT_URL 时把用户送出本站，回来后那个标签页对
+# 「回调到底落了没有」一无所知。此前唯一可用的信号是轮询 usage/balance，而「余额没变」分不清
+# 三种情况 —— 还在等 / 回调失败 / 单子已被服务端关掉。三者的处置分别是等、找运营、重新下单，
+# 混成一个「没变」等于让用户自己猜。S32/S33 已经把「回调 → 入账」这半边钉死了，钉的是库里的
+# 数字；用户看不到库。这一场景补的是从库到用户眼前那一段。
+#
+# 块 A/B 钉「回读说的与账面一致」：只断 payStatus 的话，一个把状态写对却不入账的实现照样绿，
+# 而「已支付但没额度」正是 S33 要消灭的那种静默错账 —— 不能让 pay_status 一个字段替它作证。
+# 块 C/D 钉归属门：跨用户必须 404，且与「查无此单」**逐字同形**。分成 403/404 两种就等于给
+# 探测者装了一台「哪些 id 存在」的预言机，而 rechargeId 自增，那台预言机几乎零成本。
+# 块 D 另加一条「message 非空」的下限守卫：提取链断掉时两边都是空串，相等会假绿 ——
+# 与 S52 给隐形页那条加 >=5 下限是同一个理由。
+# 块 E 钉第三种状态可读：下单失败被 close() 关掉的单必须回读成 payStatus=2，不能被过滤掉。
+# 过滤掉的话用户拿到 404，于是「我点了充值、什么也没发生、什么也查不到」—— 那正是最容易变成
+# 工单的一类。这里走的是**真 close() 路径**（未知渠道 → payment 抛 → 意图单被关闭），与 S40 同源；
+# 不用 SQL 把 pay_status 改成 2 假装，那只会验到「字段能透传」，验不到 close 真的写了它。
+echo "[S53] 充值单回读：状态与账面一致、跨用户与不存在同形 404、已关闭单可读"
+st53() { curl -s --max-time 15 -o "$GB" -w "%{http_code}" "$U/app/gateway/recharge/get/$1" \
+  -H "Authorization: Bearer $2"; }
+jf53() { python3 -c "import json;v=(json.load(open('$GB')).get('data') or {}).get('$1');print('null' if v is None else v)" 2>/dev/null; }
+jmsg53() { python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null; }
+
+# ── 块 A：刚下的单 —— 待支付、额度已算定、paidAt 还是空 ──
+bal53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+rc53=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
+RID53=$(jf53 rechargeId); MOID53=$(jf53 merchantOrderId); AMT53=$(jf53 amountMicro)
+# 下单响应的 message 与 body 必须在这里就存下来：下面 st53 会覆盖 $GB，那时再取就变成
+# 回读端点的响应了 —— fail 信息指着错的那半边，比没有信息更坑（S8 就踩过这类坑）。
+mrc53=$(jmsg53); brc53=$(head -c 200 "$GB")
+hA53=$(st53 "${RID53:-0}" "$GJWT")
+rowA53="$(jf53 payStatus) $(jf53 amountMicro) $(jf53 price) $(jf53 merchantOrderId) $(jf53 paidAt)"
+[ "$rc53" = "200" ] && [ "$hA53" = "200" ] && [ "$rowA53" = "0 $AMT53 100 gateway:quota:$RID53 null" ] \
+  && pass "块A 刚下的单可读：下单 ${rc53} → 回读 ${hA53}，payStatus=0(待支付) amountMicro=${AMT53} price=100 merchantOrderId=gateway:quota:${RID53} paidAt=null" \
+  || fail "块A 回读与下单对不上: 下单=${rc53}(期望200) 回读=${hA53}(期望200) 回读行='${rowA53}'(期望'0 ${AMT53} 100 gateway:quota:${RID53} null') 下单响应 rechargeId=${RID53} merchantOrderId=${MOID53} amountMicro=${AMT53} message='${mrc53}' body=${brc53}"
+
+# ── 块 B：回调落定后，回读说「已入账」而账面也真的入了 ──
+cb53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+  "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID53\"}")
+sleep 1
+hB53=$(st53 "$RID53" "$GJWT")
+psB53=$(jf53 payStatus); paB53=$(jf53 paidAt); moB53=$(jf53 merchantOrderId)
+balB53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx53=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID53' AND type='recharge'")
+# paidAt 必须是正数时间戳：null/空/0 都算没写。-gt 对非数字会报错，所以先用 case 拦住。
+okpa53=0; case "$paB53" in ''|null) ;; *) [ "$paB53" -gt 0 ] 2>/dev/null && okpa53=1;; esac
+[ "$cb53" = "200" ] && [ "$hB53" = "200" ] && [ "$psB53" = "1" ] && [ "$okpa53" = "1" ] \
+  && [ "$moB53" = "gateway:quota:$RID53" ] && [ "$ntx53" = "1" ] && [ "$balB53" = "$((bal53+AMT53))" ] \
+  && pass "块B 回读与账面一致：回调 ${cb53} → payStatus=${psB53}(已入账) paidAt=${paB53}(>0) merchantOrderId=${moB53}；余额 ${bal53}→${balB53}(+${AMT53})、type='recharge' 台账 ${ntx53} 条" \
+  || fail "块B 状态写对了但账没对上（或反之）: 回调=${cb53}(期望200) 回读=${hB53}(期望200) payStatus=${psB53}(期望1) paidAt=${paB53}(期望>0) merchantOrderId=${moB53}(期望gateway:quota:${RID53}) 台账=${ntx53}(期望1) 余额=${bal53}->${balB53}(期望$((bal53+AMT53)))"
+
+# ── 块 C：另一个真会员读同一张单 → 404（不是 403） ──
+read -r c53 tc53 <<<"$(sms_register '+8615000053001')"
+hC53=$(st53 "$RID53" "$tc53"); mC53=$(jmsg53)
+[ "$c53" != "0" ] && [ "$c53" != "1" ] && [ "$hC53" = "404" ] \
+  && pass "块C 跨用户读不到：新会员 id=${c53} 读 user 1 的单 ${RID53} → ${hC53}（403 会确认单子存在，rechargeId 自增，那就是零成本的枚举预言机）" \
+  || fail "块C 归属门没拦住: 新会员 id=${c53}(期望非0且非1，0 说明注册失败、环境未搭好) 回读=${hC53}(期望404) message='${mC53}'"
+
+# ── 块 D：不存在的 id 也是 404，且 message 与块 C 逐字相同 ──
+hD53=$(st53 999999999 "$GJWT"); mD53=$(jmsg53)
+[ "$hD53" = "404" ] && [ -n "$mC53" ] && [ "$mC53" = "$mD53" ] \
+  && pass "块D 「不是你的」与「不存在」同形：两者均 404 且 message 逐字相同（'${mD53}'）—— 分开就等于把存在性泄给了探测者" \
+  || fail "块D 两种 404 可区分: 不存在id=${hD53}(期望404) message='${mD53}' vs 跨用户 message='${mC53}'（两者必须非空且相等，空串相等是提取链断了的假绿）"
+
+# ── 块 E：下单失败被 close() 关掉的单仍可读，且回读成「已关闭」 ──
+bal53e=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bad53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_53"}')
+sleep 1
+# 这条路回 400（payment 的 resolveRoute 抛），响应体里没有 rechargeId，只能取 MAX(id) ——
+# 与 S40 同一做法：本场景没有并发写手。多断一条 rid53e != RID53 把「根本没建新行」这种情况
+# 从「pay_status 对不上」里分出来，否则 fail 信息会把人指到错的那半边。
+rid53e=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
+psE53db=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$rid53e")
+hE53=$(st53 "$rid53e" "$GJWT")
+psE53=$(jf53 payStatus); paE53=$(jf53 paidAt)
+ntx53e=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='gateway:quota:$rid53e'")
+bal53f=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+[ "$bad53" = "400" ] && [ "$rid53e" != "$RID53" ] && [ "$psE53db" = "2" ] && [ "$hE53" = "200" ] \
+  && [ "$psE53" = "2" ] && [ "$paE53" = "null" ] && [ "$ntx53e" = "0" ] && [ "$bal53f" = "$bal53e" ] \
+  && pass "块E 已关闭的单可读：未知渠道 → 下单 ${bad53}、意图单 ${rid53e} 被 close() 置 pay_status=${psE53db}；回读 ${hE53} payStatus=${psE53} paidAt=${paE53}、台账 ${ntx53e} 条、余额未动(${bal53f})" \
+  || fail "块E 已关闭单的回读不对: 下单=${bad53}(期望400) 新单id=${rid53e}(期望!=${RID53}) 库中pay_status=${psE53db}(期望2) 回读=${hE53}(期望200，404 意味着已关闭单被过滤掉了) payStatus=${psE53}(期望2) paidAt=${paE53}(期望null) 台账=${ntx53e}(期望0) 余额=${bal53e}->${bal53f}(期望不变)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
