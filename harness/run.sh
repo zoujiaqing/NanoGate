@@ -2155,5 +2155,95 @@ post54e=$(row54 90542)
   && pass "块E 清理不受拦：注销会员 90542 的既有例外（手插 ${pre54e} 行）→ delete ${aE54}、行已消失(${post54e})。校验只挂 create，否则这条例外会永久留在表里指向一个不再存在的客户" \
   || fail "块E delete 被 status 拦了（校验挂错了端点）: 手插后行数=${pre54e}(期望1) delete=${aE54}(期望200，400 意味着 requireChargeableMember 也加到了 delete 上) 删后行数=${post54e}(期望0)"
 
+# ════════════════════════════════════════════════════════════════════
+# S55 计费归因：每笔钱都得说得出「走的是哪个组、这个组是哪一层给的」
+#
+# 修的是两处**静默白传**。BillingGroupResolver 早就算出了 GroupSource —— 它的 KDoc 第一句就是
+# 「进日志：错账排查第一个要问的就是来源」，而 RelayEngine 解析那一步写的是 `-> r.group`，
+# source 当场被扔掉。group code 的遭遇更奇怪：它被一路传过 execute / streamWithPreflight / bill /
+# recordLog 四层签名，最后 recordLog 构造 UsageLog 时也没用它 —— 表里根本没有那两列。Kotlin 不
+# 对未使用的**函数参数**报警告（只报未使用的局部变量），所以这两处一次也没响过。
+# 后果：pricing_snapshot 逐笔冻结了 ratio，「按什么倍率收了多少」查得出；但倍率相同的四层含义
+# 完全不同（令牌口子 / 大客户谈判价 / 会员套餐 / 标准价），「为什么是这个倍率」答不上来。bill 里
+# 那条毛利倒挂告警是活例 —— 它打了 ratio 与 costDiscount 却没打组，运营看到「ratio=3.0 倒挂」时
+# 无法判断是谈判价配错了还是标准价本身配错了。撤销用户例外时这个缺口最疼：那张表是硬删。
+#
+# 四块各钉一件事，少一块就有一种「看着对」的实现能溜过去：
+#   A 无例外无覆盖 → DEFAULT，charged 作后两块的基准
+#   B 配用户例外 → USER_OVERRIDE，**且 charged 恰好翻倍**：把归因与金额绑成同一件事的两面，
+#     硬编码一个假 source 骗得过字符串断言，骗不过「金额也跟着变了」
+#   C 令牌覆盖与用户例外并存且指向不同的组 → TOKEN_OVERRIDE 胜出。没有这一块，「source 是随手
+#     取了第一层」与「source 真跟着优先级走」分不出来
+#   D 上游 403 → 失败请求那行也带归因。成功行由 finalize 落、失败行由 recordLog 落，进的是同一
+#     张表；失败行缺归因，这张表就只能按组统计成功量，「某个组是不是在集中撞某个上游」问不出来
+# 两块表都断言（usage_logs 与 settlements）：finalize 的日志维度全部取自结算行，worker 重放时
+# 可能已是另一个进程，所以归因必须先固化在 settlements 上 —— 只断言 usage_logs 会漏掉「重放丢归因」。
+# 不覆盖 MEMBER_GROUP 那层：它要 NEWGATE_MEMBER_GROUP_BILLING 开关加会员组映射（其解析行为 S26
+# 已覆盖），而本场景要证的是「source 落库了、且跟着优先级走」，三层足够。
+# ════════════════════════════════════════════════════════════════════
+echo "[S55] 计费归因落库：DEFAULT / USER_OVERRIDE / TOKEN_OVERRIDE 三层 + 失败请求也带归因"
+# seed_reset 会 TRUNCATE usage_logs 与 settlements，所以本场景里「最新一行」是干净的。
+# 端口避开 S4 的 9950(err403)/9940(err429) 与 S48 的 9948：那些 fake 进程整轮都活着。
+seed_reset; fake ok 9955; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c55','openai_compatible','http://127.0.0.1:9955','default,vip55','m-grp',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c55'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
+   UPDATE gateway_groups SET deleted=0, ratio='1.0' WHERE code='default';
+   DELETE FROM gateway_group_overrides WHERE user_id=1;
+   UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+g55=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"code":"vip55","name":"归因两倍","ratio":"2.0"}')
+# 归因读取。'<null>' 而不是空串：空串与「列不存在/查不出」在 shell 里分不开，而 NULL 是本场景
+# 要能识别的一种真实状态（V007 之前的旧行就是 NULL）。
+attr55() { q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<null>') FROM gateway_usage_logs ORDER BY id DESC LIMIT 1"; }
+sattr55() { q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<null>') FROM gateway_settlements ORDER BY id DESC LIMIT 1"; }
+chg55() { q "SELECT charged FROM gateway_usage_logs ORDER BY id DESC LIMIT 1"; }
+
+# ── 块 A：兜底层也要有归因 ──
+rA55=$(relay26); sleep 1
+atA55=$(attr55); satA55=$(sattr55); chA55=$(chg55)
+[ "$g55" = "200" ] && [ "$rA55" = "200" ] && [ "$atA55" = "default/DEFAULT" ] && [ "$satA55" = "default/DEFAULT" ] \
+  && [ -n "$chA55" ] && [ "$chA55" -gt 0 ] 2>/dev/null \
+  && pass "块A 兜底层有归因：建 vip55(ratio 2.0)=${g55} → relay=${rA55}；usage_logs 最新行 group/source=${atA55}、settlements 最新行=${satA55}（两张表都落了），charged=${chA55}（default ratio 1.0，作块B 的基准）" \
+  || fail "块A 归因没落库: 建组=${g55}(期望200) relay=${rA55}(期望200) usage_logs='${atA55}'(期望 default/DEFAULT；'<null>/<null>' 说明 V007 的列没被写进去、空串说明查询本身没出行) settlements='${satA55}'(期望同) charged=${chA55}(期望>0)"
+
+# ── 块 B：谈判价那一层，且金额跟着变 ──
+crB55=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip55","remark":"S55 归因"}')
+rB55=$(relay26); sleep 1
+atB55=$(attr55); satB55=$(sattr55); chB55=$(chg55)
+[ "$crB55" = "200" ] && [ "$rB55" = "200" ] && [ "$atB55" = "vip55/USER_OVERRIDE" ] && [ "$satB55" = "vip55/USER_OVERRIDE" ] \
+  && [ "$chB55" = "$((chA55*2))" ] \
+  && pass "块B 谈判价那一层有归因、且金额跟着变：配例外=${crB55} → relay=${rB55}；group/source=${atB55}（结算行 ${satB55}），charged ${chA55}→${chB55} 恰好两倍（vip55 ratio 2.0）。归因与计价是同一件事的两面：写死一个假 source 能过字符串断言，过不了这条" \
+  || fail "块B 归因或金额不对: 配例外=${crB55}(期望200；400 说明 userId=1 不是活会员，那是 S54 那件事) relay=${rB55}(期望200) usage_logs='${atB55}'(期望 vip55/USER_OVERRIDE) settlements='${satB55}'(期望同) charged=${chB55}(期望$(( ${chA55:-0} * 2 ))，基准 ${chA55})"
+
+# ── 块 C：令牌覆盖压过用户例外，归因与金额都取自第一层 ──
+# 用户例外留在 vip55(2.0)，令牌覆盖指向 default(1.0)。若来源报 TOKEN_OVERRIDE 而金额回到块A 的
+# 水平，就同时证明了「记的是第一层」与「计价也真按第一层」—— 只断言字符串的话，一个把 source
+# 写死成 TOKEN_OVERRIDE 的实现同样能过。
+q "UPDATE gateway_tokens SET group_override='default' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+rC55=$(relay26); sleep 1
+atC55=$(attr55); satC55=$(sattr55); chC55=$(chg55)
+[ "$rC55" = "200" ] && [ "$atC55" = "default/TOKEN_OVERRIDE" ] && [ "$satC55" = "default/TOKEN_OVERRIDE" ] \
+  && [ "$chC55" = "$chA55" ] \
+  && pass "块C 归因跟着优先级走：令牌覆盖 default 压过用户例外 vip55 → relay=${rC55}；group/source=${atC55}（结算行 ${satC55}），charged=${chC55} 回到块A 水平而不是 vip55 的 ${chB55} —— 来源与金额取自同一层" \
+  || fail "块C 优先级归因不对: relay=${rC55}(期望200) usage_logs='${atC55}'(期望 default/TOKEN_OVERRIDE；若是 vip55/USER_OVERRIDE 则令牌覆盖这一层没被记进来源) settlements='${satC55}'(期望同) charged=${chC55}(期望=${chA55}，即按 default 计而非 vip55)"
+q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';
+   DELETE FROM gateway_group_overrides WHERE user_id=1;" >/dev/null
+
+# ── 块 D：上游 403 的失败请求也带归因（recordLog 那半边）──
+# 换端口而不是改 fake 模式：既有惯例就是不同端口跑不同模式（见 S4），且 listEnabled() 每次查库、
+# 无缓存，所以 UPDATE base_url 立即生效。一发 403 不会禁用 Key —— S4 证明要连续 5 发。
+fake err403 9956; sleep 1
+q "UPDATE gateway_channels SET base_url='http://127.0.0.1:9956' WHERE name='c55';
+   INSERT INTO gateway_group_overrides (user_id,group_code,remark) VALUES (1,'vip55','S55 失败路径归因');" >/dev/null
+rD55=$(relay26); sleep 1
+# 按 status='error' 取行，不取「最新一行」：worker 可能在 TTL 后把结算行 finalize 掉、
+# 于是最新那行变成成功行，断言就会指着错的那半边。
+atD55=$(q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<null>')||'/'||status FROM gateway_usage_logs WHERE status='error' ORDER BY id DESC LIMIT 1")
+[ "$rD55" = "403" ] && [ "$atD55" = "vip55/USER_OVERRIDE/error" ] \
+  && pass "块D 失败请求也有归因：上游 403 → relay=${rD55}；usage_logs 里 status=error 那行 group/source=${atD55}（recordLog 路径 —— 此前它的 group 参数从 V001 起就白传，这一行连组都没有）" \
+  || fail "块D 失败路径缺归因: relay=${rD55}(期望403；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/USER_OVERRIDE/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
