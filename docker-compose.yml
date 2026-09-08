@@ -97,6 +97,19 @@ services:
       # 生效值在启动日志里：grep "invite reward attached"。
       NEWGATE_INVITE_REWARD_INVITER: ${INVITE_REWARD_INVITER:-}
       NEWGATE_INVITE_REWARD_INVITEE: ${INVITE_REWARD_INVITEE:-}
+      # 支付回调地址（要收真钱就得设，两项都必须是**公网可访问**的绝对地址）。
+      # NOTIFY_BASE = 后端对外的 origin，渠道服务器要能从它打到
+      #   {NOTIFY_BASE}/app/pay/channel-notify/{渠道码}
+      # RETURN_URL = 用户付完跳回的控制台账单页。
+      # 两项留空都不会让支付失败，但各自退化一处：NOTIFY_BASE 空 → 渠道不主动回调，到账靠
+      # pay-order-reconcile 定时查单兜底（十来分钟：十分钟一轮，刚下单 2 分钟内的会被跳过）；
+      # RETURN_URL 空 → 用户付完回不到你的页面（这一项与渠道回不回调无关）。
+      # 生效值在启动日志：grep "payment.callback-url"。
+      # ⚠️ 没设 NOTIFY_BASE 就别在后台停用 pay-order-reconcile：两条到账路径全断 = 钱到账了额度永远不发。
+      # ⚠️ 别填容器内部地址（http://localhost:7080 或 http://newgate:7080）：本地跑得通，
+      # 上线后一律回调失败 —— 而失败发生在渠道那一侧，你这边只看到订单一直是待支付。
+      NEWGATE_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
+      NEWGATE_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
       # 有意**不**在这里暴露 NEWGATE_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
       # （代码里标着「仅测试环境」）。不写进 compose 不是访问控制 —— 变量照样生效 ——
       # 而是不把「白送钱」放进官方支持的部署面。真要在沙箱里开，自己往 environment 里加一行。

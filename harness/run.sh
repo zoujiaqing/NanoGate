@@ -2245,5 +2245,206 @@ atD55=$(q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<nu
   && pass "块D 失败请求也有归因：上游 403 → relay=${rD55}；usage_logs 里 status=error 那行 group/source=${atD55}（recordLog 路径 —— 此前它的 group 参数从 V001 起就白传，这一行连组都没有）" \
   || fail "块D 失败路径缺归因: relay=${rD55}(期望403；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/USER_OVERRIDE/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
 
+# ════════════════════════════════════════════════════════════════════
+# S56 支付回调地址：发出去的 notify_url 必须是一条**活路由**
+#
+# 修的是「装配层从不 bind PayPlatformRegistry」：PaymentRuntimeBootstrap 用 getOrNull 取不到就静默
+# 回落到 default(http)，两个回调地址 hook 全是空串，于是下单时既不发 notify_url 也不发 return_url。
+# 账面上一切正常 —— 下单 200、钱也能到账（定时任务 pay-order-reconcile 十来分钟一轮查单兜底），所以这条缺陷
+# 在本机永远测不出来：本机没有公网地址，回调本来就打不进来。也正因如此，本场景不试图证明「渠道能
+# 打回来」，只证两件事：地址**发出去了**、以及发出去的那条路径在本进程里**真是一条注册过的路由**。
+#
+# 五块各钉一件事：
+#   A 配了基址 → payload 里的 notify_url 是逐字的绝对地址（断相等，不是断「包含」），return_url 同理，
+#     且 biz_content 里带 quit_url（支付宝用它让用户从收银台跳回）；启动日志 INFO 念出生效值
+#   B 把 A 里真发出去的 notify_url 剥掉基址、打回本机 → 200；同一路径多挂一段 → 404 作对照。
+#     这一块与单测各证一半：单测钉得住字面量，钉不住「路由真注册了」；反过来改常量时两处一起改，
+#     这一块仍绿（钉字面量的是 PayNotifyRouteTest）
+#   C 没配 → 两个参数都不出现，但 payload 仍是那条真 alipay 跳转地址、下单仍 200：留空是退化不是失败。
+#     额外钉日志文案：两行各说各的后果（return_url 没配与「渠道会不会回调」无关，共用一句就是说谎），
+#     且提到的名字是后台任务页上真能搜到的 job id 而不是类名
+#   D 写错（漏 scheme）→ 按未配置处理并记 ERROR，**且只影响那一个变量**（return_url 照常发）。
+#     这一块最要紧：静默接受一个不带 scheme 的地址，渠道会判成非法参数，那是连单都下不了
+#   E 两条到账路径同时断（基址没生效 + 对账任务在后台被停用）→ ERROR；而只要还剩一条路就不该报。
+#     这是 C 那行 WARN 的下游：它承诺了「靠对账任务兜底」，而那个任务能被停用（infra_jobs 是运行期
+#     调度真源）。承诺不成立时不响的话，后果是钱到账了额度永远不发，而两边（用户、运维）都看不到原因
+# 不覆盖沙箱渠道：SandboxPayPlatform 的 payload 是站内相对地址（模拟收银台），它本就不该带公网回调。
+# 基址用 .test 保留域（RFC 2606）：本场景从不真去连它（alipay 的 WAP 下单是页面接口，不发请求），
+# 但万一哪天有人拿这个 payload 去 curl，也不会打到一个真实第三方身上。
+# ════════════════════════════════════════════════════════════════════
+echo "[S56] 支付回调地址：下单 payload 带 notify_url/return_url、那条地址真打得回来，且两条到账路径全断时必须响"
+# 下单响应里取字段（同 S53 的 jf53，只是缺失时回显空串而不是 'null'，好与「参数没发出去」对齐）。
+jf56() { python3 -c "import json;v=(json.load(open('$GB')).get('data') or {}).get('$1');print('' if v is None else v)" 2>/dev/null; }
+# 从 payload 的 query 里取某个参数的**解码后**值，没有就回显空串。
+# 用 Python 而不是 sed/IFS：值里有 %3A%2F 这类转义，而 biz_content 自己是一串编码过的 JSON，
+# 手写切分迟早在这儿出错 —— 切错了的表现是「参数不存在」，正好与本场景要断言的东西同形。
+pq56() { python3 -c '
+import sys, urllib.parse
+p = sys.argv[1]; k = sys.argv[2] + "="
+q = p.split("?", 1)[1] if "?" in p else ""
+print(next((urllib.parse.unquote(x[len(k):]) for x in q.split("&") if x.startswith(k)), ""))
+' "$1" "$2" 2>/dev/null; }
+# 启动日志里那行「回调地址配没配」。all.log 跨重启累积，故取最后一条 = 当前这次 boot 的配置
+# （与 S42 取 invite reward attached 同一个做法）。按 env 名过滤：两行共用同一个 logger 名。
+lg56() { grep "payment.callback-url" "$WORK/logs/all.log" 2>/dev/null | grep "$1" | tail -1; }
+# 级别取字段而不是 grep 整行（同 S33 的 loglvl）：整行 grep 的话，消息里出现「INFO」也会算命中。
+lvl56() { printf '%s' "$1" | grep -oE " (ERROR|WARN|INFO) " | head -1 | tr -d ' '; }
+# 密钥取自 module-payment 的测试 fixture，不在 harness 里抄第二份：抄一份的话日后 fixture 换密钥，
+# 这里会静默过期，表现同样是下单 500「签名失败」，但原因在 harness 自己。那份 fixture 由 13 条单测
+# 盯着，不会悄悄消失；真取不到就整段跳过并喊一声 —— 静默跳过等于这五块覆盖不存在。
+KEYS56="$ROOT/../Neton/neton-application-module-payment/src/commonTest/kotlin/channel/AlipayTestKeys.kt"
+rk56() { python3 -c '
+import sys
+Q = chr(34)
+for line in open(sys.argv[1]):
+    if line.strip().startswith("const val " + sys.argv[2]):
+        print(line.split(Q)[1]); break
+else:
+    print("")
+' "$KEYS56" "$1" 2>/dev/null; }
+PRIV56=$(rk56 PRIVATE_KEY); PUB56=$(rk56 PUBLIC_KEY)
+if [ -z "$PRIV56" ] || [ -z "$PUB56" ]; then
+  echo "  ⚠️  取不到 alipay 测试密钥（$KEYS56 不在？priv=${#PRIV56}B pub=${#PUB56}B）：S56 四块整段跳过" >&2
+else
+BASE56="https://pay.nanogate.test"; RET56="https://console.nanogate.test/billing"
+# config 用 json.dumps 组装：私钥是 1.6KB base64，手拼进 SQL 迟早漏一个转义。
+CFG56=$(python3 -c '
+import json, sys
+print(json.dumps({"appId": "2021000000000056", "privateKey": sys.argv[1], "alipayPublicKey": sys.argv[2]}))
+' "$PRIV56" "$PUB56")
+# 真平台与模拟支付互斥（PaymentSettingKeys.MOCK_PAY_ENABLED：打开模拟支付会禁用全部真实渠道），
+# 所以跑真 alipay 必须把它关掉。currentValue() 每次查表、无缓存 → 改完立即生效，末尾还原成 'true'。
+# 副作用可控：S56 是最后一段，而关着它只会让 sandbox_* 一律「不可用的支付通道」，对账任务也因同一个
+# 判据不会去查前面场景留下的沙箱单 —— 全程不发一个外网请求（WAP 下单本身就是页面接口）。
+stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BASE56" NEWGATE_PAY_RETURN_URL="$RET56"
+GJWT=$(admin_jwt)
+q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at)
+     VALUES ('payment','payment.mock.enabled','false','模拟支付模式',0,0)
+     ON CONFLICT (setting_key) DO UPDATE SET value='false';
+   DELETE FROM pay_channels WHERE code='alipay56';
+   INSERT INTO pay_channels (code,platform_code,method,platform_channel_id,display_mode,config,status,remark)
+     VALUES ('alipay56','alipay','ALIPAY','WAP','REDIRECT_URL','$CFG56',1,'S56 回调地址');" >/dev/null
+rc56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+pl56=$(jf56 payload)
+nu56=$(pq56 "$pl56" notify_url); ru56=$(pq56 "$pl56" return_url); bc56=$(pq56 "$pl56" biz_content)
+ENU56="$BASE56/app/pay/channel-notify/alipay56"
+qa56=no; printf '%s' "$bc56" | grep -q "\"quit_url\":\"$RET56\"" && qa56=yes
+la56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); la56l=$(lvl56 "$la56")
+
+# ── 块 A：配了基址 → 两个地址逐字进 payload ──
+[ "$rc56" = "200" ] && [ "$nu56" = "$ENU56" ] && [ "$ru56" = "$RET56" ] && [ "$qa56" = "yes" ] && [ "$la56l" = "INFO" ] \
+  && pass "块A 回调地址真发出去了：下单=${rc56} → notify_url=${nu56}、return_url=${ru56}（都是逐字相等，不是「包含」），biz_content 里 quit_url=${qa56}（支付宝用它让用户从收银台跳回）；启动日志 ${la56l} 念出生效基址" \
+  || fail "块A 回调地址没进 payload: 下单=${rc56}(期望200；400「不可用的支付通道」= 模拟支付没关掉或 alipay56 没插进去，500 = 密钥/config 有问题) notify_url='${nu56}'(期望 '${ENU56}'；空串说明 hook 没被 bind、或基址被判非法) return_url='${ru56}'(期望 '${RET56}') quit_url=${qa56}(期望yes) 启动日志级别='${la56l}'(期望INFO，行内容 '${la56:0:140}')"
+
+# ── 块 B：发出去的那条地址，剥掉基址后在本进程里真是一条注册过的路由 ──
+# 用 Python 剥前缀而不是 ${nu56#$BASE56}：前缀不匹配时后者会**原样返回整条 URL**，
+# 于是下面那一发会打到一个奇怪的绝对地址上，失败信息指向错误的原因。
+pb56=$(python3 -c '
+import sys
+print(sys.argv[1][len(sys.argv[2]):] if sys.argv[1].startswith(sys.argv[2]) else "")
+' "$nu56" "$BASE56")
+hb56=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U$pb56" -H "$CT" -d '{}')
+ab56=$(head -c 40 "$GB" 2>/dev/null)
+# 对照：同一条路径多挂一段 → 404。没有这一发，「不是 404」可能只是某个兜底路由给的假绿
+# （S28 那次正是这个形状：结果码不变、理由全错）。
+hc56=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U$pb56/nope" -H "$CT" -d '{}')
+[ -n "$pb56" ] && [ "$hb56" = "200" ] && [ "$hc56" = "404" ] \
+  && pass "块B 那条地址是活路由：把 A 里发出去的 notify_url 剥掉基址得 ${pb56} → 打回本机 ${hb56}、回执 '${ab56}'（验签不过，符合预期：本发只证路由存在）；对照 ${pb56}/nope → ${hc56}，所以那个 ${hb56} 是真匹配上的，不是兜底路由" \
+  || fail "块B 发出去的地址打不回来: 剥基址后的路径='${pb56}'(期望 /app/pay/channel-notify/alipay56；空串说明块A 的 notify_url 不以配置的基址开头) 打回本机=${hb56}(期望200；404 说明注册的路由与发出去的地址各说各话 —— 那正是本条缺陷) 对照多挂一段=${hc56}(期望404；非404 说明有兜底路由在应答，那么「打回本机不是 404」就不证明任何事) 回执='${ab56}'"
+
+# ── 块 C：没配 → 两个参数都不出现，但下单照样成功（留空是退化，不是失败）──
+stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+GJWT=$(admin_jwt)
+rcC56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+plC56=$(jf56 payload)
+# 两面都断言：既要「没有回调参数」，也要「payload 仍是那条真 alipay 跳转地址」。
+# 只断言前者的话，一个把整个 prepay 弄挂的实现（payload 空）同样能过 —— 与块A 的正反配对同一个道理。
+ali56=no; printf '%s' "$plC56" | grep -q "openapi.alipay.com" && ali56=yes
+nnC56=no; printf '%s' "$plC56" | grep -q "notify_url=" && nnC56=yes
+nrC56=no; printf '%s' "$plC56" | grep -q "return_url=" && nrC56=yes
+lcC56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); lcC56l=$(lvl56 "$lcC56")
+lrC56=$(lg56 NEWGATE_PAY_RETURN_URL); lrC56l=$(lvl56 "$lrC56")
+# 两行各说各的后果：return_url 没配与「渠道会不会回调」无关。共用一句文案的话其中一行会说谎，
+# 而运维读到那行会去查一条没坏的路 —— 所以两行都要断：说了自己的、没借对方的。
+own56=no; printf '%s' "$lcC56" | grep -q "pay-order-reconcile" && own56=yes
+# 日志里那个名字必须是后台任务页上真能搜到的那一个（handler 列 = @Job.id）。
+# 写类名 PayOrderReconcileJob 的话运维搜不到 —— 所以这里反向钉一条：不许出现类名。
+cls56=no; printf '%s' "$lcC56" | grep -q "PayOrderReconcileJob" && cls56=yes
+back56=no; printf '%s' "$lrC56" | grep -q "回不来" && back56=yes
+lie56=no; printf '%s' "$lrC56" | grep -q "pay-order-reconcile" && lie56=yes
+[ "$rcC56" = "200" ] && [ "$ali56" = "yes" ] && [ "$nnC56" = "no" ] && [ "$nrC56" = "no" ] \
+  && [ "$lcC56l" = "WARN" ] && [ "$lrC56l" = "WARN" ] && [ "$own56" = "yes" ] && [ "$cls56" = "no" ] \
+  && [ "$back56" = "yes" ] && [ "$lie56" = "no" ] \
+  && pass "块C 没配就退化、不失败：不传两个 env 重启 → 下单=${rcC56}、payload 仍是真 alipay 跳转地址(${ali56})，但 notify_url 出现=${nnC56}、return_url 出现=${nrC56}（都不发，退化成靠对账任务查单兜底）；两行日志都是 ${lcC56l}/${lrC56l} 且各说各的后果（notify 行提 job id pay-order-reconcile=${own56}、没写成类名=${cls56}、return 行提回不来=${back56}、return 行没借对账任务=${lie56}）" \
+  || fail "块C 未配置时的行为不对: 下单=${rcC56}(期望200，留空不该让下单失败) payload 仍是 alipay 跳转地址=${ali56}(期望yes；no 说明 prepay 本身挂了，那么「没有 notify_url」是假象) notify_url 出现=${nnC56}(期望no) return_url 出现=${nrC56}(期望no) 两行级别='${lcC56l}'/'${lrC56l}'(期望WARN/WARN；空说明这行日志压根没写，运营就无从知道回调没配) notify行提 job id=${own56}(期望yes) notify行写成了类名=${cls56}(期望no；yes 说明日志点了个后台任务页上搜不到的名字 —— 那一列是 @Job.id) return行提回不来=${back56}(期望yes) return行借了对账任务=${lie56}(期望no；yes 说明两行又共用了同一句文案 —— return_url 没配并不影响渠道回调，那句话会把人送去查一条没坏的路) notify行='${lcC56:0:170}' return行='${lrC56:0:170}'"
+
+# ── 块 D：写错（漏 scheme）→ 按未配置处理 + ERROR，且只影响那一个变量 ──
+BAD56="pay.nanogate.test"
+stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BAD56" NEWGATE_PAY_RETURN_URL="$RET56"
+GJWT=$(admin_jwt)
+rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+plD56=$(jf56 payload)
+ndD56=no; printf '%s' "$plD56" | grep -q "notify_url=" && ndD56=yes
+rdD56=no; printf '%s' "$plD56" | grep -q "return_url=" && rdD56=yes
+ldD56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); ldD56l=$(lvl56 "$ldD56")
+lrD56=$(lg56 NEWGATE_PAY_RETURN_URL); lrD56l=$(lvl56 "$lrD56")
+[ "$rcD56" = "200" ] && [ "$ndD56" = "no" ] && [ "$rdD56" = "yes" ] && [ "$ldD56l" = "ERROR" ] && [ "$lrD56l" = "INFO" ] \
+  && printf '%s' "$ldD56" | grep -q "$BAD56" \
+  && pass "块D 写错不静默、也不连累另一半：notify 基址漏 scheme('${BAD56}') → 启动日志 ${ldD56l} 且点名了原值，payload 里 notify_url 出现=${ndD56}（按未配置处理，不把非法地址发给渠道）；return_url 出现=${rdD56}、它那行仍是 ${lrD56l} —— 两个变量各判各的；下单=${rcD56}（没被拖累）" \
+  || fail "块D 非法配置的处置不对: 下单=${rcD56}(期望200；400/500 说明非法地址被原样发给了渠道，那是连单都下不了) notify_url 出现=${ndD56}(期望no) return_url 出现=${rdD56}(期望yes，一个变量写错不该连累另一个) notify 行级别='${ldD56l}'(期望ERROR；WARN 说明非法值被当成「没配」，两者后果不同) return 行级别='${lrD56l}'(期望INFO) notify 行点名原值=$(printf '%s' "$ldD56" | grep -c "$BAD56")(期望1) 行内容 '${ldD56:0:160}'"
+
+# ── 块 E：两条到账路径同时断 → 必须响，而且不能无条件响 ──
+# notify 没生效时到账只剩对账任务这一条路，而 infra_jobs 是运行期调度真源 —— 那个任务能被停用
+# （DDL 里 status 默认还是 0）。两条同时断 = 真实支付的钱到账了、额度永远不发，
+# 而块C 那行 WARN 恰恰承诺了「靠对账任务兜底」。承诺不成立时必须响，所以这里要看到 ERROR。
+# E2/E3 两个对照同样要紧：配了基址、或任务还开着，就还剩一条路，此时不该再报「两条都断」。
+# 没有对照，一个无条件打 ERROR 的实现也能过 E1 —— 与块A/块C 的正反配对同一个道理。
+#
+# all.log 是 O_APPEND（neton-logging 的 FileSinkNative 用 O_WRONLY|O_CREAT|O_APPEND 打开），
+# 所以「这次启动新增了什么」必须按行号切片：直接 grep 整个文件会把 E1 那行 ERROR 算进 E2/E3 的
+# 对照里，对照于是假红；而切片方向写错（比如忘了 +1）会连旧行一起当成新增，那就是假绿。
+JOB56="pay-order-reconcile"
+nj56=$(q "SELECT count(*) FROM infra_jobs WHERE handler_name='$JOB56';" 2>/dev/null | tail -1 | tr -d ' ')
+if [ "$nj56" != "1" ]; then
+  echo "  ⚠️  infra_jobs 里 '$JOB56' 不是恰好一行（count='${nj56}'）：块E 整段跳过" >&2
+else
+  ln56() { wc -l < "$WORK/logs/all.log" 2>/dev/null | tr -d ' '; }
+  new56() { tail -n +$((${1:-0} + 1)) "$WORK/logs/all.log" 2>/dev/null | grep "payment.callback-url"; }
+
+  # E1：停用对账任务 + 不配基址 → 两条都断，ERROR 点名是哪两条
+  q "UPDATE infra_jobs SET status=0 WHERE handler_name='$JOB56';" >/dev/null
+  n1e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+  e1e56=$(new56 "$n1e56" | grep "两条到账路径" | tail -1)
+  e1l56=$(lvl56 "$e1e56")
+  # 同一次启动还该有那行 WARN（未配置本身仍然要说）—— ERROR 是**加**上去的，不是替换掉它
+  w1e56=$(new56 "$n1e56" | grep NEWGATE_PAY_NOTIFY_BASE | grep -v "两条到账路径" | tail -1)
+  w1l56=$(lvl56 "$w1e56")
+
+  # E2 对照：任务仍停用，但配上基址 → 渠道能回调，还剩一条路
+  n2e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BASE56"
+  e2e56=$(new56 "$n2e56" | grep -c "两条到账路径")
+  i2e56=$(lvl56 "$(new56 "$n2e56" | grep NEWGATE_PAY_NOTIFY_BASE | tail -1)")
+
+  # E3 对照：任务恢复启用 + 不配基址 → 就是块C 那个形状，只该有 WARN
+  q "UPDATE infra_jobs SET status=1 WHERE handler_name='$JOB56';" >/dev/null
+  n3e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+  e3e56=$(new56 "$n3e56" | grep -c "两条到账路径")
+  w3l56=$(lvl56 "$(new56 "$n3e56" | grep NEWGATE_PAY_NOTIFY_BASE | tail -1)")
+
+  [ "$e1l56" = "ERROR" ] && [ "$w1l56" = "WARN" ] && [ "$e2e56" = "0" ] && [ "$i2e56" = "INFO" ] \
+    && [ "$e3e56" = "0" ] && [ "$w3l56" = "WARN" ] && printf '%s' "$e1e56" | grep -q "$JOB56" \
+    && pass "块E 两条到账路径同时断就响、且只在那时响：停用 $JOB56 + 不配基址 → 新增 ${e1l56} 行点名两条都断（且含 job id=$(printf '%s' "$e1e56" | grep -c "$JOB56")），那行 WARN 也仍在(${w1l56})；对照①任务仍停用但配了基址 → 新增那类 ERROR=${e2e56} 条、基址行是 ${i2e56}；对照②任务启用且不配基址 → 新增那类 ERROR=${e3e56} 条、基址行是 ${w3l56}" \
+    || fail "块E 组合检查不对: E1(停用+没配) ERROR 行级别='${e1l56}'(期望ERROR；空说明这个「钱到账了额度永远不发」的组合压根没人说 —— 用户只会投诉付了钱没额度) E1 同次启动的 WARN 行级别='${w1l56}'(期望WARN；ERROR 该是加上去的，不是把未配置那行替换掉) E1 行点名 job id=$(printf '%s' "$e1e56" | grep -c "$JOB56")(期望≥1；后台任务页那一列是 @Job.id，写类名就搜不到) E2(停用+配了基址) 新增该类 ERROR=${e2e56}(期望0；非0 说明它是无条件报的，那么这行 ERROR 不携带任何信息) E2 基址行级别='${i2e56}'(期望INFO) E3(启用+没配) 新增该类 ERROR=${e3e56}(期望0) E3 基址行级别='${w3l56}'(期望WARN) E1 行内容='${e1e56:0:200}'"
+fi
+
+# 还原：本场景是最后一段，但库要等到 cleanup 才 drop，而「悄悄关着的模拟支付」会让任何后来追加的
+# 沙箱场景一律拿到「不可用的支付通道」—— 那条错误信息与「渠道被关了」完全一样，排查会走错方向。
+q "UPDATE system_settings SET value='true' WHERE setting_key='payment.mock.enabled';
+   DELETE FROM pay_channels WHERE code='alipay56';" >/dev/null
+fi
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
