@@ -75,7 +75,17 @@ echo "═══ NanoGate 可靠性 harness (DB=$DB) ═══"
 
 # ── 前置：编译 + 隔离库 + 迁移 + 基础令牌/账户 ──
 echo "[build] linking app…"
-( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q ) || { echo "build failed"; exit 1; }
+# sqlx4k driver 编译期单选（一个 K/N 可执行文件只能链一个），选哪个由 gradle property
+# neton.database.driver 决定，默认 postgres。这里**显式**传而不吃默认值：下面写的
+# database.conf 是 POSTGRESQL，两者必须一致，而「默认值」是会被别处改写的 ——
+# neton-database 的 build 目录被所有把 Neton/neton 当 composite build 的项目共享，
+# 而 privchat-application/settings.gradle.kts 会给测试调用注入 =sqlite。up-to-date 状态是按
+# 各自 root build 的历史算的，于是本项目这边判 compileKotlinMacosArm64 UP-TO-DATE、
+# 拿别人留下的 sqlite klib 去链接（或者 link 自己也判 UP-TO-DATE，直接复用那个已经链错的
+# kexe —— 实测两种都发生过）。产物一跑就死在 NETON-DB-VARIANT mismatch。
+DB_VARIANT=postgres
+link_app() { ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" ); }
+link_app || { echo "build failed"; exit 1; }
 createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 隔离 workdir：config/ 指向隔离库；app 与 migrate 都从此目录启动（config 相对 CWD 解析）
 # 只保留最近 2 次运行的 work 目录，避免长期跑 harness 占满磁盘
@@ -113,14 +123,27 @@ else
   echo "  ⚠️  未安装 redis-server（brew install redis）：限流退化为进程内计数，S24 跳过" >&2
 fi
 if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
-  # NETON-DB-VARIANT mismatch 不是配置错，而是链接进二进制的 neton-database variant 陈旧：
-  # link 任务可能判 UP-TO-DATE 而复用旧产物（kexe 里的字符串不是明文，无法直接取证）。
-  # 不提示的话，这个错会被当成 database.conf 写错去查，白白耗掉很久。
+  # NETON-DB-VARIANT mismatch 不是 database.conf 写错，而是链进二进制的 sqlx4k variant 不对，
+  # 成因见上面 link_app 的注释。两种形状都实测过：link 重跑了、但吃到别人留下的 klib（04:59）；
+  # 以及 link 自己判 UP-TO-DATE、直接复用那个已经链错的 kexe（05:08）。
+  # 自愈一次：--rerun-tasks 把整条链（含框架的 neton-database）在同一次调用里重编重链。
+  # 只 clean + 重链不够：那样 compileKotlinMacosArm64 仍按本项目的历史判 UP-TO-DATE，
+  # klib 还是别人留下的那份 sqlite。但这也不是万无一失：重编与重链之间有一分钟量级的窗口，
+  # 兄弟项目正好在这时写入的话，本次 link 又会吃到 sqlite（实测 2026-09-08 05:04：
+  # --rerun-tasks -Ppostgres 跑完，kexe 仍是 sqlite variant）。所以下面还留了「自愈后仍不匹配」
+  # 那条分支 —— 那种情况只能等对方的构建跑完再重跑。
   if grep -q 'NETON-DB-VARIANT' "$LOGS/migrate.log"; then
-    echo "  ⚠️  variant 陈旧：重链一次即可 ——" >&2
-    echo "     ( cd \"$NEWGATE\" && ./gradlew :application:clean && ./gradlew \"$LINK_TASK\" -Pneton.database.driver=postgres )" >&2
+    echo "  ⚠️  链进二进制的 sqlx4k variant 不是 ${DB_VARIANT}（多半是共享 Neton/neton 的兄弟项目刚用" >&2
+    echo "     -Pneton.database.driver=sqlite 跑过测试）：--rerun-tasks 重编重链一次…" >&2
+    ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" ) \
+      || { echo "rebuild failed"; exit 1; }
+    if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
+      echo "  ⚠️  自愈后仍不匹配：有别的构建正在并发改写那份共享 klib，等它跑完再重跑 harness" >&2
+      echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
+    fi
+  else
+    echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
   fi
-  echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
 fi
 # 基础令牌 + 账户（harness 直插 gateway 令牌）。
 # ⚠️ member_users **没有迁移种子**：admin/admin123 那个用户来自 module-infra 的 system_users，
