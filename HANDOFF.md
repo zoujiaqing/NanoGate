@@ -141,8 +141,11 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 ### 前端
 
-- 管理台：渠道 / 定价 / 日志 / 令牌 / 结算复核页
-- 用户控制台：3 个模块（我的 Key / 用量账单 / 模型广场 + 用户中心 + 财务），typecheck 通过
+- 管理台：网关概览（请求/收入/成本/毛利、按日、模型与用户 Top、渠道健康）/ 渠道（含测试连通、
+  拉取上游模型）/ 定价（含批量导入）/ 日志 / 令牌 / 结算复核 / 计价组 / 兑换码页
+- 用户控制台：注册与登录、我的 Key / 用量账单 / 模型广场 / 用户中心 / 充值与流水
+  （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值保留给联调），typecheck 通过
+- 两个前端都有 Dockerfile，compose 里与 Caddy 边缘一起起（管理台与 API 同源 7081、控制台 7082）
 
 ### 验证与 CI
 
@@ -198,19 +201,18 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 ## 六、真正还没做的
 
-**上线阻塞：**
-- 真实支付接入（现在只有 mock 充值，且需 `NEWGATE_ENABLE_MOCK_RECHARGE=true` 才启用）；
-  payment/member 的充值与 gateway 额度未接通
-- 用户注册登录流（控制台只做了资料页，无自助注册）
-- 三个发行版仓（`newgate` / `newgate-front` / `newgate-client`）的正式远端未配置（CI workflow 已写好，
-  建仓 + 配 `NETON_CI_TOKEN` 后即可真跑）
+**上线阻塞（只剩运维动作，代码侧已就绪）：**
+- 三个发行版仓（`nanogate-backend` / `nanogate-front` / `nanogate-client`）要在 GitHub 上建出来，
+  加 `NETON_CI_TOKEN`（能读私有 module-infra / module-gateway 的 PAT），CI workflow 已写好
+- Docker 镜像没在本机验证过（写这些 Dockerfile 时 Docker daemon 没开）；先 `docker compose build` 一遍
+- 真实支付凭证（支付宝等）要用真实商户号跑一次：渠道配置页、下单、回调、到账链路在沙箱渠道下已由 harness 覆盖
+- 充值汇率 `NEWGATE_QUOTA_PER_PRICE_UNIT` 与回调地址要按 DEPLOY.md 配好
 
 **功能缺口：**
-- Azure OpenAI 原生（当前走 OpenAiAdapter）
 - 扩展端点：Responses / Images / Audio / Rerank
 - codec 有损：thinking / cache_control / 多模态 / structured output
-- 价源同步、渠道测速、毛利看板
-- 可观测性：无 metrics / 告警 / 审计日志
+- 价源自动同步（现在是手工贴价目表批量导入）、渠道测速（现在只有单次连通性探测）
+- 可观测性：有 /health 与结构化结算日志，无 metrics / 告警 / 审计日志
 
 **小残留：**
 - `harness/run.sh` 的 `PGPASS` 默认值还叫 `privchat`（可被环境变量覆盖；应用配置本身已
