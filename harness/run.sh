@@ -20,7 +20,8 @@ LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="newgate_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
-AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:8800"
+PORT="${NEWGATE_HARNESS_PORT:-8800}"
+AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:$PORT"
 PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"; PGPORT="${PGPORT:-5432}"
 # PGPORT 必须一起 export：createdb/dropdb/psql 与应用的 DSN 都靠它找库。写死 5432 等于假定
 # 目标库一定在默认端口上（CI 的 postgres 服务容器、或本机跑在非默认端口的集群都不成立）。
@@ -95,6 +96,8 @@ createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 ls -dt "$LOGS"/work-* 2>/dev/null | tail -n +3 | xargs rm -rf 2>/dev/null
 WORK="$LOGS/work-$$"; mkdir -p "$WORK/config" "$WORK/logs"
 cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
+# 端口可由 NEWGATE_HARNESS_PORT 覆盖：本机跑着演示实例时不用停它
+sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f "$WORK/config/application.conf.bak"
 cat > "$WORK/config/database.conf" <<EOF
 [default]
 driver = "POSTGRESQL"
@@ -170,8 +173,8 @@ stop_app() {
   # 端口必须真的空出来，否则新实例 bind 失败（表现为「未就绪」，误判成代码问题）
   # 不用 lsof/ss 探端口：前者 GitHub 的 ubuntu runner 不一定装（缺了就静默「立刻返回端口已空」），
   # 后者 macOS 没有。bash 内建的 /dev/tcp 两端都可用；连不上（ECONNREFUSED）即为端口已释放。
-  for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/8800") 2>/dev/null || return 0; sleep 0.5; done
-  echo "  ⚠️  端口 8800 仍被占用，重启网关可能失败" >&2
+  for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null || return 0; sleep 0.5; done
+  echo "  ⚠️  端口 $PORT 仍被占用，重启网关可能失败" >&2
 }
 echo "[boot] starting gateway…"
 boot_app
@@ -2649,6 +2652,14 @@ stn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-
 st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization: Bearer $GJWT")
 stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['byModel'] if x['model']=='m-st'][0];print(d['today']['requests'],m['requests'],m['charged'],d['byToken'][0]['requests'])" 2>/dev/null)
 [ "$stn" = "2" ] && [ "$stv" = "2 2 15000 2" ] && pass "用量汇总：今日 2 次、模型 m-st 2 次/15000、按 Key 2 次" || fail "用量汇总: logs=$stn stats='$stv' body=$(echo "$st" | head -c 300)"
+
+# ══ S69 控制台自助注册：用户名密码模式必须开着（NanoGate 在 Main.kt 绑定了 MemberAuthPolicy）══
+echo "[S69] 用户名密码注册"
+rg=$(curl -s --max-time 10 -o /tmp/nanogate-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
+  -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/nanogate-reg.json)
+lg=$(curl -s --max-time 10 -o /tmp/nanogate-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
+[ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/nanogate-lg.json \
+  && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/nanogate-lg.json)"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

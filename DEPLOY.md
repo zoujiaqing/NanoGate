@@ -42,6 +42,25 @@ projects/
 > 又把应用放在了 `../../Neton` 解不到的深度。首次 `docker compose build` 请当作待验证项，
 > 失败时先看是不是布局问题。
 
+## 本机开发（不经 Docker）
+
+三个端口：后端 `8800`、用户控制台 `8880`、管理台 `8888`。
+
+```bash
+# 后端：编译后用一份本地配置目录起（database.conf 指向本机 PostgreSQL，redis.conf 指向本机 Redis）
+cd NewGate/newgate && ./gradlew :application:linkDebugExecutableMacosArm64 -Pneton.database.driver=postgres
+cd ../local && ../newgate/application/build/bin/macosArm64/debugExecutable/application.kexe migrate up
+NETON_SECURITY__JWT__SECRETKEY=<随便一串> NEWGATE_QUOTA_PER_PRICE_UNIT=10000 NEWGATE_PUBLIC_API_URL=http://localhost:8800 \
+  ../newgate/application/build/bin/macosArm64/debugExecutable/application.kexe
+# 管理台（next dev -p 8888；开发模式把 /admin /app /v1 … 重写到本机后端，所以不需要 Caddy）
+cd NewGate/newgate-front && pnpm dev
+# 控制台（next dev -p 8880；apps/console/.env.development 已指向 http://localhost:8800）
+cd NewGate/newgate-client && pnpm dev
+```
+
+管理员种子账号 `admin / admin123`（上线前改掉）。harness 也用 8800，本机跑着后端时用
+`NEWGATE_HARNESS_PORT=8801 ./harness/run.sh` 让它换端口。
+
 ## 启动
 
 ```bash
