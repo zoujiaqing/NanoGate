@@ -2,7 +2,8 @@
 #
 #   1) cp .env.example .env  然后按注释填必须改的三个密钥
 #   2) docker compose up -d
-#   3) 访问 http://localhost:7080
+#   3) 管理台（含 API）http://localhost:7081  ·  用户控制台 http://localhost:7082
+#      后端直连 http://localhost:7080 仅供调试：该端口不经 Caddy，X-Forwarded-For 一律不信
 #
 # 镜像构建上下文是父目录（Gradle composite build 需要看到同级的 neton 与各模块仓库）。
 
@@ -81,7 +82,7 @@ services:
       # 前置反代时**必须**设：它决定网关认哪个地址是「客户端」，令牌 IP 白名单完全建在它上面。
       # 空 = 不信任任何转发头（X-Forwarded-For / X-Real-IP 一律忽略），直连部署留空即可。
       # 注意这与 IP 白名单的语义相反：白名单空是放开限制，代理名单空是收紧信任。
-      NEWGATE_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      NEWGATE_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.28.0.10}
       # 充值汇率：每 1 单位 pay_orders.price（法币最小单位）发多少 μUSD 额度。
       # ⚠️ **不设 = 充值功能整个不可用**：每次下单都 500 "quota recharge is not configured"。
       # 这是有意的 —— 静默按 1:1 发放等于白送钱且不留痕迹，所以账务宁可拒绝也不猜汇率。
@@ -116,6 +117,64 @@ services:
     ports:
       - "${NEWGATE_PORT:-7080}:7080"
 
+  # ── 管理台（Next.js）。浏览器直连后端 + cookie 认证 ⇒ 必须与后端同源，由 caddy 按路径分流 ──
+  front:
+    build:
+      context: ..
+      dockerfile: NewGate/newgate-front/Dockerfile
+    image: nanogate-front:latest
+    restart: unless-stopped
+    depends_on:
+      newgate:
+        condition: service_started
+    expose: ["3000"]
+
+  # ── 用户控制台（Next.js）。自带 /api/backend 服务端代理，只需内网后端地址 ──
+  console:
+    build:
+      context: ..
+      dockerfile: NewGate/newgate-client/Dockerfile
+    image: nanogate-console:latest
+    restart: unless-stopped
+    depends_on:
+      newgate:
+        condition: service_started
+    environment:
+      NETON_BACKEND_URL: http://newgate:7080
+    expose: ["3000"]
+
+  # ── 边缘反代：deploy/Caddyfile。固定 IP 使后端能把它列为唯一受信代理 ──
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      front:
+        condition: service_healthy
+      console:
+        condition: service_healthy
+    environment:
+      ADMIN_SITE: ${ADMIN_SITE:-:7081}
+      CONSOLE_SITE: ${CONSOLE_SITE:-:7082}
+    ports:
+      - "${ADMIN_PORT:-7081}:7081"
+      - "${CONSOLE_PORT:-7082}:7082"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      default:
+        ipv4_address: 172.28.0.10
+
+# 默认网络固定网段：caddy 需要一个可被后端 NEWGATE_TRUSTED_PROXIES 引用的稳定地址
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
 volumes:
+  caddy-data:
+  caddy-config:
   postgres-data:
   redis-data:

@@ -19,7 +19,10 @@ projects/
 │   ├── neton-application-module-member/
 │   ├── neton-application-module-payment/
 │   ├── neton-application-module-platform/
-│   └── neton-application-module-gateway/   # NanoGate 的核心模块
+│   ├── neton-application-module-gateway/   # NanoGate 的核心模块
+│   ├── neton-application-front/            # 管理台基础包（前端镜像需要）
+│   ├── neton-application-front-{system,infra,member,payment,platform,gateway}/
+│   └── neton-application-client-{gateway,member,payment}/   # 控制台模块
 └── NewGate/                                # 本仓（含 docker-compose.yml）
     ├── newgate/                            # 后端发行版（Dockerfile 在此）
     ├── newgate-front/                      # 管理台
@@ -33,6 +36,8 @@ projects/
 > 「源码可读」，不是「人人可自建」。前端同理（见各自 README）。
 
 > ⚠️ 下文 Docker 路径**尚未在实机验证过**（修正时的开发机上 Docker daemon 未运行）。
+> 两个前端镜像（`newgate-front/Dockerfile`、`newgate-client/Dockerfile`）与 Caddy 边缘同样**未实机构建过**，
+> 写法照后端镜像的上下文约定推导；首次 `docker compose build` 请当作待验证项。
 > `COPY` 布局是按 `settings.gradle.kts` 的路径推导修正的，此前它既漏了三个必需仓、
 > 又把应用放在了 `../../Neton` 解不到的深度。首次 `docker compose build` 请当作待验证项，
 > 失败时先看是不是布局问题。
@@ -47,6 +52,16 @@ docker compose up -d
 ```
 
 迁移作为独立的一次性服务先跑完，成功后才启动网关——迁移失败时不会有服务在半套 schema 上接流量。
+
+起来之后有三个入口：
+
+| 地址 | 是什么 |
+|---|---|
+| `http://localhost:7081` | **管理台**，同源承载 API（`/admin` `/app` `/v1` …由 Caddy 分流到后端） |
+| `http://localhost:7082` | **用户控制台**（注册 / 登录 / API Key / 用量 / 充值） |
+| `http://localhost:7080` | 后端直连，**仅调试**：不经 Caddy，`X-Forwarded-For` 一律不信 |
+
+API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生产用 `ADMIN_SITE` 域名）。
 
 ## 必须设置的密钥
 
@@ -185,6 +200,30 @@ docker compose up -d
 - [ ] 按 token 计价的模型配了「默认输出上限」，否则请求必须自带 `max_tokens`
 - [ ] 提供向量的渠道已声明 `embeddings` 能力（默认只有 `chat`，未声明的端点会 404）
 - [ ] 定期查看管理台「结算待处理」：这些记录仍占用用户预留额度，需人工裁定
+- [ ] 生产已设 `ADMIN_SITE` / `CONSOLE_SITE` 域名并叠加 `deploy/docker-compose.prod.yml`；别把 `7080` 直连口暴露到公网
+- [ ] 控制台已开放**自助注册**（`/register`，无需邀请码）：不想开放注册就在反代层挡掉该路径，或要求邀请码
+
+## 前端镜像与边缘（Caddy）
+
+两个前端各有一个 Dockerfile，构建约定与后端镜像相同（父目录上下文、镜像内复刻宿主布局），
+但**只 COPY 显式子路径**——各仓本地 85–480M 的 `node_modules` 不会进入构建上下文，也就不需要无法版本化的父目录 `.dockerignore`。
+需要 BuildKit（Docker ≥ 23 默认）。
+
+`deploy/Caddyfile` 不是可选项。管理台在浏览器里**直连**后端并靠 cookie 认证，而后端 CORS 硬编码
+`allowedOrigins=*` + `allowCredentials=false`（`Main.kt`，改它要重新编译）——跨源时浏览器不会带 cookie，
+所以管理台和 API **必须同源**，Caddy 按路径分流：
+
+| 路径 | 去向 |
+|---|---|
+| `/admin/*` `/app/*` `/manage/*` `/platform/order*` `/v1/*` `/v1beta/*` | 后端 `newgate:7080`（SSE 关闭缓冲） |
+| 其余（含管理台自己的 `/platform/api` 等页面） | 管理台 `front:3000` |
+| `CONSOLE_SITE` 整站 | 控制台 `console:3000`（它自带 `/api/backend` 服务端代理，不直连） |
+
+Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUSTED_PROXIES` 默认只信它——
+这样令牌 IP 白名单拿到的是真实客户端地址，而直连 `7080` 的请求伪造转发头也无效。
+后端目前没有 `/health` 端点，所以 compose 对它只能 `service_started`；两个前端镜像自带 HEALTHCHECK。
+
+生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。
 
 ## 反向代理
 

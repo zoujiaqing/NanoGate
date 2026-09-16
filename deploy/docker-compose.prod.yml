@@ -1,0 +1,8 @@
+# 生产覆盖：让 Caddy 接管 80/443 以便为 ADMIN_SITE / CONSOLE_SITE 自动签发 HTTPS。
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+# 前提：.env 里 ADMIN_SITE / CONSOLE_SITE 已填公网域名，且两个域名都解析到本机。
+services:
+  caddy:
+    ports:
+      - "80:80"
+      - "443:443"
