@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure
 """
 import json, os, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +62,18 @@ class H(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
                 }); return
+            if MODE == "azure":
+                # Azure OpenAI 形状校验：api-key 头 + /openai/deployments/<dep>/chat/completions?api-version=…
+                # 不满足就 400 并把实际收到的东西回给 harness，断言失败时能直接看到差在哪。
+                dep = os.environ.get("AZURE_DEPLOYMENT", "dep-1")
+                want = f"/openai/deployments/{dep}/chat/completions?api-version=2024-06-01"
+                if self.headers.get("api-key") != os.environ.get("AZURE_KEY", "sk-azure") or self.headers.get("Authorization") or self.path != want:
+                    self._json(400, {"error": {"message": f"bad azure request path={self.path} api-key={self.headers.get('api-key')} auth={self.headers.get('Authorization')}"}}); return
+                self._json(200, {
+                    "id": "r1", "object": "chat.completion", "model": body.get("model", "?"),
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                }); return
             if MODE == "embok":
                 # embeddings 响应：usage 只有 prompt_tokens（没有 completion）——计费不得凭空补出输出 tokens
                 self._json(200, {
@@ -93,7 +105,7 @@ class H(BaseHTTPRequestHandler):
     def _okstream(self, model):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
         for i in range(3):
-            c = {"choices": [{"delta": {"content": f"t{i} "}}]}
+            c = {"model": model, "choices": [{"delta": {"content": f"t{i} "}}]}
             self.wfile.write(f"data: {json.dumps(c)}\n\n".encode()); self.wfile.flush(); time.sleep(0.15)
         tail = {"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 500}}
         self.wfile.write(f"data: {json.dumps(tail)}\n\n".encode())

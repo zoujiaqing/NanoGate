@@ -2479,5 +2479,47 @@ hc=$(curl -s --max-time 5 -o /tmp/nanogate-health.json -w "%{http_code}" "$U/hea
   && pass "/health 匿名 200 且 status=ok" \
   || fail "/health 错: HTTP=${hc} body=${hb}"
 
+# ══ S58 模型映射反向：响应里的 model 是客户端请求的名字，上游名不外泄；日志记的仍是上游名 ══
+echo "[S58] 模型映射反向改写"
+# S55 给 user 1 留了 vip55 的用户例外，后面三个场景都只在 default 组开渠道，先清掉
+q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+seed_reset; fake ok 9958; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-map','openai_compatible','http://127.0.0.1:9958','default','gpt-x','{\"gpt-x\":\"up-x\"}',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-map'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('gpt-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+mb=$(curl -s --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-x","messages":[]}')
+echo "$mb" | grep -q '"model":"gpt-x"' && ! echo "$mb" | grep -q 'up-x' \
+  && pass "非流式响应 model 改回 gpt-x" || fail "非流式响应 model 未改回: $mb"
+ms=$(curl -sN --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-x","stream":true,"messages":[]}')
+mc=$(echo "$ms" | grep -c '"model":"gpt-x"')
+[ "$mc" -ge 3 ] && ! echo "$ms" | grep -q 'up-x' \
+  && pass "流式每块 model 改回 gpt-x（$mc 块）" || fail "流式 model 未改回: chunks=$mc body=$(echo "$ms" | head -c 300)"
+um=$(wait_rows "SELECT upstream_model FROM gateway_usage_logs WHERE request_model='gpt-x' ORDER BY id LIMIT 1" up-x)
+[ "$um" = "up-x" ] && pass "usage_log.upstream_model 仍记上游名 up-x" || fail "usage_log.upstream_model=$um"
+
+# ══ S59 Azure OpenAI 原生：api-key 头 + /openai/deployments/{部署}/chat/completions?api-version= ══
+echo "[S59] Azure OpenAI 端点形状"
+seed_reset; export AZURE_DEPLOYMENT=dep-1 AZURE_KEY=sk-azure; fake azure 9959; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,api_version,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-az','azure_openai','http://127.0.0.1:9959','default','gpt-a','{\"gpt-a\":\"dep-1\"}','2024-06-01',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-az'),'sk-azure',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('gpt-a','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+ac=$(curl -s --max-time 15 -o /tmp/nanogate-az.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-a","messages":[]}'); ab=$(cat /tmp/nanogate-az.json)
+[ "$ac" = "200" ] && echo "$ab" | grep -q '"model":"gpt-a"' \
+  && pass "Azure 形状正确（200，model 改回 gpt-a）" || fail "Azure 请求形状错: HTTP=$ac body=$ab"
+unset AZURE_DEPLOYMENT AZURE_KEY
+
+# ══ S60 跨协议上游错误：Anthropic 入口打到 OpenAI 上游的 403，错误体按 Anthropic 格式返回 ══
+echo "[S60] 跨协议错误体改写"
+seed_reset; fake err403 9961; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-403','openai_compatible','http://127.0.0.1:9961','default','m-x',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-403'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+xc=$(curl -s --max-time 15 -o /tmp/nanogate-x.json -w "%{http_code}" -X POST "$U/v1/messages" -H "$AUTH" -H "$CT" -d '{"model":"m-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'); xb=$(cat /tmp/nanogate-x.json)
+[ "$xc" = "403" ] && echo "$xb" | grep -q '"type":"error"' && echo "$xb" | grep -q 'forbidden' \
+  && pass "Anthropic 入口收到 Anthropic 形状的 403（含上游原话）" || fail "跨协议错误体: HTTP=$xc body=$xb"
+oc=$(curl -s --max-time 15 -o /tmp/nanogate-o.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-x","messages":[]}'); ob=$(cat /tmp/nanogate-o.json)
+[ "$oc" = "403" ] && [ "$ob" = '{"error": "forbidden"}' ] \
+  && pass "同协议 403 仍原样透传" || fail "同协议透传变了: HTTP=$oc body=$ob"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
