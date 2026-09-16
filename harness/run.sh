@@ -2521,5 +2521,22 @@ oc=$(curl -s --max-time 15 -o /tmp/nanogate-o.json -w "%{http_code}" -X POST "$U
 [ "$oc" = "403" ] && [ "$ob" = '{"error": "forbidden"}' ] \
   && pass "同协议 403 仍原样透传" || fail "同协议透传变了: HTTP=$oc body=$ob"
 
+# ══ S61 渠道连通性探测：按渠道协议打最小请求；不计费、不记日志、不动 Key 失败计数 ══
+echo "[S61] 渠道探测"
+seed_reset; fake ok 9962; fake err403 9963; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('c-p1','openai_compatible','http://127.0.0.1:9962','default','m-p',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-p2','openai_compatible','http://127.0.0.1:9963','default','m-p',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-p1'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-p2'),'k',1,0,0,0,0);" >/dev/null
+p1=$(q "SELECT id FROM gateway_channels WHERE name='c-p1'"); p2=$(q "SELECT id FROM gateway_channels WHERE name='c-p2'")
+pb1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$p1" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}')
+echo "$pb1" | grep -q '"ok":true' && echo "$pb1" | grep -q '"status":200' \
+  && pass "健康渠道探测 ok/200" || fail "健康渠道探测: $pb1"
+pb2=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$p2" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"model":"m-p"}')
+echo "$pb2" | grep -q '"ok":false' && echo "$pb2" | grep -q '"status":403' && echo "$pb2" | grep -q 'forbidden' \
+  && pass "403 渠道探测 ok=false 且带上游原话" || fail "403 渠道探测: $pb2"
+pf=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$p2"); pl=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+[ "$pf" = "0" ] && [ "$pl" = "0" ] && pass "探测不动 Key 失败计数、不写 usage_log" || fail "探测有副作用: fail_count=$pf usage_logs=$pl"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
