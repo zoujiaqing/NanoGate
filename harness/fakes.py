@@ -86,6 +86,11 @@ class H(BaseHTTPRequestHandler):
                     "model": body.get("model", "?"),
                     "usage": {"prompt_tokens": 7, "total_tokens": 7},
                 }); return
+            if self.path == "/v1/responses":
+                # Responses API：不认 stream_options（真上游会 400，这里也照样 400 好让网关的注入露馅）
+                if "stream_options" in body:
+                    self._json(400, {"error": {"message": "Unknown parameter: 'stream_options'"}}); return
+                self._responses(body.get("model", "?"), stream); return
             # ok
             if stream:
                 self._okstream(body.get("model", "?"))
@@ -105,6 +110,20 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _responses(self, model, stream):
+        usage = {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}
+        if not stream:
+            self._json(200, {"id": "resp_1", "object": "response", "model": model, "status": "completed",
+                             "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+                             "usage": usage}); return
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        def ev(name, obj):
+            self.wfile.write(f"event: {name}\ndata: {json.dumps(obj)}\n\n".encode()); self.wfile.flush()
+        ev("response.created", {"type": "response.created", "response": {"id": "resp_1", "model": model, "status": "in_progress"}})
+        for i in range(3):
+            ev("response.output_text.delta", {"type": "response.output_text.delta", "delta": f"t{i} "}); time.sleep(0.1)
+        ev("response.completed", {"type": "response.completed", "response": {"id": "resp_1", "model": model, "status": "completed", "usage": usage}})
 
     def _okstream(self, model):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()

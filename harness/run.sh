@@ -2583,5 +2583,22 @@ ov_ch=$(echo "$ov" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];
 [ "$ovn" = "3" ] && [ "$ov_req" = "3" ] && [ "$ov_model" = "3 $ovc" ] && [ "$ov_ch" = "3 1" ] \
   && pass "概览：今日 3 请求、模型 m-ov 3 次/charged=${ovc}、渠道 c-ov 3 次" || fail "概览: logs=$ovn today=$ov_req model='$ov_model' channel='$ov_ch' body=$(echo "$ov" | head -c 300)"
 
+# ══ S65 Responses API：同协议透传、usage 按 input_/output_tokens 计、流式 usage 取自 response.completed、映射反向生效 ══
+echo "[S65] /v1/responses"
+seed_reset; fake ok 9966; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-rs','openai_compatible','http://127.0.0.1:9966','default','m-rs','{\"m-rs\":\"up-rs\"}',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rs'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rs','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+rsc=$(curl -s --max-time 15 -o /tmp/nanogate-rs.json -w "%{http_code}" -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","max_output_tokens":50}'); rsb=$(cat /tmp/nanogate-rs.json)
+[ "$rsc" = "200" ] && echo "$rsb" | grep -q '"object": "response"' && echo "$rsb" | grep -q '"model":"m-rs"' && ! echo "$rsb" | grep -q 'up-rs' \
+  && pass "非流式 200、响应 model 改回 m-rs" || fail "非流式: HTTP=$rsc body=$rsb"
+rs1=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||charged||'/'||upstream_model FROM gateway_usage_logs WHERE request_model='m-rs' ORDER BY id LIMIT 1" "1000/500/7500/up-rs")
+[ "$rs1" = "1000/500/7500/up-rs" ] && pass "usage 按 input_/output_tokens 入账（1000/500 → charged 7500）" || fail "非流式 usage_log: $rs1"
+rss=$(curl -sN --max-time 15 -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","stream":true,"max_output_tokens":50}')
+echo "$rss" | grep -q 'response.completed' && [ "$(echo "$rss" | grep -c '"model":"m-rs"')" -ge 2 ] && ! echo "$rss" | grep -q 'up-rs' \
+  && pass "流式透传到 response.completed，事件里的 model 改回 m-rs" || fail "流式: $(echo "$rss" | head -c 400)"
+rs2=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1 AND prompt_tokens=1000 AND completion_tokens=500 AND charged=7500" 1)
+[ "$rs2" = "1" ] && pass "流式 usage 取自 response.completed 并入账" || fail "流式 usage_log 行数=$rs2 $(q "SELECT status,error_code,prompt_tokens,completion_tokens FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1")"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
