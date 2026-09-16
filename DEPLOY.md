@@ -203,7 +203,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
 | 能力 | 覆盖端点 |
 |---|---|
-| `chat` | `/v1/chat/completions`、`/v1/messages`、Gemini `:generateContent` |
+| `chat` | `/v1/chat/completions`、`/v1/responses`（仅 OpenAI 兼容 / Azure 渠道参与路由）、`/v1/messages`、Gemini `:generateContent` |
 | `embeddings` | `/v1/embeddings`、Gemini `:embedContent` / `:batchEmbedContents` |
 
 - 默认只有 `chat`。**升级后确实提供向量的渠道必须补上 `embeddings`**，否则该端点会明确回 `404 model_not_found`——
