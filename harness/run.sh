@@ -2538,5 +2538,34 @@ echo "$pb2" | grep -q '"ok":false' && echo "$pb2" | grep -q '"status":403' && ec
 pf=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$p2"); pl=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 [ "$pf" = "0" ] && [ "$pl" = "0" ] && pass "探测不动 Key 失败计数、不写 usage_log" || fail "探测有副作用: fail_count=$pf usage_logs=$pl"
 
+# ══ S62 拉取上游模型清单：用渠道自己的 Key 打 /v1/models，返回去重排序后的 id ══
+echo "[S62] 拉取上游模型"
+seed_reset; fake ok 9964; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-ls','openai_compatible','http://127.0.0.1:9964','default','',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ls'),'k-ls',1,0,0,0,0);" >/dev/null
+ls_id=$(q "SELECT id FROM gateway_channels WHERE name='c-ls'")
+lsb=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/models/$ls_id" -H "Authorization: Bearer $GJWT" -H "$CT")
+echo "$lsb" | grep -q '"ok":true' && echo "$lsb" | grep -q '"models":\["m-list-a","m-list-b"\]' \
+  && pass "上游模型清单 ok 且排序去重" || fail "上游模型清单: $lsb"
+
+# ══ S63 定价批量导入：整批校验、按 model upsert、overwrite=false 跳过已有 ══
+echo "[S63] 定价批量导入"
+seed_reset
+imp1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"items":[{"model":"imp-a","inputPrice":"1","outputPrice":"2"},{"model":"imp-b","inputPrice":"3","outputPrice":"4"},{"model":"imp-a","inputPrice":"9","outputPrice":"9"}]}')
+ia=$(q "SELECT input_price||'/'||output_price||'/'||source FROM gateway_model_prices WHERE model='imp-a'"); ic=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model LIKE 'imp-%'")
+echo "$imp1" | grep -q '"created":2' && [ "$ic" = "2" ] && [ "$ia" = "1/2/import" ] \
+  && pass "首次导入 created=2（同批重复 model 只取第一条）" || fail "首次导入: resp=$imp1 rows=$ic imp-a=$ia"
+imp2=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"overwrite":false,"items":[{"model":"imp-a","inputPrice":"5","outputPrice":"6"},{"model":"imp-c","inputPrice":"7","outputPrice":"8"}]}')
+ia2=$(q "SELECT input_price FROM gateway_model_prices WHERE model='imp-a'")
+echo "$imp2" | grep -q '"created":1' && echo "$imp2" | grep -q '"skipped":1' && [ "$ia2" = "1" ] \
+  && pass "overwrite=false：新增 1、跳过 1、旧价不动" || fail "不覆盖导入: resp=$imp2 imp-a=$ia2"
+imp3=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"items":[{"model":"imp-d","inputPrice":"1","outputPrice":"2"},{"model":"imp-e","inputPrice":"bad","outputPrice":"2"}]}')
+id_rows=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='imp-d'")
+echo "$imp3" | grep -q '"errors":\["#2 imp-e' && [ "$id_rows" = "0" ] \
+  && pass "有一条不合法则整批不写，错误带行号" || fail "整批校验: resp=$imp3 imp-d rows=$id_rows"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

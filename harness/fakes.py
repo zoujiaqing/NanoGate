@@ -32,6 +32,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # GET /inflight → 当前在途请求数（供 harness 轮询断连后归零）
+        if self.path == "/v1/models":
+            # 上游模型清单（渠道「拉取模型」用）；顺带把鉴权头回显，harness 据此断言走的是渠道的 Key
+            self._json(200, {"object": "list", "data": [{"id": "m-list-b"}, {"id": "m-list-a"}], "auth": self.headers.get("Authorization")})
+            return
         if self.path == "/inflight":
             with _lock:
                 n = _inflight
