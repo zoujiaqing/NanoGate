@@ -2567,5 +2567,21 @@ id_rows=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='imp-d'")
 echo "$imp3" | grep -q '"errors":\["#2 imp-e' && [ "$id_rows" = "0" ] \
   && pass "有一条不合法则整批不写，错误带行号" || fail "整批校验: resp=$imp3 imp-d rows=$id_rows"
 
+# ══ S64 管理台概览：从用量日志现算的汇总与上面 S1 一样的口径 ══
+echo "[S64] 网关概览"
+seed_reset; fake ok 9965; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-ov','openai_compatible','http://127.0.0.1:9965','default','m-ov',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ov'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-ov','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+for _ in 1 2 3; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ov","messages":[]}'; done
+ovn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-ov'" 3)
+ovc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs WHERE request_model='m-ov'")
+ov=$(curl -s --max-time 15 "$U/admin/gateway/info/overview?days=7" -H "Authorization: Bearer $GJWT")
+ov_req=$(echo "$ov" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['today']['requests'])" 2>/dev/null)
+ov_model=$(echo "$ov" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['topModels'] if x['model']=='m-ov'][0];print(m['requests'],m['charged'])" 2>/dev/null)
+ov_ch=$(echo "$ov" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];c=[x for x in d['channels'] if x['name']=='c-ov'][0];print(c['requests'],c['status'])" 2>/dev/null)
+[ "$ovn" = "3" ] && [ "$ov_req" = "3" ] && [ "$ov_model" = "3 $ovc" ] && [ "$ov_ch" = "3 1" ] \
+  && pass "概览：今日 3 请求、模型 m-ov 3 次/charged=${ovc}、渠道 c-ov 3 次" || fail "概览: logs=$ovn today=$ov_req model='$ov_model' channel='$ov_ch' body=$(echo "$ov" | head -c 300)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
