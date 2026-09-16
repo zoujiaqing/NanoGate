@@ -1,0 +1,37 @@
+# NanoGate 边缘反向代理（docker compose 内的 caddy 服务加载）。
+#
+# 为什么必须有这一层：管理台在浏览器里**直连**后端并靠 cookie 认证（credentials: include），
+# 而后端 CORS 硬编码 allowedOrigins=* 且 allowCredentials=false —— 跨源时浏览器根本不会带 cookie，
+# 登录态在另一个端口上永远无效。所以管理台与后端 API 必须是同一个源，只能在这里按路径分流。
+# 用户控制台没有这个问题：它自带 /api/backend 服务端代理，浏览器不直连后端。
+{
+	admin off
+}
+
+# ── 管理台 + API：同源 ──
+# 站点地址来自环境变量：本地默认 ":7081"；生产写域名（如 admin.example.com）即自动签 HTTPS，
+# 并配合 deploy/docker-compose.prod.yml 发布 80/443。
+{$ADMIN_SITE}
+	encode zstd gzip
+
+	# 后端路由组的挂载点（newgate/application/config/routing.conf）：
+	#   admin → /admin   app → /app   manage → /manage   open → /platform   gateway → 根（/v1、/v1beta）
+	# /platform 下管理台自己有 /platform/api、/platform/log 等 6 个页面，后端在该前缀下只有 /platform/order，
+	# 因此只精确放行 /platform/order*，其余 /platform/* 留给管理台页面。
+	@backend path /admin/* /app/* /manage/* /platform/order /platform/order/* /v1/* /v1beta/*
+	handle @backend {
+		reverse_proxy newgate:7080 {
+			# SSE 流式响应：禁止代理缓冲，否则整段攒完一次性吐出（DEPLOY.md「反向代理」）
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy front:3000
+	}
+}
+
+# ── 用户控制台 ──
+{$CONSOLE_SITE}
+	encode zstd gzip
+	reverse_proxy console:3000
+}
