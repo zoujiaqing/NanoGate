@@ -221,9 +221,23 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 
 Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUSTED_PROXIES` 默认只信它——
 这样令牌 IP 白名单拿到的是真实客户端地址，而直连 `7080` 的请求伪造转发头也无效。
-后端目前没有 `/health` 端点，所以 compose 对它只能 `service_started`；两个前端镜像自带 HEALTHCHECK。
+后端 `/health`（匿名，DB 能应答才 200）与两个前端镜像都自带 HEALTHCHECK，compose 的 `depends_on` 一律用 `service_healthy`。
 
 生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。
+
+## 可观测性（最小集）
+
+没有 metrics 端点（框架未引入 Prometheus 之类的依赖，这是下一步）。上线前至少能看这三样：
+
+| 看什么 | 在哪 |
+|---|---|
+| 每个 HTTP 请求（方法/路径/状态/耗时） | `logs/access.log`，框架 `http.access` 行，同时异步落库 |
+| 每次中转的**结算摘要**：模型、渠道、token 数、收入 `charged`、成本 `cost`、首字节/总耗时、结果 | `logs/all.log` 里的 `settlement.finalized` 行（结构化字段，JSON 日志可直接按字段聚合）；预留被释放的请求是 `settlement.released` |
+| 错误与告警 | `logs/error.log`（`ERROR,WARN`） |
+| 存活/就绪 | `GET /health`：`200 {"status":"ok"}`；数据库不可达 `503 {"status":"degraded"}` |
+
+成本曲线、渠道故障率、单用户消耗这些运营视图，现阶段就是对 `settlement.finalized` 行做聚合——
+它写在结算事务提交之后，worker 重放的结算也会打，所以与账本一一对应。
 
 ## 反向代理
 
