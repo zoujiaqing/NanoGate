@@ -126,7 +126,7 @@ services:
     restart: unless-stopped
     depends_on:
       newgate:
-        condition: service_started
+        condition: service_healthy
     expose: ["3000"]
 
   # ── 用户控制台（Next.js）。自带 /api/backend 服务端代理，只需内网后端地址 ──
@@ -138,7 +138,7 @@ services:
     restart: unless-stopped
     depends_on:
       newgate:
-        condition: service_started
+        condition: service_healthy
     environment:
       NETON_BACKEND_URL: http://newgate:7080
     expose: ["3000"]

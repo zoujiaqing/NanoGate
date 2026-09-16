@@ -45,6 +45,9 @@ trap cleanup EXIT INT TERM
 
 pass() { echo "  ✅ $1"; PASS=$((PASS+1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+# 等某条计数查询达到期望值（非流式先响应后计费：客户端拿到 200 时结算还在 NonCancellable 里写库）。
+# 有界轮询代替裸 sleep：到点仍不等就原值返回，交给调用方断言——多写一条同样会被 = 抓住。
+wait_rows() { local sql=$1 want=$2 tries=${3:-25} v; for _ in $(seq 1 "$tries"); do v=$(q "$sql"); [ "$v" = "$want" ] && break; sleep 0.2; done; echo "$v"; }
 q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
 # Redis 断言助手：只碰本次拉起的隔离实例的隔离 db。键名带 keyPrefix（配置里可变），
 # 故一律用 *ngrl:* 通配匹配，不把前缀写死在断言里。
@@ -429,7 +432,7 @@ for i in 1 2 3 4 5; do
 done
 n200=$(echo "$codes" | grep -o "200" | wc -l | tr -d ' ')
 n429=$(echo "$codes" | grep -o "429" | wc -l | tr -d ' ')
-lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
+lg=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs" 3)
 q "UPDATE gateway_tokens SET rpm_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/dev/null
 [ "$n200" = "3" ] && [ "$n429" = "2" ] && [ "$lg" = "3" ] \
   && pass "RPM=3：前 3 个 200、后 2 个 429、仅 3 条计费（被限流的不调上游）" \
@@ -2468,6 +2471,13 @@ fi
 q "UPDATE system_settings SET value='true' WHERE setting_key='payment.mock.enabled';
    DELETE FROM pay_channels WHERE code='alipay56';" >/dev/null
 fi
+
+# ══ S57 健康端点：匿名可读，DB 可达即 200（容器 HEALTHCHECK / compose depends_on / 反代健康检查都靠它）══
+echo "[S57] /health"
+hc=$(curl -s --max-time 5 -o /tmp/nanogate-health.json -w "%{http_code}" "$U/health"); hb=$(cat /tmp/nanogate-health.json 2>/dev/null)
+[ "$hc" = "200" ] && echo "$hb" | grep -q '"status":"ok"' \
+  && pass "/health 匿名 200 且 status=ok" \
+  || fail "/health 错: HTTP=${hc} body=${hb}"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
