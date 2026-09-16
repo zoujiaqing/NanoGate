@@ -2616,5 +2616,11 @@ iml=$(wait_rows "SELECT charged||'/'||prompt_tokens||'/'||status FROM gateway_us
 imn=$(curl -s --max-time 15 -o /tmp/nanogate-img2.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img2","prompt":"a cat"}')
 [ "$imn" = "404" ] && grep -q 'model_not_found' /tmp/nanogate-img2.json && pass "没声明 images 能力的渠道不参与 → 404 model_not_found" || fail "能力缺失: HTTP=$imn body=$(cat /tmp/nanogate-img2.json)"
 
+# ══ S67 公开接入信息：匿名可读，端点清单齐全 ══
+echo "[S67] /app/gateway/public-info"
+pic=$(curl -s --max-time 5 -o /tmp/nanogate-pi.json -w "%{http_code}" "$U/app/gateway/public-info"); pib=$(cat /tmp/nanogate-pi.json)
+[ "$pic" = "200" ] && echo "$pib" | grep -q '/v1/chat/completions' && echo "$pib" | grep -q '/v1/images/generations' && echo "$pib" | grep -q '/v1/messages' \
+  && pass "public-info 匿名 200 且列出各协议端点" || fail "public-info: HTTP=$pic body=$pib"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

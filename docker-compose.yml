@@ -109,6 +109,7 @@ services:
       # ⚠️ 没设 NOTIFY_BASE 就别在后台停用 pay-order-reconcile：两条到账路径全断 = 钱到账了额度永远不发。
       # ⚠️ 别填容器内部地址（http://localhost:7080 或 http://newgate:7080）：本地跑得通，
       # 上线后一律回调失败 —— 而失败发生在渠道那一侧，你这边只看到订单一直是待支付。
+      NEWGATE_PUBLIC_API_URL: ${PUBLIC_API_URL:-}
       NEWGATE_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
       NEWGATE_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
       # 有意**不**在这里暴露 NEWGATE_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
