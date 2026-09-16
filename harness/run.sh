@@ -2622,5 +2622,33 @@ pic=$(curl -s --max-time 5 -o /tmp/nanogate-pi.json -w "%{http_code}" "$U/app/ga
 [ "$pic" = "200" ] && echo "$pib" | grep -q '/v1/chat/completions' && echo "$pib" | grep -q '/v1/images/generations' && echo "$pib" | grep -q '/v1/messages' \
   && pass "public-info 匿名 200 且列出各协议端点" || fail "public-info: HTTP=$pic body=$pib"
 
+# ══ S68 用户自助：改 Key 的名称/预算/有效期/模型范围，改不了运营设定的限速与计价组；用量汇总口径与日志一致 ══
+echo "[S68] 用户自助 Key 更新与用量汇总"
+seed_reset; fake ok 9968; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-st','openai_compatible','http://127.0.0.1:9968','default','m-st',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-st'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-st','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
+s68tok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"name":"s68"}')
+S68ID=$(echo "$s68tok" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null)
+q "UPDATE gateway_tokens SET rpm_limit=7, group_override='default' WHERE id=$S68ID" >/dev/null
+s68future=$(( $(date +%s) * 1000 + 86400000 ))
+up=$(curl -s --max-time 10 -o /tmp/nanogate-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"name\":\"s68-renamed\",\"quotaBudget\":5000000,\"expiresAt\":$s68future,\"allowedModels\":\"m-st\",\"allowedIps\":\"\"}")
+row=$(q "SELECT name||'/'||quota_budget||'/'||allowed_models||'/'||rpm_limit||'/'||COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$S68ID")
+[ "$up" = "200" ] && [ "$row" = "s68-renamed/5000000/m-st/7/default" ] \
+  && pass "自助更新：名称/预算/模型范围改了，rpm_limit=7 与 group_override 原样" || fail "自助更新: HTTP=$up row=$row body=$(cat /tmp/nanogate-s68.json)"
+inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"name\":\"x\",\"rpmLimit\":9999}")
+rl=$(q "SELECT rpm_limit FROM gateway_tokens WHERE id=$S68ID")
+[ "$inj" = "400" ] && [ "$rl" = "7" ] && pass "塞 rpmLimit 被拒（400）且限速不变" || fail "限速注入: HTTP=$inj rpm_limit=$rl"
+past=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"name\":\"x\",\"expiresAt\":1000}")
+[ "$past" = "400" ] && pass "过去的有效期被拒" || fail "过去有效期: HTTP=$past"
+for _ in 1 2; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-st","messages":[]}'; done
+stn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-st'" 2)
+st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization: Bearer $GJWT")
+stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['byModel'] if x['model']=='m-st'][0];print(d['today']['requests'],m['requests'],m['charged'],d['byToken'][0]['requests'])" 2>/dev/null)
+[ "$stn" = "2" ] && [ "$stv" = "2 2 15000 2" ] && pass "用量汇总：今日 2 次、模型 m-st 2 次/15000、按 Key 2 次" || fail "用量汇总: logs=$stn stats='$stv' body=$(echo "$st" | head -c 300)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
