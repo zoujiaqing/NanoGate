@@ -57,11 +57,11 @@ docker compose up -d
 
 | 地址 | 是什么 |
 |---|---|
-| `http://localhost:7081` | **管理台**，同源承载 API（`/admin` `/app` `/v1` …由 Caddy 分流到后端） |
-| `http://localhost:7082` | **用户控制台**（注册 / 登录 / API Key / 用量 / 充值） |
-| `http://localhost:7080` | 后端直连，**仅调试**：不经 Caddy，`X-Forwarded-For` 一律不信 |
+| `http://localhost:8888` | **管理台**，同源承载 API（`/admin` `/app` `/v1` …由 Caddy 分流到后端） |
+| `http://localhost:8880` | **用户控制台**（注册 / 登录 / API Key / 用量 / 充值） |
+| `http://localhost:8800` | 后端直连，**仅调试**：不经 Caddy，`X-Forwarded-For` 一律不信 |
 
-API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生产用 `ADMIN_SITE` 域名）。
+API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生产用 `ADMIN_SITE` 域名）。
 
 ## 必须设置的密钥
 
@@ -143,7 +143,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 两边都看不出原因。启动时会为这个组合打一行 ERROR 点名是哪两条；但它**只在启动时查一次**，
 运行期在后台停用不会重新检查 —— 所以停用那个任务前，先确认回调基址已经配了。
 
-⚠️ 别填容器内部地址（`http://localhost:7080`、`http://newgate:7080`）：本地跑得通，
+⚠️ 别填容器内部地址（`http://localhost:8800`、`http://newgate:8800`）：本地跑得通，
 上线后一律回调失败，而失败发生在渠道那一侧 —— 你的日志里只会看到订单一直是待支付。
 
 漏写 `https://` 之类的非法值**不会**被静默当成没配：按未配置处理并记 ERROR。
@@ -234,7 +234,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 - [ ] 每条渠道都点过「测试连通」；Azure 渠道的模型映射目标是部署名、`api_version` 与你的资源匹配
 - [ ] 管理台「支付应用 → 渠道配置」里至少启用了一条真实渠道，并用沙箱渠道把「下单 → 付款 → 到账」走通过一次
 - [ ] 定期查看管理台「结算待处理」：这些记录仍占用用户预留额度，需人工裁定
-- [ ] 生产已设 `ADMIN_SITE` / `CONSOLE_SITE` 域名并叠加 `deploy/docker-compose.prod.yml`；别把 `7080` 直连口暴露到公网
+- [ ] 生产已设 `ADMIN_SITE` / `CONSOLE_SITE` 域名并叠加 `deploy/docker-compose.prod.yml`；别把 `8800` 直连口暴露到公网
 - [ ] 已设 `PUBLIC_API_URL`（容器内 `NEWGATE_PUBLIC_API_URL`），否则控制台的接入说明只能显示占位符
 - [ ] 控制台已开放**自助注册**（`/register`，无需邀请码）：不想开放注册就在反代层挡掉该路径，或要求邀请码
 
@@ -250,12 +250,12 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
 | 路径 | 去向 |
 |---|---|
-| `/admin/*` `/app/*` `/manage/*` `/platform/order*` `/v1/*` `/v1beta/*` | 后端 `newgate:7080`（SSE 关闭缓冲） |
+| `/admin/*` `/app/*` `/manage/*` `/platform/order*` `/v1/*` `/v1beta/*` | 后端 `newgate:8800`（SSE 关闭缓冲） |
 | 其余（含管理台自己的 `/platform/api` 等页面） | 管理台 `front:3000` |
 | `CONSOLE_SITE` 整站 | 控制台 `console:3000`（它自带 `/api/backend` 服务端代理，不直连） |
 
 Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUSTED_PROXIES` 默认只信它——
-这样令牌 IP 白名单拿到的是真实客户端地址，而直连 `7080` 的请求伪造转发头也无效。
+这样令牌 IP 白名单拿到的是真实客户端地址，而直连 `8800` 的请求伪造转发头也无效。
 后端 `/health`（匿名，DB 能应答才 200）与两个前端镜像都自带 HEALTHCHECK，compose 的 `depends_on` 一律用 `service_healthy`。
 
 生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。

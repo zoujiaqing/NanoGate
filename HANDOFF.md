@@ -145,7 +145,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   拉取上游模型）/ 定价（含批量导入）/ 日志 / 令牌 / 结算复核 / 计价组 / 兑换码页
 - 用户控制台：注册与登录、我的 Key / 用量账单 / 模型广场 / 用户中心 / 充值与流水
   （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值保留给联调），typecheck 通过
-- 两个前端都有 Dockerfile，compose 里与 Caddy 边缘一起起（管理台与 API 同源 7081、控制台 7082）
+- 两个前端都有 Dockerfile，compose 里与 Caddy 边缘一起起（管理台与 API 同源 8888、控制台 8880）
 
 ### 验证与 CI
 
@@ -156,8 +156,8 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   SSRF（含 DNS 复查）、原生认证、用户端越权防护等。
   **改动账务或流式代码后必须跑这个。**
   2026-09-02 实测 **37/37 全绿**（已含下述框架拆分迁移修复）。
-  ⚠️ 若断言大面积 404，先查 7080 是否被残留网关进程占用——旧进程应答会让所有场景假性失败。
-  macOS 上 `lsof -nP -iTCP:7080 -sTCP:LISTEN` 最直接；但**别把 lsof 写进脚本**（ubuntu runner
+  ⚠️ 若断言大面积 404，先查 8800 是否被残留网关进程占用——旧进程应答会让所有场景假性失败。
+  macOS 上 `lsof -nP -iTCP:8800 -sTCP:LISTEN` 最直接；但**别把 lsof 写进脚本**（ubuntu runner
   不一定装，缺了会静默变成「端口已空」），`run.sh` 里用的是 bash 内建的 `/dev/tcp` 探测。
 - **CI：三个仓都有 workflow（2026-09-02 重写）**
   - 后端 `newgate/.github/workflows/backend-ci.yml`：macOS job 编译 + `:module-gateway` /

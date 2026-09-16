@@ -2,7 +2,7 @@
 # NanoGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；库位置由
-#   PGUSER/PGPASS/PGHOST/PGPORT 指定（默认本机 5432），其余端口是写死的：应用 7080、
+#   PGUSER/PGPASS/PGHOST/PGPORT 指定（默认本机 5432），其余端口是写死的：应用 8800、
 #   fake 9920–9991、隔离 Redis 6399。CI 跑的是同一个脚本（postgres 用 service 容器，见
 #   newgate/.github/workflows/backend-ci.yml）：一次性 runner 上写死端口不会撞，但本机并行跑
 #   多份 harness 会（动态端口仍在 SPEC.md 末「待办」段）。
@@ -20,7 +20,7 @@ LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="newgate_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
-AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:7080"
+AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:8800"
 PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"; PGPORT="${PGPORT:-5432}"
 # PGPORT 必须一起 export：createdb/dropdb/psql 与应用的 DSN 都靠它找库。写死 5432 等于假定
 # 目标库一定在默认端口上（CI 的 postgres 服务容器、或本机跑在非默认端口的集群都不成立）。
@@ -170,8 +170,8 @@ stop_app() {
   # 端口必须真的空出来，否则新实例 bind 失败（表现为「未就绪」，误判成代码问题）
   # 不用 lsof/ss 探端口：前者 GitHub 的 ubuntu runner 不一定装（缺了就静默「立刻返回端口已空」），
   # 后者 macOS 没有。bash 内建的 /dev/tcp 两端都可用；连不上（ECONNREFUSED）即为端口已释放。
-  for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/7080") 2>/dev/null || return 0; sleep 0.5; done
-  echo "  ⚠️  端口 7080 仍被占用，重启网关可能失败" >&2
+  for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/8800") 2>/dev/null || return 0; sleep 0.5; done
+  echo "  ⚠️  端口 8800 仍被占用，重启网关可能失败" >&2
 }
 echo "[boot] starting gateway…"
 boot_app
