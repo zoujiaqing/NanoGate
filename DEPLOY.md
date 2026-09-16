@@ -84,6 +84,10 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 | 成本 | 官方价 × 渠道 `cost_discount` | 结算行与用量日志的 `cost`，不动用户余额 |
 
 - 定价表里填的一律是**官方价**；给单个模型单独定价用 `sale_override`，整体加价调 `SALE_MARKUP`。
+- 价目表可以整份贴进去：管理台「模型定价 → 批量导入」接受每行 `model 输入价 输出价 [缓存读 缓存写]`，
+  也接受 JSON（数组，或 `{"gpt-4o":{"input":2.5,"output":10}}` 这种各家价目表常见的形状）。
+  按 model 去重后逐条 upsert；**有一条不合法整批不写**并按行号报错；取消「覆盖已有」则只补新模型。
+  接口 `POST /admin/gateway/price/import`（`gateway:price:create`），导入的行 `source=import`。
 - `MIN_MARGIN` 是发布闸门：售价任一维低于「官方成本 × 该倍率」时管理台拒绝保存（默认 `1`，即不许亏本卖）。
 - 闸门只挡「配错价」。折扣 >1 的渠道、倍率 <1 的用户组仍可能把单笔毛利压成负数，
   这类请求照常服务但会记 `margin inversion` 告警——请把它接进监控。
@@ -106,6 +110,13 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 没有普适默认值：它取决于你按什么币种定价、以及你想让「1 元」对应多少额度。
 
 额度由服务端按这个汇率算出，**不接受客户端指定** —— 客户端能同时填 price 与 amount 就等于自己给自己定价。
+
+控制台「充值与流水」页的在线充值走的就是这条：读 `GET /app/pay/channel/list`（运营在管理台
+「支付应用 → 渠道配置」里启用的渠道）→ 用户选渠道、填金额（元）→ `POST /app/gateway/recharge`
+→ 按渠道的 `displayMode` 处理：`REDIRECT_URL` 新窗口打开收银台，`QR_CODE` 页内画码，`SDK_PARAMS`
+原样展示参数 → 每 2 秒轮询 `GET /app/gateway/recharge/get/{id}` 直到已支付，然后刷新余额。
+轮询最多 10 分钟，超时只是不再等，回调到账不受影响。**没有启用任何渠道时该卡片只显示提示**，
+用户只能走兑换码 —— 所以上线前先在管理台把渠道配好并用沙箱渠道走一遍。
 
 ### 支付回调地址：`PAY_NOTIFY_BASE` / `PAY_RETURN_URL`（要收真钱就得设）
 
@@ -166,6 +177,26 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 （缩短码长或缩小字符集会让测试红）。码外泄时用「整批作废」止损，它只影响未用的码 ——
 已用的是历史事实，要收回已发放的额度请走管理端的额度调整另记一条台账。
 
+## 渠道
+
+四种类型：`openai_compatible`、`azure_openai`、`anthropic`、`gemini`。协议转换在网关内完成，
+客户端用哪种协议进来都能打到任一类型的上游（错误体也会改写成客户端协议的形状，不会把
+OpenAI 形状的错误原样塞给 Anthropic SDK）。
+
+- **模型映射是双向的**：`{"gpt-4o":"my-deployment"}` 请求时把 model 改成上游的名字，响应
+  （含流式每一块）再改回客户端请求的名字 —— 客户端看不到上游叫什么，SDK 按 model 做的缓存
+  与统计也不会乱。用量日志里 `upstream_model` 记的仍是上游名，成本核算按它查。
+- **Azure OpenAI**：鉴权走 `api-key` 头，路径为 `/openai/deployments/{部署名}/chat/completions?api-version=…`。
+  Base URL 填资源地址（`https://xxx.openai.azure.com`），**部署名就是模型映射的目标名**，
+  `api_version` 留空用代码默认值（当前 `2024-10-21`）。
+- **测试连通**（渠道行菜单 / `POST /admin/gateway/channel/probe/{id}`）：用渠道自己的协议、代理、
+  Key 打一条 `max_tokens=1` 的请求，把上游的状态码、耗时与原话带回来。不计费、不写用量日志、
+  不动 Key 的失败计数。配完渠道先点它，别等第一个客户替你发现 Key 填错了。
+- **拉取模型**（同菜单 / `POST /admin/gateway/channel/models/{id}`）：从上游列出模型 id
+  （Azure 列的是部署名），确认后**并入**渠道的模型清单 —— 只追加不覆盖，运营挑过的清单不会被冲掉。
+  很多 OpenAI 兼容站不实现 `/v1/models`，拉不到就手填。
+- Base URL 与代理地址写入时做 SSRF 校验，见「上游地址与 SSRF」。
+
 ## 端点能力
 
 渠道除了「支持哪些模型」，还要声明「能服务哪些端点」（管理台渠道表单的**端点能力**，即 `gateway_channels.capabilities`）：
@@ -199,6 +230,8 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `7081`（生�
 - [ ] 售价与毛利符合经营策略：`SALE_MARKUP` / `MIN_MARGIN` 已设置（默认不加价、不许亏本卖）
 - [ ] 按 token 计价的模型配了「默认输出上限」，否则请求必须自带 `max_tokens`
 - [ ] 提供向量的渠道已声明 `embeddings` 能力（默认只有 `chat`，未声明的端点会 404）
+- [ ] 每条渠道都点过「测试连通」；Azure 渠道的模型映射目标是部署名、`api_version` 与你的资源匹配
+- [ ] 管理台「支付应用 → 渠道配置」里至少启用了一条真实渠道，并用沙箱渠道把「下单 → 付款 → 到账」走通过一次
 - [ ] 定期查看管理台「结算待处理」：这些记录仍占用用户预留额度，需人工裁定
 - [ ] 生产已设 `ADMIN_SITE` / `CONSOLE_SITE` 域名并叠加 `deploy/docker-compose.prod.yml`；别把 `7080` 直连口暴露到公网
 - [ ] 控制台已开放**自助注册**（`/register`，无需邀请码）：不想开放注册就在反代层挡掉该路径，或要求邀请码
