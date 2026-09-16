@@ -205,6 +205,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 |---|---|
 | `chat` | `/v1/chat/completions`、`/v1/responses`（仅 OpenAI 兼容 / Azure 渠道参与路由）、`/v1/messages`、Gemini `:generateContent` |
 | `embeddings` | `/v1/embeddings`、Gemini `:embedContent` / `:batchEmbedContents` |
+| `images` | `/v1/images/generations`（仅 OpenAI 兼容 / Azure 渠道）。DALL·E 这类响应没有 usage，定价里必须填「按次」；gpt-image-1 按 token 计价的填 token 价并配「默认输出上限」 |
 
 - 默认只有 `chat`。**升级后确实提供向量的渠道必须补上 `embeddings`**，否则该端点会明确回 `404 model_not_found`——
   宁可报错，也不把向量请求送进 chat 上游、再用上游的 404 来发现配错（那时钱已预留、日志已脏、重试已撞三遍）。

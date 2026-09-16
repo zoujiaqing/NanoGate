@@ -86,6 +86,9 @@ class H(BaseHTTPRequestHandler):
                     "model": body.get("model", "?"),
                     "usage": {"prompt_tokens": 7, "total_tokens": 7},
                 }); return
+            if self.path == "/v1/images/generations":
+                # DALL·E 形状：没有 usage，网关只能按次计价
+                self._json(200, {"created": 1, "data": [{"url": "http://127.0.0.1/x.png", "revised_prompt": body.get("prompt", "")}]}); return
             if self.path == "/v1/responses":
                 # Responses API：不认 stream_options（真上游会 400，这里也照样 400 好让网关的注入露馅）
                 if "stream_options" in body:

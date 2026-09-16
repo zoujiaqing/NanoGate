@@ -2600,5 +2600,21 @@ echo "$rss" | grep -q 'response.completed' && [ "$(echo "$rss" | grep -c '"model
 rs2=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1 AND prompt_tokens=1000 AND completion_tokens=500 AND charged=7500" 1)
 [ "$rs2" = "1" ] && pass "流式 usage 取自 response.completed 并入账" || fail "流式 usage_log 行数=$rs2 $(q "SELECT status,error_code,prompt_tokens,completion_tokens FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1")"
 
+# ══ S66 图片生成：images 能力 + 按次计价；没声明能力的渠道不参与 ══
+echo "[S66] /v1/images/generations"
+seed_reset; fake ok 9967; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('c-img','openai_compatible','http://127.0.0.1:9967','default','m-img','chat,images',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-noimg','openai_compatible','http://127.0.0.1:9967','default','m-img2','chat',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-img'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-noimg'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-img','0','0','0','0',20000,'manual',0,0,0),('m-img2','0','0','0','0',20000,'manual',0,0,0);" >/dev/null
+imc=$(curl -s --max-time 15 -o /tmp/nanogate-img.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img","prompt":"a cat","n":1,"size":"1024x1024"}'); imb=$(cat /tmp/nanogate-img.json)
+[ "$imc" = "200" ] && echo "$imb" | grep -q '"url": "http://127.0.0.1/x.png"' \
+  && pass "图片生成 200 透传" || fail "图片生成: HTTP=$imc body=$imb"
+iml=$(wait_rows "SELECT charged||'/'||prompt_tokens||'/'||status FROM gateway_usage_logs WHERE request_model='m-img' LIMIT 1" "20000/0/ok")
+[ "$iml" = "20000/0/ok" ] && pass "按次计价入账 20000 μUSD（无 usage 也不算 0）" || fail "图片 usage_log: $iml"
+imn=$(curl -s --max-time 15 -o /tmp/nanogate-img2.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img2","prompt":"a cat"}')
+[ "$imn" = "404" ] && grep -q 'model_not_found' /tmp/nanogate-img2.json && pass "没声明 images 能力的渠道不参与 → 404 model_not_found" || fail "能力缺失: HTTP=$imn body=$(cat /tmp/nanogate-img2.json)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
