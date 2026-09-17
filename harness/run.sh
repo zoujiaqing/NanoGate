@@ -2686,5 +2686,50 @@ a3ev=$(echo "$a3" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' '
 tl=$(wait_rows "SELECT prompt_tokens||'/'||cache_read_tokens||'/'||completion_tokens FROM gateway_usage_logs WHERE request_model='m-tl' ORDER BY id LIMIT 1" "100/40/20")
 [ "$tl" = "100/40/20" ] && pass "计费仍按上游原生 usage（100 prompt 含 40 缓存）" || fail "跨协议计费: $tl"
 
+# ══ S71 重排序端点：rerank 能力 + usage 只有 total_tokens 时按输入计 ══
+echo "[S71] /v1/rerank"
+seed_reset; fake rerank 9933; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-rr','openai_compatible','http://127.0.0.1:9933','default','m-rr','chat,rerank',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rr'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rr','1','0','0','0',1,'manual',0,0,0);" >/dev/null
+rrc=$(curl -s --max-time 15 -o /tmp/nanogate-rr.json -w "%{http_code}" -X POST "$U/v1/rerank" -H "$AUTH" -H "$CT" -d '{"model":"m-rr","query":"q","documents":["a","b","c"]}')
+[ "$rrc" = "200" ] && grep -q '"relevance_score"' /tmp/nanogate-rr.json && pass "rerank 200 透传" || fail "rerank: HTTP=$rrc $(head -c 200 /tmp/nanogate-rr.json)"
+rrl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||status FROM gateway_usage_logs WHERE request_model='m-rr' LIMIT 1" "77/0/ok")
+[ "$rrl" = "77/0/ok" ] && pass "total_tokens=77 计为输入、状态 ok" || fail "rerank usage_log: $rrl"
+
+# ══ S72 价源同步 + 指标 + 渠道测速落库 ══
+echo "[S72] 价源同步 / metrics / 测速"
+seed_reset; fake ok 9934; sleep 1
+stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NEWGATE_METRICS_TOKEN=mt
+sy=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/sync" -H "Authorization: Bearer $GJWT" -H "$CT")
+sya=$(q "SELECT input_price||'/'||output_price||'/'||default_max_output_tokens||'/'||source FROM gateway_model_prices WHERE model='sync-a'")
+echo "$sy" | grep -q '"created":2' && [ "$sya" = "1.5/6/4096/sync" ] && pass "价源同步：对象形状解析、created=2、source=sync" || fail "价源同步: $sy sync-a=$sya"
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-pr','openai_compatible','http://127.0.0.1:9934','default','m-pr2',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-pr'),'k',1,0,0,0,0);" >/dev/null
+prid=$(q "SELECT id FROM gateway_channels WHERE name='c-pr'")
+curl -s --max-time 15 -o /dev/null -X POST "$U/admin/gateway/channel/probe/$prid" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}'
+prow=$(q "SELECT last_probe_ok||'/'||(last_probe_ms IS NOT NULL)||'/'||(last_probe_at > 0) FROM gateway_channels WHERE id=$prid")
+[ "$prow" = "1/true/true" ] && pass "探测结果落到渠道行（ok/ms/at）" || fail "测速落库: $prow"
+m401=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$U/metrics")
+mb=$(curl -s --max-time 5 "$U/metrics" -H "Authorization: Bearer mt")
+[ "$m401" = "401" ] && echo "$mb" | grep -q '^nanogate_channel_probe_ok{channel="c-pr"' && echo "$mb" | grep -q '^nanogate_settlements_manual_review ' \
+  && pass "/metrics 带 token 才可读，含渠道测速与结算指标" || fail "metrics: noauth=$m401 body=$(echo "$mb" | head -c 300)"
+
+# ══ S73 真实 Claude Code CLI（装了才跑）：完整两轮工具调用经网关打 OpenAI 上游 ══
+if command -v claude >/dev/null 2>&1; then
+echo "[S73] Claude Code CLI"
+seed_reset; fake tools 9935; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-cc','openai_compatible','http://127.0.0.1:9935','default','m-cc',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-cc'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-cc','2.5','10','0.25','0',8192,'manual',0,0,0);" >/dev/null
+ccout=$(cd /tmp && ANTHROPIC_BASE_URL="$U" ANTHROPIC_API_KEY="$TOKEN_PLAINTEXT" CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 120 claude -p "read a.txt" --model m-cc --max-turns 3 --output-format json < /dev/null 2>/dev/null)
+ccv=$(echo "$ccout" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('num_turns'),d.get('stop_reason'),d.get('is_error'),d.get('result'))" 2>/dev/null)
+[ "$ccv" = "2 end_turn False done" ] && pass "Claude Code 两轮（tool_use → tool_result → 文本）经网关跑通" || fail "Claude Code: '$ccv' $(echo "$ccout" | head -c 300)"
+ccn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-cc' AND status='ok'" 2)
+[ "$ccn" = "2" ] && pass "两轮都计费成功" || fail "Claude Code 计费行数=$ccn"
+else
+echo "[S73] Claude Code CLI 未安装，跳过"
+fi
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

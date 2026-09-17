@@ -110,6 +110,8 @@ services:
       # ⚠️ 别填容器内部地址（http://localhost:8800 或 http://newgate:8800）：本地跑得通，
       # 上线后一律回调失败 —— 而失败发生在渠道那一侧，你这边只看到订单一直是待支付。
       NEWGATE_PUBLIC_API_URL: ${PUBLIC_API_URL:-}
+      NEWGATE_PRICE_SYNC_URL: ${PRICE_SYNC_URL:-}
+      NEWGATE_METRICS_TOKEN: ${METRICS_TOKEN:-}
       NEWGATE_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
       NEWGATE_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
       # 有意**不**在这里暴露 NEWGATE_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度

@@ -224,6 +224,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 |---|---|
 | `chat` | `/v1/chat/completions`、`/v1/responses`（仅 OpenAI 兼容 / Azure 渠道参与路由）、`/v1/messages`、Gemini `:generateContent` |
 | `embeddings` | `/v1/embeddings`、Gemini `:embedContent` / `:batchEmbedContents` |
+| `rerank` | `/v1/rerank`（Jina / Cohere 形状，仅 OpenAI 兼容渠道）。上游 usage 只有 `total_tokens` 时全部按输入计价 |
 | `images` | `/v1/images/generations`（仅 OpenAI 兼容 / Azure 渠道）。DALL·E 这类响应没有 usage，定价里必须填「按次」；gpt-image-1 按 token 计价的填 token 价并配「默认输出上限」 |
 
 - 默认只有 `chat`。**升级后确实提供向量的渠道必须补上 `embeddings`**，否则该端点会明确回 `404 model_not_found`——
@@ -280,6 +281,15 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。
 
 ## 可观测性（最小集）
+
+- `GET /metrics`：Prometheus 文本格式，数字从库里现算（与概览页同口径）：按状态的请求总数与近 5 分钟数、
+  收入/成本累计（μUSD）、每条渠道的状态与最近测速、待人工复核与待重放的结算数。默认匿名；设
+  `NEWGATE_METRICS_TOKEN` 后要求 `Authorization: Bearer <token>`。生产请设 token 或在反代层只放行监控网段。
+- 定时任务（后台「定时任务」页可停用/改 cron）：
+  - `gateway-channel-probe`（`*/5 * * * *`）：用渠道自己的 Key 打一条 `max_tokens=1` 的请求，结果写在渠道行
+    （管理台渠道表「测速」列、概览渠道表、`/metrics` 都能看到）。每条渠道每 5 分钟消耗一次最小请求。
+  - `gateway-price-sync`（每天 03:10）：从 `NEWGATE_PRICE_SYNC_URL` 拉价目表导入（格式与管理台批量导入一致），
+    `NEWGATE_PRICE_SYNC_OVERWRITE=false` 则只补新模型。管理台「模型定价 → 同步价源」可立即拉一次。
 
 没有 metrics 端点（框架未引入 Prometheus 之类的依赖，这是下一步）。上线前至少能看这三样：
 

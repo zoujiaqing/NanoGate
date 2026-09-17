@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank
 """
 import json, os, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +32,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # GET /inflight → 当前在途请求数（供 harness 轮询断连后归零）
+        if self.path == "/prices.json":
+            # 价源同步用的价目表（对象形状）
+            self._json(200, {"sync-a": {"input": 1.5, "output": 6, "maxOutput": 4096}, "sync-b": {"inputPrice": "0.2", "outputPrice": "0.8"}})
+            return
         if self.path == "/v1/models":
             # 上游模型清单（渠道「拉取模型」用）；顺带把鉴权头回显，harness 据此断言走的是渠道的 Key
             self._json(200, {"object": "list", "data": [{"id": "m-list-b"}, {"id": "m-list-a"}], "auth": self.headers.get("Authorization")})
@@ -67,6 +71,8 @@ class H(BaseHTTPRequestHandler):
                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
                 }); return
             if MODE == "tools":
+                if os.environ.get("FAKE_DUMP"):
+                    with open(os.environ["FAKE_DUMP"], "a") as fh: fh.write(json.dumps({"headers": dict(self.headers), "body": body}) + "\n")
                 # 工具调用 + reasoning_content：第一轮回 tool_calls；请求里已带 tool 结果则回文本
                 has_result = any(m.get("role") == "tool" for m in body.get("messages", []))
                 if not stream:
@@ -83,6 +89,11 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
                 def w(d):
                     self.wfile.write(f"data: {json.dumps(d)}\n\n".encode()); self.wfile.flush()
+                if has_result:
+                    w({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "checked"}, "finish_reason": None}]})
+                    w({"choices": [{"index": 0, "delta": {"content": "done"}, "finish_reason": "stop"}]})
+                    w({"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 5}})
+                    self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush(); return
                 w({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "need "}, "finish_reason": None}]})
                 w({"choices": [{"index": 0, "delta": {"reasoning_content": "tool"}, "finish_reason": None}]})
                 w({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}]}, "finish_reason": None}]})
@@ -109,6 +120,11 @@ class H(BaseHTTPRequestHandler):
                     "model": body.get("model", "?"),
                     "usage": {"prompt_tokens": 7, "total_tokens": 7},
                 }); return
+            if self.path == "/v1/rerank":
+                # Jina / Cohere 形状：results + usage.total_tokens（没有 prompt/completion 之分）
+                docs = body.get("documents", [])
+                self._json(200, {"model": body.get("model", "?"), "results": [{"index": i, "relevance_score": 0.9 - i * 0.1} for i in range(len(docs))],
+                                 "usage": {"total_tokens": 77}}); return
             if self.path == "/v1/images/generations":
                 # DALL·E 形状：没有 usage，网关只能按次计价
                 self._json(200, {"created": 1, "data": [{"url": "http://127.0.0.1/x.png", "revised_prompt": body.get("prompt", "")}]}); return
