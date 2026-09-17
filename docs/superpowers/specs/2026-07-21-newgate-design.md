@@ -143,11 +143,14 @@ new-api 做得差的点必须做得更好**）：
 `message_delta.usage`（Anthropic）/ `usageMetadata`（Gemini）。不移植 tiktoken。
 额度**预检**用字符数估算，**结算**用上游实际 usage；极少数不回报 usage 的上游按估算计费并在渠道上标记。
 
-### 决策 D：v1 上游渠道类型
+### 决策 D：上游渠道类型
 
 `OpenAI 兼容`（覆盖 OpenAI、DeepSeek、Qwen、Moonshot、智谱、xAI、Groq、OpenRouter、
 SiliconFlow、Ollama、vLLM 等绝大多数）、`Anthropic`、`Gemini`、`Azure OpenAI`
-（ChatCompletions 语义 + 不同 URL/认证头）。Bedrock / Vertex 列入 v1.1。
+（ChatCompletions 语义 + 不同 URL/认证头）。**2026-09 已补 `Bedrock`（SigV4 + event-stream 解帧）与
+`Vertex AI`（服务账号 OAuth；Anthropic 与 Gemini 两个发布者）**。托管上游通过适配器的四个钩子
+（路径 / body / 每请求鉴权头 / 字节流解码）覆盖，协议层复用；细则见
+`Neton/neton-application-module-gateway/docs/upstream-adapters-and-codecs.md`。
 
 **国产厂商接入形态（2026-07 查证）**：兼容模式已是行业标准且是官方推荐路径——不仅全员提供
 OpenAI 兼容端点，DeepSeek（`api.deepseek.com/anthropic`）、智谱 GLM、Qwen、Kimi、MiniMax、
@@ -188,15 +191,23 @@ sk- 令牌格式沿用 `sk-` 前缀 + 48 位随机（客户端配置习惯与 ne
 | `/v1/messages`（Claude 原生） | IR | 透传 | IR |
 | `/v1beta/...:generateContent`（Gemini 原生，含流式） | IR | IR | 透传 |
 | `/v1/embeddings` | 透传 | — | IR（embedContent） |
-| `/v1/responses` | 透传（支持者）/ 降级为 ChatCompletions | v1.1 | v1.1 |
-| `/v1/images/generations` | 透传 | — | v1.1 |
-| `/v1/audio/speech`、`/v1/audio/transcriptions` | 透传 | — | — |
-| `/v1/rerank`（Jina/Cohere 风格，同 new-api） | 透传（rerank 类上游） | — | — |
+| `/v1/responses` | 透传（仅 OpenAI 系上游参与路由） | — | — |
+| `/v1/images/generations` | 透传（按次计价） | — | — |
+| `/v1/audio/speech`（二进制出）、`/v1/audio/transcriptions|translations`（multipart 进） | 透传 | — | — |
+| `/v1/rerank`（Jina/Cohere 风格，同 new-api） | 透传（`total_tokens` 计输入） | — | — |
 | `/v1/models` | 本地生成：返回该令牌可用模型列表 | | |
+
+Bedrock 列同 Anthropic（Anthropic 协议），Vertex 列按发布者同 Anthropic / Gemini。
 
 流式：三种协议的 SSE 事件格式互转由 IR 层承担（Anthropic 的
 message_start/content_block_delta 序列 ↔ OpenAI chunk ↔ Gemini streamGenerateContent）。
 响应中的 model 字段做**反向模型映射**（用户请求什么名字就回什么名字）。
+
+**保真状态（2026-09）**：工具调用（定义 / 调用 / 结果、顺序与合并）、图片（base64 / URL）、
+thinking ↔ `reasoning_content` ↔ Gemini thought、`thinking.adaptive` + `output_config.effort` ↔ `reasoning_effort`、
+缓存用量、mid-conversation system、Gemini 结构化输出 均已双向转换并有单测；
+上游错误体改写成客户端协议形状；真实 Claude Code CLI 经网关打 OpenAI 上游的两轮工具调用是 harness 场景。
+仍有损：`cache_control`（OpenAI 无对应）、Anthropic 服务端工具、Gemini 多候选与 thought signature、OpenAI→Anthropic 的 structured output。
 
 ## 6. 领域模型（module-gateway 表）
 
@@ -275,13 +286,13 @@ UI 组件一律走各自 front-kit（shadcn-ui）；i18n v1 中文优先，英�
 
 ## 10. 部署形态
 
-- 数据库仅支持 **PostgreSQL / MySQL**（不支持 SQLite）。sqlx4k 的 Native 驱动编译期单选，故 PostgreSQL 与
-  MySQL 各为一种构建产物（`-Pneton.database.driver=postgres`（默认）/`=mysql`），分别发布二进制/镜像标签；
-  启动时校验配置库类型与编译驱动一致。SQL 迁移脚本按 `sql/{postgresql,mysql}/` 约定，嵌入方言跟随驱动
-- 单二进制（~10MB scratch 镜像）：生产部署；当前 PostgreSQL 已端到端验证，MySQL 预留待真实 harness 验证
+- 数据库 **只支持 PostgreSQL**（2026-08 决策：用户不用关心数据库，一律 Docker 起 PostgreSQL；MySQL 分支不再维护）。
+  sqlx4k 的 Native 驱动编译期单选（`-Pneton.database.driver=postgres`）；SQL 迁移脚本 `sql/postgresql/` 编译期嵌入
+- 单二进制（Debian slim 运行镜像，带 `curl`/libcurl4 供健康检查与 SMTP）
 - Redis：可选，仅多节点限流/共享计数需要
-- 发布物：GitHub Releases 预编译二进制（linuxX64/arm64、macOS）+ Docker 镜像 + docker-compose（后端 + 前端 + MySQL）
-- 前端独立部署（Next.js standalone），`NETON_BACKEND_URL` 指向后端
+- 端口：后端 `8800`、用户控制台 `8880`、管理台 `8888`（管理台与 API 经 Caddy 同源；本机开发用 Next 重写同源）
+- 发布物：Docker 镜像 + docker-compose（后端 + PostgreSQL + Redis + 两个前端 + Caddy）；`deploy/docker-compose.prod.yml` 叠加 80/443
+- 前端各自镜像（Next.js），控制台经服务端代理打后端（`NETON_BACKEND_URL`），管理台浏览器直连同源 API
 
 ## 11. 测试策略
 
@@ -308,5 +319,17 @@ UI 组件一律走各自 front-kit（shadcn-ui）；i18n v1 中文优先，英�
 1. ~~开源许可与依赖开放~~ **已决策（2026-07-21）**：member / payment 等均为自有项目，
    随 NewGate 一并采用开源许可发布；NewGate 建议 Apache-2.0
 2. new-api 迁移工具范围：只迁渠道/定价，还是含用户（密码 bcrypt 可移植）与额度
-3. Bedrock / Vertex 进 v1.1 的优先级
+3. ~~Bedrock / Vertex 进 v1.1 的优先级~~ 已实现（2026-09）
 4. Realtime WebSocket 代理是否永久排除
+5. 公告、两步验证、审计日志尚未做；`cache_control` 跨协议无对应物
+
+## 14. 交付状态（2026-09）
+
+本节记录设计之外已经落地、且改变了运营方式的能力，细节以 `DEPLOY.md` 与 `HANDOFF.md` 为准：
+
+- 端点：chat / responses / embeddings / images / rerank / audio（speech 二进制出、转写 multipart 透传）/ messages / Gemini。
+- 上游：OpenAI 兼容、Azure、Anthropic、Gemini、Bedrock、Vertex；渠道测试连通、拉取上游模型、5 分钟定时测速。
+- 定价：官方价 / 售价双轨、计价组与用户例外、批量导入、每日价源同步、按 token / 按次 / 按字符。
+- 运营：概览看板（收入 / 成本 / 毛利、每日柱状图、Top 模型与用户、渠道健康）、`/metrics`、结算复核、邮件通道（SMTP 或厂商 HTTP）。
+- 用户：注册 / 登录 / 邮箱找回密码、Key 自助（预算 / 有效期 / 模型范围 / IP）、用量汇总、在线充值、兑换码、接入说明。
+- 验证：harness 170 条断言（含真实 Claude Code CLI、SigV4 重算校验、假 SMTP 完整握手）、模块单测 190+。
