@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio | mail
 """
 import json, os, time, threading, hashlib, hmac, base64, struct, zlib, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +11,7 @@ PORT = int(os.environ.get("PORT", "9990"))
 # 在途请求计数：断连后网关应立即拆掉上游连接，本计数随之归零。
 # 若网关泄漏 producer 协程（仍在读上游），bigstream handler 不会退出，计数停在 >0——据此断言无残留。
 _inflight = 0
+_last_mail = None
 _lock = threading.Lock()
 
 
@@ -32,6 +33,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # GET /inflight → 当前在途请求数（供 harness 轮询断连后归零）
+        if self.path == "/last-mail":
+            self._json(200, _last_mail or {}); return
         if self.path == "/prices.json":
             # 价源同步用的价目表（对象形状）
             self._json(200, {"sync-a": {"input": 1.5, "output": 6, "maxOutput": 4096}, "sync-b": {"inputPrice": "0.2", "outputPrice": "0.8"}})
@@ -51,6 +54,11 @@ class H(BaseHTTPRequestHandler):
         _enter()
         try:
             self._raw_body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if MODE == "mail":
+                # 自定义 HTTP 邮件厂商：记下最后一封（含鉴权头），/last-mail 给 harness 读验证码
+                global _last_mail
+                _last_mail = {"auth": self.headers.get("Authorization"), "path": self.path, "body": json.loads(self._raw_body or b"{}")}
+                self._json(200, {"id": "mail_1"}); return
             if MODE == "audio":
                 self._audio(); return
             body = json.loads(self._raw_body or b"{}")

@@ -289,6 +289,18 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 
 生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。
 
+## 邮件通道
+
+邮件走厂商 HTTP 接口，**不走 SMTP**：本运行时（Kotlin/Native）的 socket 没有 TLS，465/587 都发不出去，
+管理台「邮箱账号」里的 SMTP 字段只是保留位。支持 Resend / SendGrid / Mailgun / Brevo / 自定义 HTTP
+（POST JSON `{from, fromName, to[], subject, text, html}`，`Authorization: Bearer <apiKey>`，可以自己写个
+中转去接任何邮件服务）。管理台「邮箱账号」填发件邮箱、厂商、API Key（Mailgun 还要接口地址）。
+
+用途：控制台「找回密码」（`/forgot-password`，只对绑定过邮箱的账号生效，未知邮箱不发信也不报错）、
+个人资料页「绑定邮箱」、管理台按模板发信。验证码邮件默认文案可被模板 `mail_verification_bind_email` /
+`mail_verification_reset_password` 覆盖（模板正文第一行写 `Subject: …` 作主题，正文含 HTML 标签即按 HTML 发）。
+没配邮箱账号时验证码只落邮件日志（`[DEV] code=…`），方便本地联调。
+
 ## 可观测性（最小集）
 
 - `GET /metrics`：Prometheus 文本格式，数字从库里现算（与概览页同口径）：按状态的请求总数与近 5 分钟数、

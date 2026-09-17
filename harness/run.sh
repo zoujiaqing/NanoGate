@@ -2786,5 +2786,38 @@ trl=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='st
 nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -H "$CT" -d '{"model":"stt-1"}')
 [ "$nomp" = "400" ] && pass "非 multipart 请求 400" || fail "非 multipart: HTTP=$nomp"
 
+# ══ S77 邮件通道：自定义 HTTP 厂商发信；绑定邮箱 → 邮箱找回密码 → 新密码登录；未知邮箱不发也不报错 ══
+echo "[S77] 邮件通道与邮箱找回密码"
+fake mail 9939; sleep 1
+q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
+mac=$(curl -s --max-time 10 -o /tmp/nanogate-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"mail":"noreply@nanogate.test","fromName":"NanoGate","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
+[ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/nanogate-mac.json)"
+rg=$(curl -s --max-time 10 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
+S77T=$(echo "$rg" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['accessToken'])" 2>/dev/null)
+sc=$(curl -s --max-time 10 -o /tmp/nanogate-sec.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"S77@Example.com","scene":"bind_email"}')
+lm=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail")
+code=$(echo "$lm" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
+lmv=$(echo "$lm" | python3 -c "import sys,json;d=json.load(sys.stdin);b=d['body'];print(d['auth'],d['path'],b['from'],b['to'][0],b['subject'])" 2>/dev/null)
+[ "$sc" = "200" ] && [ -n "$code" ] && [ "$lmv" = "Bearer mail-key /send noreply@nanogate.test s77@example.com 验证码" ] \
+  && pass "发码：厂商收到 Bearer 鉴权、发件人、小写归一的收件人与主题，正文含 6 位码" || fail "发码: HTTP=$sc code='$code' mail='$lmv' $(echo "$lm" | head -c 200)"
+bd=$(curl -s --max-time 10 -o /tmp/nanogate-bd.json -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
+em=$(q "SELECT email FROM member_users WHERE username='s77user'")
+[ "$bd" = "200" ] && [ "$em" = "s77@example.com" ] && pass "绑定邮箱落库" || fail "绑定邮箱: HTTP=$bd email=$em $(head -c 200 /tmp/nanogate-bd.json)"
+wrong=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
+[ "$wrong" = "400" ] && pass "验证码一次性：重放被拒" || fail "验证码重放: HTTP=$wrong"
+curl -s --max-time 5 -X POST "http://127.0.0.1:9939/reset" -H "$CT" -d '{}' >/dev/null
+unk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"nobody@example.com","scene":"reset_password"}')
+lm2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json;print(json.load(sys.stdin).get('body',{}).get('to',[''])[0])" 2>/dev/null)
+[ "$unk" = "200" ] && [ "$lm2" != "nobody@example.com" ] && pass "未绑定的邮箱：返回 200 但不发信（不泄露账号存在）" || fail "未知邮箱: HTTP=$unk lastTo=$lm2"
+curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"s77@example.com","scene":"reset_password"}'
+code2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
+rp=$(curl -s --max-time 10 -o /tmp/nanogate-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
+lg=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
+old=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
+[ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/nanogate-rp.json)"
+ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com' AND send_status=0")
+[ "$ml" = "2" ] && pass "两封验证码邮件都进了邮件日志" || fail "邮件日志行=$ml"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
