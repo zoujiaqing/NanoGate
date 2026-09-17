@@ -147,6 +147,8 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   adaptive thinking/effort 都有单测（module-gateway commonTest 180+）与 harness 场景；真实 Claude Code CLI 经网关打
   OpenAI 上游的两轮工具调用是 harness S73（本机装了 claude 才跑）
 - 端点：chat / responses / embeddings / images / rerank / messages / gemini generateContent
+- 上游类型：OpenAI 兼容、Azure OpenAI、Anthropic、Gemini、AWS Bedrock（SigV4 + event-stream 解帧）、
+  Vertex AI（服务账号换 OAuth token；Anthropic 与 Gemini 两个发布者）；harness 的假上游会用同一套算法重算 SigV4 校验真实签名
 - 运维：/metrics（Prometheus）、定时任务 gateway-channel-probe（5 分钟测速）与 gateway-price-sync（每日价源同步）
 - 用户控制台：注册与登录、我的 Key / 用量账单 / 模型广场 / 用户中心 / 充值与流水
   （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值保留给联调），typecheck 通过
@@ -215,7 +217,6 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 **功能缺口：**
 - 音频端点（/v1/audio/*）：框架 HttpClient 的响应体是 String，二进制与 multipart 透传要先改框架
-- Bedrock / Vertex 原生渠道：需要 SigV4（HMAC）与服务账号 RS256 签名；Bedrock 流式还是 AWS event-stream 二进制帧不是 SSE
 - codec 仍有损的部分：Anthropic 的 cache_control 到 OpenAI 上游没有对应物（只能丢）；Gemini 的 thought signature、
   多候选（n>1）不支持；OpenAI structured output 到 Anthropic 没做（Gemini 已做 responseSchema）
 - 告警与审计日志（/metrics 已有，可接 Prometheus 告警规则）

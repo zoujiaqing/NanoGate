@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex
 """
-import json, os, time, threading
+import json, os, time, threading, hashlib, hmac, base64, struct, zlib, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE = os.environ.get("MODE", "ok")
@@ -50,7 +50,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         _enter()
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 2) or "{}")
+            self._raw_body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = json.loads(self._raw_body or b"{}")
             stream = bool(body.get("stream"))
             if MODE == "err500":
                 self._json(500, {"error": "upstream down"}); return
@@ -70,6 +71,10 @@ class H(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
                 }); return
+            if MODE == "bedrock":
+                self._bedrock(body); return
+            if MODE == "vertex":
+                self._vertex(body); return
             if MODE == "tools":
                 if os.environ.get("FAKE_DUMP"):
                     with open(os.environ["FAKE_DUMP"], "a") as fh: fh.write(json.dumps({"headers": dict(self.headers), "body": body}) + "\n")
@@ -166,6 +171,84 @@ class H(BaseHTTPRequestHandler):
         for i in range(3):
             ev("response.output_text.delta", {"type": "response.output_text.delta", "delta": f"t{i} "}); time.sleep(0.1)
         ev("response.completed", {"type": "response.completed", "response": {"id": "resp_1", "model": model, "status": "completed", "usage": usage}})
+
+    # ── Bedrock：校验 SigV4（用已知的 AK/SK 重算签名）+ 路径；非流式回 Anthropic JSON，流式回 event-stream 二进制帧 ──
+    def _sigv4_expected(self, raw_body):
+        ak, sk = "AKIAFAKE", "fakesecret"
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("AWS4-HMAC-SHA256 "): return "missing sigv4: " + auth[:40]
+        parts = dict(kv.strip().split("=", 1) for kv in auth[len("AWS4-HMAC-SHA256 "):].split(","))
+        cred = parts["Credential"]; signed_headers = parts["SignedHeaders"]
+        _, date, region, service, _ = cred.split("/")
+        amz_date = self.headers.get("X-Amz-Date", "")
+        canon_headers = "".join(f"{h}:{' '.join(self.headers.get(h, '').split())}\n" for h in signed_headers.split(";"))
+        path = self.path.split("?")[0]
+        canon_uri = "/".join(seg.replace("%", "%25").replace(":", "%3A") for seg in path.split("/"))
+        payload_hash = hashlib.sha256(raw_body).hexdigest()
+        canonical = "\n".join(["POST", canon_uri, "", canon_headers, signed_headers, payload_hash])
+        scope = f"{date}/{region}/{service}/aws4_request"
+        sts = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+        k = ("AWS4" + sk).encode()
+        for v in (date, region, service, "aws4_request"): k = hmac.new(k, v.encode(), hashlib.sha256).digest()
+        sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+        if parts["Signature"] != sig: return f"bad signature (expected {sig[:12]}…, got {parts['Signature'][:12]}…; canonical={canonical!r})"
+        if not cred.startswith(ak + "/"): return "bad access key"
+        return None
+
+    def _bedrock(self, body):
+        raw = self._raw_body
+        err = self._sigv4_expected(raw)
+        if err: self._json(403, {"message": err}); return
+        if body.get("anthropic_version") != "bedrock-2023-05-31" or "model" in body or "stream" in body:
+            self._json(400, {"message": f"bad body keys: {sorted(body.keys())}"}); return
+        dep = os.environ.get("BEDROCK_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+        want_base = "/model/" + dep.replace(":", "%3A") + "/"
+        if not self.path.startswith(want_base): self._json(404, {"message": f"bad path {self.path}, want {want_base}..."}); return
+        if self.path.endswith("/invoke"):
+            self._json(200, {"id": "msg_b", "type": "message", "role": "assistant", "model": "claude-3-5-sonnet", "content": [{"type": "text", "text": "from bedrock"}],
+                             "stop_reason": "end_turn", "usage": {"input_tokens": 11, "output_tokens": 4}}); return
+        # invoke-with-response-stream：AWS event-stream 帧
+        self.send_response(200); self.send_header("Content-Type", "application/vnd.amazon.eventstream"); self.end_headers()
+        def frame(headers, payload):
+            hb = b""
+            for k, v in headers.items():
+                kb, vb = k.encode(), v.encode(); hb += bytes([len(kb)]) + kb + b"\x07" + struct.pack(">H", len(vb)) + vb
+            total = 12 + len(hb) + len(payload) + 4
+            prelude = struct.pack(">II", total, len(hb))
+            msg = prelude + struct.pack(">I", zlib.crc32(prelude)) + hb + payload
+            return msg + struct.pack(">I", zlib.crc32(msg))
+        def chunk(ev):
+            return frame({":message-type": "event", ":event-type": "chunk", ":content-type": "application/json"},
+                         json.dumps({"bytes": base64.b64encode(json.dumps(ev).encode()).decode()}).encode())
+        events = [
+            {"type": "message_start", "message": {"id": "msg_b", "type": "message", "role": "assistant", "model": "claude-3-5-sonnet", "content": [], "usage": {"input_tokens": 11, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "from "}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "bedrock"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 4}},
+            {"type": "message_stop", "amazon-bedrock-invocationMetrics": {"inputTokenCount": 11, "outputTokenCount": 4}},
+        ]
+        data = b"".join(chunk(e) for e in events)
+        # 故意按奇怪边界切着发，逼解码器处理跨包帧
+        for i in range(0, len(data), 37):
+            self.wfile.write(data[i:i + 37]); self.wfile.flush(); time.sleep(0.01)
+
+    # ── Vertex：Bearer + 路径形状；anthropic 发布者回 Anthropic JSON，google 发布者回 Gemini JSON ──
+    def _vertex(self, body):
+        if self.headers.get("Authorization") != "Bearer vtx-token": self._json(401, {"error": {"message": "bad bearer " + self.headers.get("Authorization", "")}}); return
+        want = "/v1/projects/proj-x/locations/us-east5/publishers/"
+        if not self.path.startswith(want): self._json(404, {"error": {"message": f"bad path {self.path}"}}); return
+        rest = self.path[len(want):]
+        if rest.startswith("anthropic/models/"):
+            if body.get("anthropic_version") != "vertex-2023-10-16" or "model" in body: self._json(400, {"error": {"message": f"bad body keys {sorted(body.keys())}"}}); return
+            if rest.endswith(":rawPredict"):
+                self._json(200, {"id": "msg_v", "type": "message", "role": "assistant", "model": "claude", "content": [{"type": "text", "text": "from vertex"}], "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 2}}); return
+            self._json(400, {"error": {"message": "stream not faked"}}); return
+        if rest.startswith("google/models/") and rest.endswith(":generateContent"):
+            self._json(200, {"candidates": [{"content": {"parts": [{"text": "from vertex gemini"}], "role": "model"}, "finishReason": "STOP", "index": 0}],
+                             "usageMetadata": {"promptTokenCount": 6, "candidatesTokenCount": 3, "totalTokenCount": 9}}); return
+        self._json(404, {"error": {"message": f"unknown publisher path {rest}"}})
 
     def _okstream(self, model):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()

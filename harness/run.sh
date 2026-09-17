@@ -2731,5 +2731,37 @@ else
 echo "[S73] Claude Code CLI 未安装，跳过"
 fi
 
+# ══ S74 AWS Bedrock：SigV4 签名由假上游用同一对 AK/SK 重算校验；非流式 + event-stream 流式；OpenAI 入口跨协议也通 ══
+echo "[S74] Bedrock"
+seed_reset; fake bedrock 9936; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-br','bedrock','http://127.0.0.1:9936','default','claude-br','{\"claude-br\":\"anthropic.claude-3-5-sonnet-20241022-v2:0\"}',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-br'),'AKIAFAKE:fakesecret',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('claude-br','3','15','0','0',4096,'manual',0,0,0);" >/dev/null
+# 假上游的 region 来自主机名；本机是 127.0.0.1，所以给渠道一个可推 region 的 Base URL 做不到 —— 走厂商参数
+q "UPDATE gateway_channels SET provider_config='{\"region\":\"us-east-1\"}' WHERE name='c-br'" >/dev/null
+brc=$(curl -s --max-time 15 -o /tmp/nanogate-br.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+[ "$brc" = "200" ] && grep -q '"from bedrock"' /tmp/nanogate-br.json && pass "Bedrock 非流式：SigV4 通过校验、body 形状正确" || fail "Bedrock 非流式: HTTP=$brc $(head -c 400 /tmp/nanogate-br.json)"
+brs=$(curl -sN --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}')
+brev=$(echo "$brs" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' ')
+[ "$brev" = "message_start content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] && echo "$brs" | grep -q 'bedrock' \
+  && pass "Bedrock 流式：event-stream 二进制帧还原成 Anthropic SSE（跨包切帧）" || fail "Bedrock 流式: '$brev' $(echo "$brs" | head -c 300)"
+bro=$(curl -s --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"claude-br","messages":[{"role":"user","content":"hi"}]}')
+echo "$bro" | grep -q '"content":"from bedrock"' && pass "OpenAI 入口 → Bedrock 跨协议" || fail "OpenAI→Bedrock: $(echo "$bro" | head -c 300)"
+brl=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='claude-br' AND status='ok' AND prompt_tokens=11 AND completion_tokens=4" 3)
+[ "$brl" = "3" ] && pass "三次都按 Anthropic usage 计费（11/4）" || fail "Bedrock 计费行=$brl"
+
+# ══ S75 Vertex AI：Bearer 直用、project/location 走厂商参数；Anthropic 与 Gemini 两个发布者 ══
+echo "[S75] Vertex AI"
+seed_reset; fake vertex 9937; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,provider_config,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('c-va','vertex_anthropic','http://127.0.0.1:9937','default','claude-va','{\"claude-va\":\"claude-sonnet-4@20250514\"}','{\"project\":\"proj-x\",\"location\":\"us-east5\"}',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-vg','vertex_gemini','http://127.0.0.1:9937','default','gemini-vg','{\"gemini-vg\":\"gemini-2.5-pro\"}','{\"project\":\"proj-x\",\"location\":\"us-east5\"}',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-va'),'vtx-token',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-vg'),'vtx-token',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('claude-va','3','15','0','0',4096,'manual',0,0,0),('gemini-vg','1','5','0','0',4096,'manual',0,0,0);" >/dev/null
+vac=$(curl -s --max-time 15 -o /tmp/nanogate-va.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-va","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+[ "$vac" = "200" ] && grep -q '"from vertex"' /tmp/nanogate-va.json && pass "Vertex Anthropic：Bearer + rawPredict 路径 + anthropic_version" || fail "Vertex Anthropic: HTTP=$vac $(head -c 300 /tmp/nanogate-va.json)"
+vgc=$(curl -s --max-time 15 -o /tmp/nanogate-vg.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gemini-vg","messages":[{"role":"user","content":"hi"}]}')
+[ "$vgc" = "200" ] && grep -q '"from vertex gemini"' /tmp/nanogate-vg.json && pass "Vertex Gemini：OpenAI 入口跨协议到 generateContent" || fail "Vertex Gemini: HTTP=$vgc $(head -c 300 /tmp/nanogate-vg.json)"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

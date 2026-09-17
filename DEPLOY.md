@@ -198,7 +198,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 ## 渠道
 
-四种类型：`openai_compatible`、`azure_openai`、`anthropic`、`gemini`。协议转换在网关内完成，
+七种类型：`openai_compatible`、`azure_openai`、`anthropic`、`gemini`、`bedrock`、`vertex_anthropic`、`vertex_gemini`。协议转换在网关内完成，
 客户端用哪种协议进来都能打到任一类型的上游（错误体也会改写成客户端协议的形状，不会把
 OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
@@ -214,6 +214,14 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 - **拉取模型**（同菜单 / `POST /admin/gateway/channel/models/{id}`）：从上游列出模型 id
   （Azure 列的是部署名），确认后**并入**渠道的模型清单 —— 只追加不覆盖，运营挑过的清单不会被冲掉。
   很多 OpenAI 兼容站不实现 `/v1/models`，拉不到就手填。
+- **AWS Bedrock**（类型 `bedrock`，Anthropic 模型）：Base URL 填 `https://bedrock-runtime.<region>.amazonaws.com`
+  （region 从主机名推，也可在厂商参数里写 `{"region":"us-east-1"}`），渠道 Key 填 `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`，
+  模型映射的目标名就是 Bedrock 模型 id（如 `anthropic.claude-sonnet-4-20250514-v1:0`）。请求走 SigV4 签名，
+  流式响应的 AWS event-stream 二进制帧由网关还原成标准 SSE。
+- **Vertex AI**（类型 `vertex_anthropic` / `vertex_gemini`）：Base URL 填 `https://<location>-aiplatform.googleapis.com`，
+  厂商参数必填 `{"project":"<gcp-project>","location":"us-east5"}`，渠道 Key 填服务账号 JSON 整段
+  （网关用它换 OAuth token 并缓存到过期前）或直接填一枚 access token（调试用）。模型映射目标名即
+  发布者模型 id（`claude-sonnet-4@20250514` / `gemini-2.5-pro`）。这三种类型没有模型列表接口，模型清单手填。
 - Base URL 与代理地址写入时做 SSRF 校验，见「上游地址与 SSRF」。
 
 ## 端点能力
