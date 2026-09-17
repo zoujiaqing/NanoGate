@@ -291,10 +291,11 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 
 ## 邮件通道
 
-邮件走厂商 HTTP 接口，**不走 SMTP**：本运行时（Kotlin/Native）的 socket 没有 TLS，465/587 都发不出去，
-管理台「邮箱账号」里的 SMTP 字段只是保留位。支持 Resend / SendGrid / Mailgun / Brevo / 自定义 HTTP
-（POST JSON `{from, fromName, to[], subject, text, html}`，`Authorization: Bearer <apiKey>`，可以自己写个
-中转去接任何邮件服务）。管理台「邮箱账号」填发件邮箱、厂商、API Key（Mailgun 还要接口地址）。
+两种发信方式，管理台「邮箱账号」里选：
+- **SMTP**：任意邮箱（企业邮箱 / QQ / 163 / Gmail 应用密码）。465 选 SSL，587 选 STARTTLS，
+  两者都关是明文（只适合内网中继）。TLS 由 ktor-network-tls 提供，证书按系统信任链校验。
+- **厂商 HTTP 接口**：Resend / SendGrid / Mailgun / Brevo / 自定义 HTTP（POST JSON
+  `{from, fromName, to[], subject, text, html}`，`Authorization: Bearer <apiKey>`）。填发件邮箱、API Key（Mailgun 还要接口地址）。
 
 用途：控制台「找回密码」（`/forgot-password`，只对绑定过邮箱的账号生效，未知邮箱不发信也不报错）、
 个人资料页「绑定邮箱」、管理台按模板发信。验证码邮件默认文案可被模板 `mail_verification_bind_email` /

@@ -2819,5 +2819,23 @@ old=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/
 ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com' AND send_status=0")
 [ "$ml" = "2" ] && pass "两封验证码邮件都进了邮件日志" || fail "邮件日志行=$ml"
 
+# ══ S78 SMTP 发信：假 SMTP 服务器走完整握手；AUTH LOGIN、MIME 头、RFC 2047 主题、base64 正文、验证码可用 ══
+echo "[S78] SMTP 发信"
+rm -f /tmp/nanogate-smtp.json; (PORT=2526 DUMP=/tmp/nanogate-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)); sleep 1
+q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
+smc=$(curl -s --max-time 10 -o /tmp/nanogate-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"mail":"robot@nanogate.test","fromName":"NanoGate 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@nanogate.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
+[ "$smc" = "200" ] && pass "SMTP 邮箱账号创建" || fail "SMTP 账号: HTTP=$smc $(head -c 200 /tmp/nanogate-smc.json)"
+sc8=$(curl -s --max-time 30 -o /tmp/nanogate-sec8.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"s78@example.com","scene":"bind_email"}')
+smv=$(python3 -c "
+import json;d=json.load(open('/tmp/nanogate-smtp.json'))
+print(d['user'],d['password'],d['from'],d['rcpts'][0],d['subject'],d['content_type'],d['has_date'],d['has_message_id'],'NanoGate' in d['from_header'])" 2>/dev/null)
+code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/tmp/nanogate-smtp.json'))['body']).group(0))" 2>/dev/null)
+[ "$sc8" = "200" ] && [ "$smv" = "robot@nanogate.test smtp-pw robot@nanogate.test s78@example.com 验证码 text/plain True True True" ] && [ -n "$code8" ] \
+  && pass "SMTP：AUTH LOGIN 凭据、信封、RFC 2047 中文主题与发件人名、Date/Message-ID、base64 正文含验证码" || fail "SMTP 发信: HTTP=$sc8 parsed='$smv' code='$code8' $(head -c 300 /tmp/nanogate-sec8.json)"
+bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
+em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
+[ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
