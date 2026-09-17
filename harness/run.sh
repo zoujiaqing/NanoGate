@@ -2841,18 +2841,41 @@ bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
+# ══ S80 权限字符串规范（RBAC spec §3）：格式、冻结词汇表、死授权 ══
+echo "[S80] 权限字符串规范"
+# 1) 格式：三段式、全小写、复合词用连字符（§3.1 / §3.3）
+badfmt=$(q "SELECT COALESCE(string_agg(DISTINCT permission, ' '), '') FROM system_menus WHERE permission <> '' AND permission !~ '^[a-z]+:[a-z0-9-]+:[a-z0-9-]+$'")
+[ -z "$badfmt" ] && pass "权限串格式全部合规（三段式 / 小写 / 连字符）" || fail "格式不合规: $badfmt"
+# 2) 冻结词汇表：读一律 query，page/list/detail/overview/menu 不得再出现（§3.4）
+badact=$(q "SELECT COALESCE(string_agg(DISTINCT permission, ' '), '') FROM system_menus WHERE permission ~ ':(page|list|detail|overview|menu)$'")
+[ -z "$badact" ] && pass "动作词合规：读已统一为 query，无 page/list/detail/overview/menu" || fail "动作词偏离: $badact"
+# 3) 死授权：启用菜单里的 permission 必须在后端 @Permission 里存在（§3.5 约束 1）
+#    模块源码路径沿用本 harness 一贯的仓库布局假设（与 gradle 的 ../../Neton 同源）
+MODSRC="$HERE/../../Neton"
+if [ -d "$MODSRC" ]; then
+  for m in system infra member payment platform gateway; do
+    grep -rhoE '@Permission\("[^"]+"\)' "$MODSRC/neton-application-module-$m/src/commonMain/kotlin" 2>/dev/null | sed 's/@Permission("//;s/")//'
+  done | sort -u > /tmp/nanogate-backend-perms.txt
+  q "SELECT DISTINCT permission FROM system_menus WHERE permission <> '' AND status = 1" | sort -u > /tmp/nanogate-menu-perms.txt
+  dead=$(comm -13 /tmp/nanogate-backend-perms.txt /tmp/nanogate-menu-perms.txt | tr '\n' ' ')
+  [ -z "$dead" ] && pass "无死授权：$(wc -l < /tmp/nanogate-menu-perms.txt | tr -d ' ') 个启用菜单权限全部能在后端找到接口" \
+    || fail "死授权（菜单有、后端无，授了也调不通）: $dead"
+else
+  echo "  ⚠️  找不到模块源码目录，跳过死授权检查"
+fi
+
 # ══ S79 管理台信息架构与角色划分（V012）：菜单裁剪、排序、预置角色的真实权限隔离 ══
 echo "[S79] 管理台菜单与预置角色"
 # 1) 菜单：产品核心排第一，无关模块不进树，藏起来的支付回调补上了入口
 top1=$(q "SELECT name FROM system_menus WHERE type=1 AND parent_id=0 AND status=1 ORDER BY sort LIMIT 1")
 gone=$(q "SELECT COUNT(*) FROM system_menus m WHERE m.status=1 AND m.permission IN ('platform:api:list','member:signin:query','pay:withdraw:list','system:message-channel:query','system:social-user:query','infra:file:query')")
-notify=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/notify/index' AND status=1")
+deadpg=$(q "SELECT COUNT(*) FROM system_menus WHERE component IN ('pay/notify/index','pay/app/index') AND status=1")
 leftget=$(q "SELECT COUNT(*) FROM system_menus WHERE permission ~ '^gateway:[a-z_]+:get$'")
 gworder=$(q "SELECT string_agg(path, ',' ORDER BY sort) FROM system_menus WHERE type=2 AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='AI 网关' AND type=1 AND parent_id=0)")
-[ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$notify" = "1" ] && [ "$leftget" = "0" ] \
+[ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$deadpg" = "0" ] && [ "$leftget" = "0" ] \
   && [ "$gworder" = "overview,log,channel,price,token,group,group-override,redemption,settlement" ] \
-  && pass "菜单：AI 网关排第一且内部按使用频率排序，6 类无关页面全部下架，支付回调补了入口，权限动词无 :get 残留" \
-  || fail "菜单: 第一组=$top1 无关页残留=$gone 支付回调=$notify 残留get=$leftget 网关顺序=$gworder"
+  && pass "菜单：AI 网关排第一且内部按使用频率排序，6 类无关页面下架，两个后端 404 的死页面也下架，权限动词无 :get 残留" \
+  || fail "菜单: 第一组=$top1 无关页残留=$gone 死页面残留=$deadpg 残留get=$leftget 网关顺序=$gworder"
 
 # 2) 四个预置角色存在
 roles=$(q "SELECT string_agg(code, ',' ORDER BY sort) FROM system_roles WHERE code<>'super_admin' AND status=1")
