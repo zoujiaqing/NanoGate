@@ -2661,5 +2661,30 @@ lg=$(curl -s --max-time 10 -o /tmp/nanogate-lg.json -w "%{http_code}" -X POST "$
 [ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/nanogate-lg.json \
   && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/nanogate-lg.json)"
 
+# ══ S70 跨协议保真：Anthropic 入口（Claude Code 形状）打 OpenAI 上游的工具调用、thinking、缓存用量、多轮回填 ══
+echo "[S70] Anthropic 入口 ↔ OpenAI 上游：工具调用与 thinking"
+q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+seed_reset; fake tools 9970; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-tools','openai_compatible','http://127.0.0.1:9970','default','m-tl',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-tools'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-tl','2.5','10','0.25','0',5000,'manual',0,0,0);" >/dev/null
+REQ1='{"model":"m-tl","max_tokens":100,"system":[{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"thinking":{"type":"enabled","budget_tokens":2000},"tools":[{"name":"read_file","description":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}},{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"read a.txt"}]}'
+a1=$(curl -s --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "anthropic-version: 2023-06-01" -H "$CT" -d "$REQ1")
+a1v=$(echo "$a1" | python3 -c "
+import sys,json;d=json.load(sys.stdin);b=d['content']
+print(d['stop_reason'], b[0]['type'], b[1]['type'], b[1]['name'], b[1]['input']['path'], b[1]['id'], d['usage']['input_tokens'], d['usage']['cache_read_input_tokens'])" 2>/dev/null)
+[ "$a1v" = "tool_use thinking tool_use read_file a.txt call_1 60 40" ] && pass "非流式：thinking 块 + tool_use 块、stop_reason=tool_use、缓存用量拆分（60 + 40）" || fail "非流式跨协议: '$a1v' body=$(echo "$a1" | head -c 300)"
+REQ2='{"model":"m-tl","max_tokens":100,"tools":[{"name":"read_file","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"read a.txt"},{"role":"assistant","content":[{"type":"thinking","thinking":"need tool","signature":""},{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"text","text":"here"},{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"FILE-BODY"}]}]}]}'
+a2=$(curl -s --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d "$REQ2")
+echo "$a2" | grep -q 'FILE-BODY' && echo "$a2" | grep -q '"stop_reason":"end_turn"' \
+  && pass "第二轮：tool_result 回填成 OpenAI tool 消息并排在文本前，上游读到了结果" || fail "第二轮回填: $(echo "$a2" | head -c 300)"
+a3=$(curl -sN --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d "$(echo "$REQ1" | sed 's/"max_tokens":100/"max_tokens":100,"stream":true/')")
+a3ev=$(echo "$a3" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' ')
+[ "$a3ev" = "message_start content_block_start content_block_delta content_block_delta content_block_delta content_block_stop content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] \
+  && echo "$a3" | grep -q '"thinking_delta"' && echo "$a3" | grep -q '"partial_json"' && echo "$a3" | grep -q '"stop_reason":"tool_use"' && echo "$a3" | grep -q '"cache_read_input_tokens":40' \
+  && pass "流式：thinking 块 → tool_use 块顺序正确、块先关后开、message_delta 带缓存用量" || fail "流式事件序列: '$a3ev' $(echo "$a3" | head -c 400)"
+tl=$(wait_rows "SELECT prompt_tokens||'/'||cache_read_tokens||'/'||completion_tokens FROM gateway_usage_logs WHERE request_model='m-tl' ORDER BY id LIMIT 1" "100/40/20")
+[ "$tl" = "100/40/20" ] && pass "计费仍按上游原生 usage（100 prompt 含 40 缓存）" || fail "跨协议计费: $tl"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

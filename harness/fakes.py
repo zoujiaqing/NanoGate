@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools
 """
 import json, os, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -66,6 +66,29 @@ class H(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
                 }); return
+            if MODE == "tools":
+                # 工具调用 + reasoning_content：第一轮回 tool_calls；请求里已带 tool 结果则回文本
+                has_result = any(m.get("role") == "tool" for m in body.get("messages", []))
+                if not stream:
+                    if has_result:
+                        msg = {"role": "assistant", "content": "done: " + str([m.get("content") for m in body["messages"] if m.get("role") == "tool"]), "reasoning_content": "checked"}
+                        fin = "stop"
+                    else:
+                        msg = {"role": "assistant", "content": None, "reasoning_content": "need tool",
+                               "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]}
+                        fin = "tool_calls"
+                    self._json(200, {"id": "r1", "object": "chat.completion", "model": body.get("model", "?"),
+                                     "choices": [{"index": 0, "message": msg, "finish_reason": fin}],
+                                     "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "prompt_tokens_details": {"cached_tokens": 40}}}); return
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                def w(d):
+                    self.wfile.write(f"data: {json.dumps(d)}\n\n".encode()); self.wfile.flush()
+                w({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "need "}, "finish_reason": None}]})
+                w({"choices": [{"index": 0, "delta": {"reasoning_content": "tool"}, "finish_reason": None}]})
+                w({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}]}, "finish_reason": None}]})
+                w({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"a.txt\"}"}}]}, "finish_reason": "tool_calls"}]})
+                w({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 40}}})
+                self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush(); return
             if MODE == "azure":
                 # Azure OpenAI 形状校验：api-key 头 + /openai/deployments/<dep>/chat/completions?api-version=…
                 # 不满足就 400 并把实际收到的东西回给 harness，断言失败时能直接看到差在哪。
