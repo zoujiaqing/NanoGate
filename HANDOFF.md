@@ -141,8 +141,13 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 
 ### 前端
 
-- 管理台：网关概览（请求/收入/成本/毛利、按日、模型与用户 Top、渠道健康）/ 渠道（含测试连通、
-  拉取上游模型）/ 定价（含批量导入）/ 日志 / 令牌 / 结算复核 / 计价组 / 兑换码页
+- 管理台：网关概览（请求/收入/成本/毛利、按日柱状图、模型与用户 Top、渠道健康与测速）/ 渠道（含测试连通、
+  拉取上游模型、定时测速列）/ 定价（批量导入、价源同步）/ 日志 / 令牌 / 结算复核 / 计价组 / 兑换码页
+- 跨协议保真：Anthropic↔OpenAI↔Gemini 三向的工具调用、图片、thinking/reasoning、缓存用量、mid-conversation system、
+  adaptive thinking/effort 都有单测（module-gateway commonTest 180+）与 harness 场景；真实 Claude Code CLI 经网关打
+  OpenAI 上游的两轮工具调用是 harness S73（本机装了 claude 才跑）
+- 端点：chat / responses / embeddings / images / rerank / messages / gemini generateContent
+- 运维：/metrics（Prometheus）、定时任务 gateway-channel-probe（5 分钟测速）与 gateway-price-sync（每日价源同步）
 - 用户控制台：注册与登录、我的 Key / 用量账单 / 模型广场 / 用户中心 / 充值与流水
   （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值保留给联调），typecheck 通过
 - 两个前端都有 Dockerfile，compose 里与 Caddy 边缘一起起（管理台与 API 同源 8888、控制台 8880）
@@ -209,10 +214,12 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - 充值汇率 `NEWGATE_QUOTA_PER_PRICE_UNIT` 与回调地址要按 DEPLOY.md 配好
 
 **功能缺口：**
-- 扩展端点：Responses / Images / Audio / Rerank
-- codec 有损：thinking / cache_control / 多模态 / structured output
-- 价源自动同步（现在是手工贴价目表批量导入）、渠道测速（现在只有单次连通性探测）
-- 可观测性：有 /health 与结构化结算日志，无 metrics / 告警 / 审计日志
+- 音频端点（/v1/audio/*）：框架 HttpClient 的响应体是 String，二进制与 multipart 透传要先改框架
+- Bedrock / Vertex 原生渠道：需要 SigV4（HMAC）与服务账号 RS256 签名；Bedrock 流式还是 AWS event-stream 二进制帧不是 SSE
+- codec 仍有损的部分：Anthropic 的 cache_control 到 OpenAI 上游没有对应物（只能丢）；Gemini 的 thought signature、
+  多候选（n>1）不支持；OpenAI structured output 到 Anthropic 没做（Gemini 已做 responseSchema）
+- 告警与审计日志（/metrics 已有，可接 Prometheus 告警规则）
+- 控制台：公告、邮箱找回密码（member 只有短信路径）、两步验证
 
 **小残留：**
 - `harness/run.sh` 的 `PGPASS` 默认值还叫 `privchat`（可被环境变量覆盖；应用配置本身已
