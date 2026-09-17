@@ -2763,5 +2763,28 @@ vac=$(curl -s --max-time 15 -o /tmp/nanogate-va.json -w "%{http_code}" -X POST "
 vgc=$(curl -s --max-time 15 -o /tmp/nanogate-vg.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gemini-vg","messages":[{"role":"user","content":"hi"}]}')
 [ "$vgc" = "200" ] && grep -q '"from vertex gemini"' /tmp/nanogate-vg.json && pass "Vertex Gemini：OpenAI 入口跨协议到 generateContent" || fail "Vertex Gemini: HTTP=$vgc $(head -c 300 /tmp/nanogate-vg.json)"
 
+# ══ S76 音频：TTS 二进制原样回 + 按输入字符计费；转写 multipart 原样透传、model 字段改写、text 响应类型保真 ══
+echo "[S76] /v1/audio/*"
+seed_reset; fake audio 9938; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-au','openai_compatible','http://127.0.0.1:9938','default','tts-1,stt-1','{\"stt-1\":\"whisper-up\"}','chat,audio',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-au'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('tts-1','15','0','0','0',NULL,'manual',0,0,0),('stt-1','0','0','0','0',6000,'manual',0,0,0);" >/dev/null
+spc=$(curl -s --max-time 15 -o /tmp/nanogate-tts.bin -w "%{http_code} %{content_type}" -X POST "$U/v1/audio/speech" -H "$AUTH" -H "$CT" -d '{"model":"tts-1","input":"hello world","voice":"alloy"}')
+spsz=$(wc -c < /tmp/nanogate-tts.bin | tr -d ' '); sphead=$(head -c 8 /tmp/nanogate-tts.bin)
+[ "$spc" = "200 audio/mpeg" ] && [ "$sphead" = "ID3AUDIO" ] && [ "$spsz" = "1043" ] \
+  && pass "TTS：二进制 1043 字节与 audio/mpeg 原样回（不经文本解码）" || fail "TTS: $spc size=$spsz head=$sphead"
+spl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||charged||'/'||status FROM gateway_usage_logs WHERE request_model='tts-1' LIMIT 1" "11/0/165/ok")
+[ "$spl" = "11/0/165/ok" ] && pass "TTS 按 11 个输入字符计费（15 USD/百万字符 → 165 μUSD）、状态 ok" || fail "TTS usage_log: $spl"
+head -c 3000 /dev/urandom > /tmp/nanogate-in.wav
+trc=$(curl -s --max-time 15 -o /tmp/nanogate-tr.json -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -F model=stt-1 -F language=zh -F file=@/tmp/nanogate-in.wav)
+[ "$trc" = "200" ] && grep -q '"transcript of nanogate-in.wav (3000 bytes)"' /tmp/nanogate-tr.json && grep -q '"model": "whisper-up"' /tmp/nanogate-tr.json && grep -q '"language": "zh"' /tmp/nanogate-tr.json \
+  && pass "转写：文件字节完整到达、model 改写成 whisper-up、其它字段不动" || fail "转写: HTTP=$trc $(head -c 300 /tmp/nanogate-tr.json)"
+trt=$(curl -s --max-time 15 -w " %{content_type}" -X POST "$U/v1/audio/translations" -H "$AUTH" -F model=stt-1 -F response_format=text -F file=@/tmp/nanogate-in.wav)
+[ "$trt" = "transcript of nanogate-in.wav text/plain; charset=utf-8" ] && pass "response_format=text 时按上游的 text/plain 回" || fail "text 响应: '$trt'"
+trl=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='stt-1' AND charged=6000 AND status='ok'" 2)
+[ "$trl" = "2" ] && pass "两次转写都按次计 6000 μUSD 且 ok" || fail "转写计费行=$trl"
+nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -H "$CT" -d '{"model":"stt-1"}')
+[ "$nomp" = "400" ] && pass "非 multipart 请求 400" || fail "非 multipart: HTTP=$nomp"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

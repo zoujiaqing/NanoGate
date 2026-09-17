@@ -233,6 +233,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 | `chat` | `/v1/chat/completions`、`/v1/responses`（仅 OpenAI 兼容 / Azure 渠道参与路由）、`/v1/messages`、Gemini `:generateContent` |
 | `embeddings` | `/v1/embeddings`、Gemini `:embedContent` / `:batchEmbedContents` |
 | `rerank` | `/v1/rerank`（Jina / Cohere 形状，仅 OpenAI 兼容渠道）。上游 usage 只有 `total_tokens` 时全部按输入计价 |
+| `audio` | `/v1/audio/speech`（JSON 进、音频二进制出，按 `input` 字符数计「输入价」，即每百万字符的价）、`/v1/audio/transcriptions` 与 `/v1/audio/translations`（multipart 原样透传，只改写 `model`；`response_format=text` 时按上游的 text/plain 回）。转写模型上游多半不给 usage，定价填「按次」；gpt-4o-transcribe 这类给 usage 的按 token 计 |
 | `images` | `/v1/images/generations`（仅 OpenAI 兼容 / Azure 渠道）。DALL·E 这类响应没有 usage，定价里必须填「按次」；gpt-image-1 按 token 计价的填 token 价并配「默认输出上限」 |
 
 - 默认只有 `chat`。**升级后确实提供向量的渠道必须补上 `embeddings`**，否则该端点会明确回 `404 model_not_found`——

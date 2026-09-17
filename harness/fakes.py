@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio
 """
 import json, os, time, threading, hashlib, hmac, base64, struct, zlib, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +51,8 @@ class H(BaseHTTPRequestHandler):
         _enter()
         try:
             self._raw_body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if MODE == "audio":
+                self._audio(); return
             body = json.loads(self._raw_body or b"{}")
             stream = bool(body.get("stream"))
             if MODE == "err500":
@@ -171,6 +173,32 @@ class H(BaseHTTPRequestHandler):
         for i in range(3):
             ev("response.output_text.delta", {"type": "response.output_text.delta", "delta": f"t{i} "}); time.sleep(0.1)
         ev("response.completed", {"type": "response.completed", "response": {"id": "resp_1", "model": model, "status": "completed", "usage": usage}})
+
+    # ── 音频：speech 回二进制；transcriptions/translations 解析 multipart，回显 model 与文件大小 ──
+    def _audio(self):
+        raw = self._raw_body
+        if self.path == "/v1/audio/speech":
+            body = json.loads(raw or b"{}")
+            data = b"ID3AUDIO" + bytes(range(256)) * 4 + body.get("input", "").encode()
+            self.send_response(200); self.send_header("Content-Type", "audio/mpeg"); self.send_header("Content-Length", str(len(data))); self.end_headers()
+            self.wfile.write(data); return
+        if self.path in ("/v1/audio/transcriptions", "/v1/audio/translations"):
+            import email, email.policy
+            ct = self.headers.get("Content-Type", "")
+            msg = email.message_from_bytes(b"Content-Type: " + ct.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw, policy=email.policy.HTTP)
+            fields, file_size, file_name = {}, 0, None
+            for part in msg.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                fn = part.get_filename()
+                payload = part.get_payload(decode=True) or b""
+                if fn: file_size, file_name = len(payload), fn
+                else: fields[name] = payload.decode()
+            if not file_name: self._json(400, {"error": {"message": "file part missing"}}); return
+            if fields.get("response_format") == "text":
+                data = f"transcript of {file_name}".encode()
+                self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            self._json(200, {"text": f"transcript of {file_name} ({file_size} bytes)", "model": fields.get("model"), "language": fields.get("language")}); return
+        self._json(404, {"error": {"message": "unknown audio path " + self.path}})
 
     # ── Bedrock：校验 SigV4（用已知的 AK/SK 重算签名）+ 路径；非流式回 Anthropic JSON，流式回 event-stream 二进制帧 ──
     def _sigv4_expected(self, raw_body):
