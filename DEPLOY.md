@@ -293,7 +293,9 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 
 两种发信方式，管理台「邮箱账号」里选：
 - **SMTP**：任意邮箱（企业邮箱 / QQ / 163 / Gmail 应用密码）。465 选 SSL，587 选 STARTTLS，
-  两者都关是明文（只适合内网中继）。TLS 由 ktor-network-tls 提供，证书按系统信任链校验。
+  两者都关是明文（只适合内网中继）。发信走系统 libcurl（macOS 自带；Linux 镜像的 `curl` 包自带
+  libcurl4，构建阶段装 `libcurl4-openssl-dev`），证书按系统信任链校验。Windows 构建没有系统 libcurl，
+  只支持明文 SMTP，请改用厂商 HTTP 接口。
 - **厂商 HTTP 接口**：Resend / SendGrid / Mailgun / Brevo / 自定义 HTTP（POST JSON
   `{from, fromName, to[], subject, text, html}`，`Authorization: Bearer <apiKey>`）。填发件邮箱、API Key（Mailgun 还要接口地址）。
 

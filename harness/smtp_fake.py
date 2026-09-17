@@ -3,7 +3,7 @@
 把最后一封信解析后写成 JSON 到 DUMP 文件，供 harness 断言鉴权、收发件人、主题与正文。
 用法：PORT=2525 DUMP=/tmp/x.json python3 smtp_fake.py
 """
-import base64, email, email.policy, json, os, socketserver
+import base64, email, email.policy, json, os, re, socketserver
 
 PORT = int(os.environ.get("PORT", "2525"))
 DUMP = os.environ.get("DUMP", "/tmp/smtp-fake.json")
@@ -29,10 +29,15 @@ class H(socketserver.StreamRequestHandler):
                 self.w("334 VXNlcm5hbWU6"); user = base64.b64decode(self.line()).decode()
                 self.w("334 UGFzc3dvcmQ6"); pw = base64.b64decode(self.line()).decode()
                 self.w("235 ok")
+            elif u.startswith("AUTH PLAIN"):
+                # libcurl 优先用 PLAIN：一行带 token（或先 334 再发）
+                tok = l[10:].strip() or (self.w("334 ") or self.line())
+                parts = base64.b64decode(tok).decode().split("\x00")
+                user, pw = parts[-2], parts[-1]; self.w("235 ok")
             elif u.startswith("MAIL FROM:"):
-                mail_from = l[10:].strip().strip("<>"); self.w("250 ok")
+                mail_from = re.search(r"<([^>]*)>", l).group(1); self.w("250 ok")
             elif u.startswith("RCPT TO:"):
-                rcpts.append(l[8:].strip().strip("<>")); self.w("250 ok")
+                rcpts.append(re.search(r"<([^>]*)>", l).group(1)); self.w("250 ok")
             elif u == "DATA":
                 self.w("354 go")
                 buf = []

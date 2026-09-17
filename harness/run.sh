@@ -208,6 +208,8 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-fo','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 n=$(curl -sN --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-fo","stream":true,"messages":[]}' | grep -c "^data:")
 [ "$n" -ge 3 ] && pass "流式 dead→live 重试成功（$n data 行）" || fail "流式重试失败（$n data 行）"
+# 这条请求的结算在响应结束后才异步落账；不等它，S3 的 seed_reset 会把它的扣款留给下一个场景的余额断言（偶发 +1500）
+wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-fo'" 1 >/dev/null
 
 # ══ S3 非零断连真实扣款 + producer 无残留 ══
 echo "[S3] 非零断连计费 + producer 无残留"
@@ -2821,7 +2823,9 @@ ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com
 
 # ══ S78 SMTP 发信：假 SMTP 服务器走完整握手；AUTH LOGIN、MIME 头、RFC 2047 主题、base64 正文、验证码可用 ══
 echo "[S78] SMTP 发信"
-rm -f /tmp/nanogate-smtp.json; (PORT=2526 DUMP=/tmp/nanogate-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)); sleep 1
+rm -f /tmp/nanogate-smtp.json
+PORT=2526 DUMP=/tmp/nanogate-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)
+sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 smc=$(curl -s --max-time 10 -o /tmp/nanogate-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"mail":"robot@nanogate.test","fromName":"NanoGate 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@nanogate.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')

@@ -219,7 +219,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - codec 仍有损的部分：Anthropic 的 cache_control 到 OpenAI 上游没有对应物（只能丢）；Gemini 的 thought signature、
   多候选（n>1）不支持；OpenAI structured output 到 Anthropic 没做（Gemini 已做 responseSchema）
 - 告警与审计日志（/metrics 已有，可接 Prometheus 告警规则）
-- 控制台：公告、两步验证；邮箱找回密码已有（SMTP 与厂商 HTTP 接口都支持；SMTP 的 TLS 走 ktor-network-tls）
+- 控制台：公告、两步验证；邮箱找回密码已有（SMTP 与厂商 HTTP 接口都支持；SMTP 走系统 libcurl（cinterop），465/587 的 TLS 已对 QQ/163 实测握手）
 
 **小残留：**
 - `harness/run.sh` 的 `PGPASS` 默认值还叫 `privchat`（可被环境变量覆盖；应用配置本身已
