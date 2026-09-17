@@ -188,14 +188,17 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ok'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-ok','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 seq 1 20 | xargs -P 20 -I{} curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ok","messages":[]}'
-sleep 1
+# 非流式请求先响应再结算（V004 的设计），固定 sleep 在机器忙时会读到中间态：
+# 实测出现过 charged=120000 / debit=127500 / balanceΔ=142500 / quotaUsed=150000 这种四项各停在
+# 不同笔数上的画面 —— 看起来像账务不一致，其实只是还没落完。等 20 行日志到位再读。
+n1=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1" 20 50)
 sc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs WHERE user_id=1")
 sd=$(q "SELECT -COALESCE(SUM(amount),0) FROM gateway_quota_transactions WHERE user_id=1 AND type='consume'")
 bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$sc" = "150000" ] && [ "$sc" = "$sd" ] && [ "$sc" = "$bd" ] && [ "$sc" = "$tu" ] \
   && pass "20 并发 → charged=$sc == debit=$sd == balanceΔ=$bd == quotaUsed=$tu" \
-  || fail "四项不等: charged=$sc debit=$sd balanceΔ=$bd quotaUsed=$tu"
+  || fail "四项不等: charged=$sc debit=$sd balanceΔ=$bd quotaUsed=$tu（日志行数=$n1，期望 20）"
 
 # ══ S2 dead→live 首字节前重试 ══
 echo "[S2] dead→live 故障转移"
@@ -262,7 +265,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    ((SELECT id FROM gateway_channels WHERE name='rv'),'auto',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='rv'),'manual',0,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rv','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 for i in 1 2 3 4 5; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-rv","messages":[]}'; done
-JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/gateway/channel/revive/$(CID rv)" -H "Authorization: Bearer $JWT"
 sa=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID rv) AND api_key='auto'")
 sm=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID rv) AND api_key='manual'")
@@ -389,7 +392,7 @@ q "DELETE FROM gateway_usage_logs; DELETE FROM gateway_quota_transactions;
    UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=7000 WHERE user_id=1;
    UPDATE gateway_tokens SET quota_used=0, quota_reserved=7000 WHERE key_hash='$TOKEN_HASH';
    UPDATE gateway_settlements SET status='FINALIZE_PENDING', lease_owner=NULL, lease_until=0, next_retry_at=0, attempts=0 WHERE settlement_id='$sid';" >/dev/null
-JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 tick=$(curl -s --max-time 15 -X POST "$U/admin/gateway/settlement/tick" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 st=$(q "SELECT status FROM gateway_settlements WHERE settlement_id='$sid'")
 lc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs")
@@ -623,7 +626,7 @@ inv=$(grep -c "margin inversion" "$WORK/logs/all.log" 2>/dev/null)
 # ══ S21 发布闸门：售价低于官方成本 → 拒绝发布（毛利底线）══
 echo "[S21] 毛利闸门（发布期）"
 seed_reset
-JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 low=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"1\"}"}')
 nlow=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate'")
 hi=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"5\",\"output\":\"20\"}"}')
@@ -654,7 +657,7 @@ bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
 [ "$code" = "200" ] && [ "$sc" = "15000" ] && [ "$sco" = "7500" ] && [ "$bd" = "15000" ] && [ "$rs" = "$exp_res" ] \
   && pass "加价率 2.0：收入=${sc}（官方×2）、成本=${sco}（官方轨不变）、预留=${rs}、余额Δ=${bd}" \
   || fail "加价率未生效: code=$code charged=${sc}(期望15000) cost=${sco}(期望7500) 预留=${rs}(期望${exp_res}) balanceΔ=${bd}"
-JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 low=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate2","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"3\"}"}')
 nlow=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate2'")
 hi=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/create" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"model":"m-gate2","inputPrice":"2.5","outputPrice":"10","cacheReadPrice":"0","cacheWritePrice":"0","saleOverride":"{\"input\":\"4\"}"}')
@@ -756,7 +759,7 @@ fi
 # 名字都返回 198.18.0.0/15），所以公网域名用例只区分「放行」与「因解析失败而 fail-closed」，
 # 后者是 DNS 不可用时的预期行为，不计失败。
 echo "[S25] 渠道 SSRF 校验（admin API）"
-JWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 mkch() { curl -s --max-time 10 -o "/tmp/s25-$2-$$" -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" \
   -H "Authorization: Bearer $JWT" -H "$CT" -d "{\"name\":\"s25-$2\",\"type\":\"openai_compatible\",\"baseUrl\":\"$1\"}"; }
 meta=$(mkch "http://169.254.169.254/latest/meta-data" meta)
@@ -789,7 +792,7 @@ fi
 # 与 S1/S17 同一套数，不引入新的计价假设。
 # ════════════════════════════════════════════════════════════════════
 GB=/tmp/s26-body-$$
-GJWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 # /app 与 /admin 共用 JWT 体系（只有 gateway 组走 sk- 令牌，见 GatewaySecurityConfig）
 GID() { q "SELECT id FROM gateway_groups WHERE code='$1'"; }
 relay26() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-grp","messages":[]}'; }
@@ -978,7 +981,7 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 # 重启后重取 JWT（与 :582 / :617 / :700 同一惯例）。后面没有场景了，所以末尾不需要
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
 stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000
-GJWT=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 
 echo "[S31] 在途改会员组映射：按下单时冻结的快照计价"
 # 装配层的 MemberGroupPort 是 `MemberTable.get(userId)?.groupId` —— 每次解析都活读 DB，没缓存。
@@ -1367,7 +1370,7 @@ lo41=$((nowms41 - 3600000)); hi41=$((nowms41 + 600000))
 # 管理端 JWT。重启后旧 token 其实仍然有效（无状态签名、密钥来自配置），但重新登一次能消掉
 # 「401 是因为 token 失效还是因为权限不够」这一整类歧义 —— 下面 S44 正好要断言 401。
 admin_jwt() {
-  curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+  curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" \
     -d '{"username":"admin","password":"admin123"}' \
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null
 }
@@ -1386,7 +1389,9 @@ sms_register() {
   local mobile="$1" invite="${2:-}" code body resp out
   # send-sms-code 与 sms-login 各限 5 次/60s/IP，而隔离 Redis 跨 app 重启存活 ——
   # 本批要注册 6 个用户，不清计数必然撞 429（表现成「注册失败」，会被误判成代码问题）。
-  rkdel "*ngrl:*"
+  # 键名实测是 <keyPrefix>:ratelimit:<controller.method>:IP:<ip>:<window>；这里原先写的是
+  # `*ngrl:*`，一个键都匹配不上 —— 清计数其实一直没发生，全靠 60s 窗口自然过期，机器一忙就漏。
+  rkdel "*ratelimit:*"
   curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-sms-code" -H "$CT" \
     -d "{\"mobile\":\"$mobile\",\"scene\":1}"
   # 键名带 keyPrefix（ngharness），一律通配匹配，不把前缀写死（与 rksum/rkdel 同一约定）。
@@ -1447,7 +1452,7 @@ echo "[S43] 配置额度后：两个角色各恰好一条台账，余额按配�
 # 万一后面还要加场景就会踩到一个谁也说不清的差异。
 stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
   NEWGATE_INVITE_REWARD_INVITER=50000 NEWGATE_INVITE_REWARD_INVITEE=20000
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk43=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
 atok43=no; printf '%s' "$atk43" | grep -q "inviter=50000 invitee=20000" && atok43=yes
 read -r a43 ta43 <<<"$(sms_register '+8615000043001')"
@@ -1498,7 +1503,7 @@ echo "[S45] 额度配置非法：该角色不发奖但必须响，且不连累�
 # 客服按活动口径答复用户，而账上什么都没有 —— 那比不发奖励糟得多。所以非法必须与 0 严格区分。
 stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
   NEWGATE_INVITE_REWARD_INVITER=1e3 NEWGATE_INVITE_REWARD_INVITEE=20000
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk45=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
 atok45=no; printf '%s' "$atk45" | grep -q "inviter=INVALID invitee=20000" && atok45=yes
 mis45a=$(grep -c "invite reward MISCONFIGURED role=inviter" "$WORK/logs/all.log" 2>/dev/null)
@@ -1540,7 +1545,7 @@ echo "[S46] 兑换码管理端要授权，不只是认证：零角色的管理�
 # 而这个场景会绿着放行一个已经谁都用不了的接口。另一半保险在 S36–S39：它们全程用 admin 造码，
 # 补注解若把 super_admin 的 `*:*:*` 通配也挡住，那四个场景会一起红。
 q "INSERT INTO system_users (id, username, password_hash, nickname, status, created_at, updated_at) SELECT 946, 'cs_s46', password_hash, 'S46 客服', 1, 0, 0 FROM system_users WHERE id=1 ON CONFLICT (id) DO NOTHING" >/dev/null
-csjwt=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+csjwt=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" \
   -d '{"username":"cs_s46","password":"admin123"}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 csok46=no; [ -n "$csjwt" ] && csok46=yes
@@ -1555,7 +1560,7 @@ p3=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" \
 sleep 1
 ngen46b=$(q "SELECT COUNT(*) FROM gateway_redemption_codes")
 # 对照：同一个接口、换成 super_admin，必须 200 且真的多出一行。
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 ok46=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":1000,"count":1,"note":"S46 对照"}')
 sleep 1
@@ -1615,7 +1620,7 @@ echo "[S48] 用户级计价例外：管理端能写、写了真的改变计价�
 # 断言后者恰好是前者的 ratio 倍。用比值而不是写死金额：金额取决于模型价与 token 数，
 # 写死期望值会把「定价变了」误报成「例外没生效」（S27 已经因为 normalize 剔尾零踩过一次）。
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 # 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 member_users(1) 的会员组是 S26 留下的
 # 未映射组，基线那一发会变成 403 而不是按 default 计价。关掉它，比较才是干净的两层：例外 vs default。
 seed_reset; fake ok 9948; sleep 1
@@ -1765,7 +1770,7 @@ rm -f "$A1" "$A2" "$A3" "$A4"
 # 所以头号断言不是字符串比对，而是**拿 /page 返回的串真去兑一次**：脱敏被摘掉，这一发就会
 # 200 并且真入账 —— 字符串断言只能证明「看起来脱敏了」，这一条证明「兑不动」。
 echo "[S50] 兑换码列表脱敏：能看列表不等于能兑换"
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 gen50=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":70000,"count":3,"note":"S50 脱敏"}')
 batch50=$(printf '%s' "$gen50" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('batchId',''))" 2>/dev/null)
@@ -1837,10 +1842,10 @@ rm -f "$P50"
 # 块 G 会一起红 —— 那种改法会让撤回在最需要它的场景下失效（误发的额度被用户赶紧花掉就撤不
 # 回来了），而拒绝的理由听起来永远像是谨慎。
 echo "[S51] 额度撤回：真扣钱、幂等、允许转负、非法入参与越权一律挡住"
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 # 零角色主体自建，不沿用 S46 的 csjwt：S51 要能独立成立，不该因为 S46 改了 token 就连带失败。
 q "INSERT INTO system_users (id, username, password_hash, nickname, status, created_at, updated_at) SELECT 951, 'cs_s51', password_hash, 'S51 客服', 1, 0, 0 FROM system_users WHERE id=1 ON CONFLICT (id) DO NOTHING" >/dev/null
-csjwt51=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" \
+csjwt51=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" \
   -d '{"username":"cs_s51","password":"admin123"}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 csrole51=$(q "SELECT COUNT(*) FROM system_user_roles WHERE user_id=951")
@@ -2348,7 +2353,7 @@ print(json.dumps({"appId": "2021000000000056", "privateKey": sys.argv[1], "alipa
 # 副作用可控：S56 是最后一段，而关着它只会让 sandbox_* 一律「不可用的支付通道」，对账任务也因同一个
 # 判据不会去查前面场景留下的沙箱单 —— 全程不发一个外网请求（WAP 下单本身就是页面接口）。
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BASE56" NEWGATE_PAY_RETURN_URL="$RET56"
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at)
      VALUES ('payment','payment.mock.enabled','false','模拟支付模式',0,0)
      ON CONFLICT (setting_key) DO UPDATE SET value='false';
@@ -2386,7 +2391,7 @@ hc56=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U$pb56/nop
 
 # ── 块 C：没配 → 两个参数都不出现，但下单照样成功（留空是退化，不是失败）──
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcC56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plC56=$(jf56 payload)
@@ -2414,7 +2419,7 @@ lie56=no; printf '%s' "$lrC56" | grep -q "pay-order-reconcile" && lie56=yes
 # ── 块 D：写错（漏 scheme）→ 按未配置处理 + ERROR，且只影响那一个变量 ──
 BAD56="pay.nanogate.test"
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BAD56" NEWGATE_PAY_RETURN_URL="$RET56"
-GJWT=$(admin_jwt)
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plD56=$(jf56 payload)
@@ -2657,9 +2662,9 @@ stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=
 
 # ══ S69 控制台自助注册：用户名密码模式必须开着（NanoGate 在 Main.kt 绑定了 MemberAuthPolicy）══
 echo "[S69] 用户名密码注册"
-rg=$(curl -s --max-time 10 -o /tmp/nanogate-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
+rg=$(curl -s --max-time 30 -o /tmp/nanogate-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
   -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/nanogate-reg.json)
-lg=$(curl -s --max-time 10 -o /tmp/nanogate-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
+lg=$(curl -s --max-time 30 -o /tmp/nanogate-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
 [ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/nanogate-lg.json \
   && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/nanogate-lg.json)"
 
@@ -2795,7 +2800,7 @@ q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 mac=$(curl -s --max-time 10 -o /tmp/nanogate-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"mail":"noreply@nanogate.test","fromName":"NanoGate","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
 [ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/nanogate-mac.json)"
-rg=$(curl -s --max-time 10 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
+rg=$(curl -s --max-time 30 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
 S77T=$(echo "$rg" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['accessToken'])" 2>/dev/null)
 sc=$(curl -s --max-time 10 -o /tmp/nanogate-sec.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"S77@Example.com","scene":"bind_email"}')
 lm=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail")
@@ -2815,8 +2820,8 @@ lm2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "impor
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"s77@example.com","scene":"reset_password"}'
 code2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
 rp=$(curl -s --max-time 10 -o /tmp/nanogate-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
-lg=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
-old=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
+lg=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
+old=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
 [ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/nanogate-rp.json)"
 ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com' AND send_status=0")
 [ "$ml" = "2" ] && pass "两封验证码邮件都进了邮件日志" || fail "邮件日志行=$ml"
@@ -2840,6 +2845,28 @@ code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/t
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
+
+# ══ S81 支付渠道后台：充值链路的配置前提（页面此前建不出渠道，且侧栏里没有入口）══
+echo "[S81] 支付渠道后台"
+# 建渠道用的是前端表单现在的字段形状；此前表单第一项是必填的「应用 ID」，而 pay_channels 没有那一列
+pc=$(curl -s --max-time 10 -o /tmp/nanogate-pc.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"code":"s81_alipay","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{}","feeRate":6,"status":1}')
+pcid=$(python3 -c "import json;print(json.load(open('/tmp/nanogate-pc.json')).get('data',''))" 2>/dev/null)
+[ "$pc" = "200" ] && [ -n "$pcid" ] && pass "按前端表单的形状能建出渠道（扁平模型，无 appId）" || fail "建渠道: HTTP=$pc body=$(head -c 200 /tmp/nanogate-pc.json)"
+# 带 appId 必须被拒：这正是旧表单的形状，留着会让人以为还能那么填
+oldshape=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"appId":1,"code":"s81_old","config":"{}"}')
+[ "$oldshape" = "400" ] && pass "旧表单形状（带 appId）被拒 400" || fail "旧形状没被拒: HTTP=$oldshape"
+# 重复编码要给人话，不能是 500
+dup=$(curl -s --max-time 10 -o /tmp/nanogate-dup.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"code":"s81_alipay","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{}"}')
+grep -q "已存在" /tmp/nanogate-dup.json && [ "$dup" != "500" ] \
+  && pass "重复编码给的是人话而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/nanogate-dup.json)"
+# 侧栏里要有入口，且用户端能看到这条渠道
+pcmenu=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/channel/index' AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
+pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $GJWT" | grep -c "s81_alipay")
+[ "$pcmenu" = "1" ] && [ "$pcapp" = "1" ] && pass "支付中心下有「支付渠道」入口，且用户端选渠道时看得到它" \
+  || fail "入口或用户端可见性: 菜单=$pcmenu 用户端命中=$pcapp"
 
 # ══ S80 权限字符串规范（RBAC spec §3）：格式、冻结词汇表、死授权 ══
 echo "[S80] 权限字符串规范"
@@ -2868,14 +2895,24 @@ fi
 echo "[S79] 管理台菜单与预置角色"
 # 1) 菜单：产品核心排第一，无关模块不进树，藏起来的支付回调补上了入口
 top1=$(q "SELECT name FROM system_menus WHERE type=1 AND parent_id=0 AND status=1 ORDER BY sort LIMIT 1")
-gone=$(q "SELECT COUNT(*) FROM system_menus m WHERE m.status=1 AND m.permission IN ('platform:api:list','member:signin:query','pay:withdraw:list','system:message-channel:query','system:social-user:query','infra:file:query')")
+# 按 component 查，不按权限串：权限串会被改名迁移改掉，用它做断言会在「该停的没停」时静默通过
+#（V012 就是这么漏掉转账/提现/冻结的 —— payment V002 先把 :list 改成了 :query）
+gone=$(q "SELECT COUNT(*) FROM system_menus WHERE status=1 AND component IN (
+  'platform/api/index','member/signin/config/index','pay/withdraw/index','pay/transfer/index',
+  'pay/wallet/freeze/index','system/social/user/index','infra/file/index')")
+# 「消息中心」与「短信管理」指向同一批 component，只能按权限串区分（保留短信、下架消息中心）
+msgctr=$(q "SELECT COUNT(*) FROM system_menus WHERE status=1 AND permission LIKE 'system:message-%'")
 deadpg=$(q "SELECT COUNT(*) FROM system_menus WHERE component IN ('pay/notify/index','pay/app/index') AND status=1")
 leftget=$(q "SELECT COUNT(*) FROM system_menus WHERE permission ~ '^gateway:[a-z_]+:get$'")
 gworder=$(q "SELECT string_agg(path, ',' ORDER BY sort) FROM system_menus WHERE type=2 AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='AI 网关' AND type=1 AND parent_id=0)")
-[ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$deadpg" = "0" ] && [ "$leftget" = "0" ] \
+# 钱包两页必须挂在支付中心底下（V012 的挪动曾因改名而落空，把它们埋在停用目录里）
+wallet=$(q "SELECT COUNT(*) FROM system_menus WHERE status=1 AND component IN ('pay/wallet/balance/index','pay/wallet/rechargePackage/index') AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
+# 授权行不得指向已停用的菜单：留着不越权，但会让角色管理页面勾着一堆看不见的东西
+ghost=$(q "SELECT COUNT(*) FROM system_role_menus rm JOIN system_menus m ON m.id=rm.menu_id JOIN system_roles r ON r.id=rm.role_id WHERE m.status=0 AND r.code <> 'super_admin'")
+[ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$msgctr" = "0" ] && [ "$deadpg" = "0" ] && [ "$leftget" = "0" ] && [ "$wallet" = "2" ] && [ "$ghost" = "0" ] \
   && [ "$gworder" = "overview,log,channel,price,token,group,group-override,redemption,settlement" ] \
   && pass "菜单：AI 网关排第一且内部按使用频率排序，6 类无关页面下架，两个后端 404 的死页面也下架，权限动词无 :get 残留" \
-  || fail "菜单: 第一组=$top1 无关页残留=$gone 死页面残留=$deadpg 残留get=$leftget 网关顺序=$gworder"
+  || fail "菜单: 第一组=$top1 无关页残留=$gone 消息中心残留=$msgctr 死页面残留=$deadpg 残留get=$leftget 钱包页归位=$wallet 幽灵授权=$ghost 网关顺序=$gworder"
 
 # 2) 四个预置角色存在
 roles=$(q "SELECT string_agg(code, ',' ORDER BY sort) FROM system_roles WHERE code<>'super_admin' AND status=1")
@@ -2884,11 +2921,11 @@ roles=$(q "SELECT string_agg(code, ',' ORDER BY sort) FROM system_roles WHERE co
 # 3) 端到端：建真实用户 → 绑客服角色 → 登录 → 权限计算链路
 #    这里不查 SQL 而是走 /get-permission-info，因为要验的正是「角色 → 菜单 → 权限」这条链路本身
 for rc in support finance gateway_ops; do
-  uc=$(curl -s --max-time 10 -o /tmp/ng-u-$rc.json -w "%{http_code}" -X POST "$U/admin/system/user/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  uc=$(curl -s --max-time 30 -o /tmp/ng-u-$rc.json -w "%{http_code}" -X POST "$U/admin/system/user/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
     -d "{\"username\":\"s79$rc\",\"password\":\"s79pass123\",\"nickname\":\"S79 $rc\"}")
   uid=$(python3 -c "import sys,json;print(json.load(open('/tmp/ng-u-$rc.json')).get('data',''))" 2>/dev/null)
   q "INSERT INTO system_user_roles (user_id, role_id, created_at) SELECT $uid, id, 0 FROM system_roles WHERE code='$rc'" >/dev/null
-  jwt=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d "{\"username\":\"s79$rc\",\"password\":\"s79pass123\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+  jwt=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d "{\"username\":\"s79$rc\",\"password\":\"s79pass123\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
   curl -s --max-time 10 "$U/admin/system/auth/get-permission-info" -H "Authorization: Bearer $jwt" -o /tmp/ng-pi-$rc.json
   eval "JWT_$rc=\$jwt"
   [ "$uc" = "200" ] && [ -n "$jwt" ] || fail "S79 建 $rc 用户失败: HTTP=$uc uid=$uid"
@@ -2899,6 +2936,9 @@ sup_ok=$(has support gateway:quota:grant); sup_no=$(has support gateway:channel:
 [ "$sup_ok" = "yes" ] && [ "$sup_no" = "no" ] && [ "$sup_menu" = "AI 网关,会员中心,支付中心" ] \
   && pass "客服：能发放额度（客诉补偿），改不了上游渠道；侧栏只有三组业务菜单" \
   || fail "客服权限: 发额度=$sup_ok 改渠道=$sup_no 菜单=$sup_menu"
+fin_pay=$(has finance pay:channel:create); fin_order=$(has finance pay:order:query)
+[ "$fin_pay" = "yes" ] && [ "$fin_order" = "yes" ] \
+  && pass "财务拿得到收款通道与支付订单（充值链路的配置前提）" || fail "财务缺支付权限: 建渠道=$fin_pay 查订单=$fin_order"
 fin_ok=$(has finance gateway:price:update); fin_no=$(has finance gateway:channel:update)
 ops_ok=$(has gateway_ops gateway:channel:update); ops_no=$(has gateway_ops gateway:price:update)
 [ "$fin_ok" = "yes" ] && [ "$fin_no" = "no" ] && [ "$ops_ok" = "yes" ] && [ "$ops_no" = "no" ] \
