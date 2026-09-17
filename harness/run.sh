@@ -2841,5 +2841,54 @@ bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
+# ══ S79 管理台信息架构与角色划分（V012）：菜单裁剪、排序、预置角色的真实权限隔离 ══
+echo "[S79] 管理台菜单与预置角色"
+# 1) 菜单：产品核心排第一，无关模块不进树，藏起来的支付回调补上了入口
+top1=$(q "SELECT name FROM system_menus WHERE type=1 AND parent_id=0 AND status=1 ORDER BY sort LIMIT 1")
+gone=$(q "SELECT COUNT(*) FROM system_menus m WHERE m.status=1 AND m.permission IN ('platform:api:list','member:signin:query','pay:withdraw:list','system:message-channel:query','system:social-user:query','infra:file:query')")
+notify=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/notify/index' AND status=1")
+leftget=$(q "SELECT COUNT(*) FROM system_menus WHERE permission ~ '^gateway:[a-z_]+:get$'")
+gworder=$(q "SELECT string_agg(path, ',' ORDER BY sort) FROM system_menus WHERE type=2 AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='AI 网关' AND type=1 AND parent_id=0)")
+[ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$notify" = "1" ] && [ "$leftget" = "0" ] \
+  && [ "$gworder" = "overview,log,channel,price,token,group,group-override,redemption,settlement" ] \
+  && pass "菜单：AI 网关排第一且内部按使用频率排序，6 类无关页面全部下架，支付回调补了入口，权限动词无 :get 残留" \
+  || fail "菜单: 第一组=$top1 无关页残留=$gone 支付回调=$notify 残留get=$leftget 网关顺序=$gworder"
+
+# 2) 四个预置角色存在
+roles=$(q "SELECT string_agg(code, ',' ORDER BY sort) FROM system_roles WHERE code<>'super_admin' AND status=1")
+[ "$roles" = "gateway_ops,finance,support,readonly" ] && pass "预置四个角色（网关运营 / 财务 / 客服 / 只读）" || fail "预置角色: $roles"
+
+# 3) 端到端：建真实用户 → 绑客服角色 → 登录 → 权限计算链路
+#    这里不查 SQL 而是走 /get-permission-info，因为要验的正是「角色 → 菜单 → 权限」这条链路本身
+for rc in support finance gateway_ops; do
+  uc=$(curl -s --max-time 10 -o /tmp/ng-u-$rc.json -w "%{http_code}" -X POST "$U/admin/system/user/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+    -d "{\"username\":\"s79$rc\",\"password\":\"s79pass123\",\"nickname\":\"S79 $rc\"}")
+  uid=$(python3 -c "import sys,json;print(json.load(open('/tmp/ng-u-$rc.json')).get('data',''))" 2>/dev/null)
+  q "INSERT INTO system_user_roles (user_id, role_id, created_at) SELECT $uid, id, 0 FROM system_roles WHERE code='$rc'" >/dev/null
+  jwt=$(curl -s --max-time 10 -X POST "$U/admin/system/auth/login" -H "$CT" -d "{\"username\":\"s79$rc\",\"password\":\"s79pass123\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+  curl -s --max-time 10 "$U/admin/system/auth/get-permission-info" -H "Authorization: Bearer $jwt" -o /tmp/ng-pi-$rc.json
+  eval "JWT_$rc=\$jwt"
+  [ "$uc" = "200" ] && [ -n "$jwt" ] || fail "S79 建 $rc 用户失败: HTTP=$uc uid=$uid"
+done
+has() { python3 -c "import sys,json;print('yes' if '$2' in json.load(open('/tmp/ng-pi-$1.json'))['data']['permissions'] else 'no')" 2>/dev/null; }
+menus() { python3 -c "import sys,json;print(','.join(m['name'] for m in json.load(open('/tmp/ng-pi-$1.json'))['data']['menus']))" 2>/dev/null; }
+sup_ok=$(has support gateway:quota:grant); sup_no=$(has support gateway:channel:update); sup_menu=$(menus support)
+[ "$sup_ok" = "yes" ] && [ "$sup_no" = "no" ] && [ "$sup_menu" = "AI 网关,会员中心,支付中心" ] \
+  && pass "客服：能发放额度（客诉补偿），改不了上游渠道；侧栏只有三组业务菜单" \
+  || fail "客服权限: 发额度=$sup_ok 改渠道=$sup_no 菜单=$sup_menu"
+fin_ok=$(has finance gateway:price:update); fin_no=$(has finance gateway:channel:update)
+ops_ok=$(has gateway_ops gateway:channel:update); ops_no=$(has gateway_ops gateway:price:update)
+[ "$fin_ok" = "yes" ] && [ "$fin_no" = "no" ] && [ "$ops_ok" = "yes" ] && [ "$ops_no" = "no" ] \
+  && pass "财务与运营互不越界：财务改价不改渠道，运营改渠道不改价" \
+  || fail "职责隔离: 财务(改价=$fin_ok 改渠道=$fin_no) 运营(改渠道=$ops_ok 改价=$ops_no)"
+
+# 4) 负向：权限不是只在前端藏按钮，后端必须真拦
+deny=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $JWT_support" -H "$CT" \
+  -d '{"name":"s79-should-fail","type":"openai_compatible","baseUrl":"http://127.0.0.1:1","keys":["k"]}')
+allow=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X GET "$U/admin/gateway/usage-log/page?pageNo=1&pageSize=1" -H "Authorization: Bearer $JWT_support")
+created=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s79-should-fail'")
+[ "$deny" != "200" ] && [ "$created" = "0" ] && pass "后端真拦：客服建渠道被拒（HTTP=${deny}），库里没有多出渠道行" \
+  || fail "越权没拦住: 建渠道 HTTP=$deny 库里行数=$created（查日志 HTTP=$allow）"
+
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

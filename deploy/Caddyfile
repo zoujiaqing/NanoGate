@@ -16,9 +16,9 @@
 
 	# 后端路由组的挂载点（newgate/application/config/routing.conf）：
 	#   admin → /admin   app → /app   manage → /manage   open → /platform   gateway → 根（/v1、/v1beta）
-	# /platform 下管理台自己有 /platform/api、/platform/log 等 6 个页面，后端在该前缀下只有 /platform/order，
-	# 因此只精确放行 /platform/order*，其余 /platform/* 留给管理台页面。
-	@backend path /admin/* /app/* /manage/* /platform/order /platform/order/* /v1/* /v1beta/*
+	# 管理台不再装配 front-platform（开放平台与 AI 网关职责重叠），/platform 下已无前端页面，
+	# 整个前缀交给后端（它在该前缀下提供 open 路由组）。
+	@backend path /admin/* /app/* /manage/* /platform/* /v1/* /v1beta/*
 	handle @backend {
 		reverse_proxy newgate:8800 {
 			# SSE 流式响应：禁止代理缓冲，否则整段攒完一次性吐出（DEPLOY.md「反向代理」）

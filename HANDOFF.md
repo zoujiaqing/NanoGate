@@ -219,6 +219,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
 - codec 仍有损的部分：Anthropic 的 cache_control 到 OpenAI 上游没有对应物（只能丢）；Gemini 的 thought signature、
   多候选（n>1）不支持；OpenAI structured output 到 Anthropic 没做（Gemini 已做 responseSchema）
 - 告警与审计日志（/metrics 已有，可接 Prometheus 告警规则）
+- 管理台信息架构已按本产品裁剪（38 页，AI 网关第一组）并预置四个角色，见 DEPLOY.md「管理台角色与菜单」
 - 控制台：公告、两步验证；邮箱找回密码已有（SMTP 与厂商 HTTP 接口都支持；SMTP 走系统 libcurl（cinterop），465/587 的 TLS 已对 QQ/163 实测握手）
 
 **小残留：**
