@@ -2846,6 +2846,31 @@ bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
+# ══ S83 个人中心：只能改自己的展示字段；改密码必须验旧密码 ══
+echo "[S83] 个人资料与修改密码"
+pget() { curl -s --max-time 10 "$U/admin/system/user/profile/get" -H "Authorization: Bearer $GJWT" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('nickname'),d.get('deptId'),d.get('status'),sep='|')" 2>/dev/null; }
+IFS='|' read -r nick0 dept0 st0 <<< "$(pget)"
+# 夹带 deptId / status：部门决定数据权限，自己改部门就是越权
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"nickname":"S83 Admin","deptId":999999,"status":0}'
+IFS='|' read -r nick1 dept1 st1 <<< "$(pget)"
+[ "$dept1" = "$dept0" ] && [ "$st1" = "$st0" ] && pass "资料接口改不了自己的部门和状态（部门=$dept1 状态=${st1}）" \
+  || fail "越权字段生效了: 部门 ${dept0}→$dept1 状态 ${st0}→$st1"
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"nickname":"S83 Admin"}'
+IFS='|' read -r nick2 _ _ <<< "$(pget)"
+[ "$nick2" = "S83 Admin" ] && pass "昵称能改" || fail "昵称没改成: $nick2"
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"nickname\":\"$nick0\"}"
+pw() { curl -s --max-time 10 -o /tmp/nanogate-pw.json -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"oldPassword\":\"$1\",\"newPassword\":\"$2\"}"; }
+nopw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"newPassword":"s83-new-pass"}')
+wrong=$(pw "not-my-password" "s83-new-pass")
+[ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "当前密码不正确" /tmp/nanogate-pw.json \
+  && pass "改密码：不带旧密码 400，旧密码错误 400（当前密码不正确）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/nanogate-pw.json)"
+ok1=$(pw "admin123" "s83-new-pass")
+newlogin=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"s83-new-pass"}' | grep -c accessToken)
+ok2=$(pw "s83-new-pass" "admin123")
+[ "$ok1" = "200" ] && [ "$newlogin" = "1" ] && [ "$ok2" = "200" ] && pass "旧密码正确能改，新密码能登录，已改回" \
+  || fail "改密码: 改=$ok1 新密码登录=$newlogin 改回=$ok2"
+
 # ══ S82 站点品牌：后台「配置管理」里改名，用户端匿名读到（登录页在登录前就要显示产品名）══
 echo "[S82] 站点品牌配置"
 site() { curl -s --max-time 10 "$U/admin/system/site/public" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('name',''),'|',d.get('tagline',''))" 2>/dev/null; }
