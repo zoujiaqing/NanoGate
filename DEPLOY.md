@@ -412,6 +412,29 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 - 别把网关和其他项目混在同一个 db 里再做 `flushdb`：harness 就是因此自带一个隔离实例
   （独立端口 + 独立 db + 独立 `keyPrefix` + 关持久化）。
 
+## 裸机部署（不用 Docker）
+
+首尔生产机就是这么装的（Rocky Linux 10，2C/4G）。要点：
+
+- **后端在 macOS 上交叉编译**：机器太小跑不动 Kotlin/Native。装好 `messense/macos-cross-toolchains`
+  的 `x86_64-unknown-linux-gnu` 后，从目标机拷一份 `/usr/lib64/libcurl.so.4` 到本地目录并建
+  `libcurl.so` 软链，再
+  `./gradlew :application:linkReleaseExecutableLinuxX64 -Pnewgate.linuxX64.libDir=<该目录绝对路径>`
+  （或环境变量 `NEWGATE_LINUX_X64_LIBDIR`）。头文件仓里已 vendor，只缺链接用的 so。
+- **运行时依赖**：EL10 要装 `libxcrypt-compat`（二进制链的是 `libcrypt.so.1`），否则启动即
+  `libcrypt.so.1 => not found`。`ldd nanogate | grep "not found"` 应为空。
+- **前端在目标机构建**：Node 24 + pnpm 11.20，按 Dockerfile 的布局把 `Neton/` 与 `NewGate/` 两层
+  放到同一父目录下 `pnpm install --frozen-lockfile && pnpm --filter … build`；4G 内存要加 swap。
+  构建产物目录可整体拷走（node_modules 里没有指出仓库的软链）。用 `next start -H 127.0.0.1` 起。
+- **边缘**：Caddy 按域名分流——管理台域名下把 `/admin/* /app/* /manage/* /platform/*` 转后端（同源，
+  理由见上节），控制台域名整站转控制台，API 域名只放行 `/v1/* /v1beta/* /health
+  /app/pay/channel-notify/*`、其余 404。后端设 `NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1`。
+- **后端监听地址**：框架目前写死监听 `0.0.0.0`（`server.host` 不生效），8800 与 Next 的端口要靠
+  防火墙挡。腾讯云这类机器上已有主机安全写的 iptables 规则，**别用 `nftables.service`**——它的
+  stop/reload 会 `flush ruleset` 把别人的规则一起清掉；单独建一张 `inet` 表、用只增删这张表的
+  oneshot 单元加载。
+- **迁移**：systemd 单元里 `ExecStartPre=… migrate up`，迁移失败服务就不启动。
+
 ## 升级
 
 ```bash
