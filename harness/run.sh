@@ -1978,7 +1978,7 @@ case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
 # 里、「页面有入口」记在 app 的 nav 里，两套文件谁都不检查对方。这与 S49 要抓的洞同构：
 # 能力本身存在，授予它的那根接线断了，而断掉是静默的。
 # 三处静默失配各钉一道：
-# ① 已装配页面 → nav 里有条目（漏了就是只能手敲 URL 的隐形页）；
+# ① 已装配页面 → nav 或 consoleSubPages 里有条目（漏了就是只能手敲 URL 的隐形页）；
 # ② nav 条目 → 页面真存在（漏了就是点进去 404 的死链接：页面被删而 nav 忘了跟着改）；
 # ③ icon 名 → app-shell 的 iconMap 里真有这个键。NavItem.icon 的类型是 string|null，写错任何串
 #    typecheck 都放行，resolveIcon 静默回落 CircleDot —— 图标错了不报错，只是侧栏长得不对。
@@ -2010,7 +2010,7 @@ if [ -f "$CONSOLE52/package.json" ] && [ -f "$NAV52" ] && [ -f "$SHELL52" ]; the
   hide=$(comm -23 "$B2" "$B3" | tr '\n' ' '); nhide=$(comm -23 "$B2" "$B3" | wc -l | tr -d ' ')
   dead=$(comm -13 "$B2" "$B3" | tr '\n' ' '); ndead=$(comm -13 "$B2" "$B3" | wc -l | tr -d ' ')
   [ "$nhide" = "0" ] && [ "$np52" -ge 5 ] \
-    && pass "每个已装配页面都有侧栏入口（${nm52} 个 client 模块 → ${np52} 个页面 vs nav ${nn52} 条，隐形页 0）" \
+    && pass "每个已装配页面都有入口（${nm52} 个 client 模块 → ${np52} 个页面 vs 侧栏 + 二级页 ${nn52} 条，隐形页 0）" \
     || fail "隐形页 ${nhide} 个（路由与组件都在、typecheck 也绿，用户却只能手敲 URL 进去）: ${hide} | 页面=${np52}(期望>=5：gateway 3 页 + member 1 页 + payment 1 页) nav=${nn52}"
   [ "$ndead" = "0" ] \
     && pass "每条侧栏入口都指向真页面（悬空 0）" \
@@ -2845,6 +2845,29 @@ code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/t
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
+
+# ══ S84 会员个人资料：响应不带密码哈希；昵称 / 设密码 / 换绑手机走各自的接口 ══
+echo "[S84] 会员个人资料与安全设置"
+read -r m84 t84 <<<"$(sms_register '+8615000084001')"
+mget() { curl -s --max-time 10 "$U/app/member/user/get" -H "Authorization: Bearer $t84"; }
+leak=$(mget | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(','.join(k for k in ('password','sessionVersion','currentDeviceId','deleted') if k in d) or 'none', d.get('hasPassword'))" 2>/dev/null)
+[ "$leak" = "none False" ] && pass "资料接口不再带出密码哈希与会话内部字段，并给出 hasPassword=false（短信注册的账号）" \
+  || fail "资料接口: 泄露字段/hasPassword=${leak}（会员 ${m84}）"
+nk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-nickname" -H "Authorization: Bearer $t84" -H "$CT" -d '{"nickname":"S84 会员"}')
+nkv=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('nickname'))" 2>/dev/null)
+[ "$nk" = "200" ] && [ "$nkv" = "S84 会员" ] && pass "改昵称走 update-nickname（页面原来调的 /update 并不存在）" || fail "改昵称: HTTP=$nk 读到=$nkv"
+setpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"","newPassword":"s84-pass-123"}')
+haspw=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('hasPassword'))" 2>/dev/null)
+wrongpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"nope-nope","newPassword":"s84-pass-456"}')
+[ "$setpw" = "200" ] && [ "$haspw" = "True" ] && [ "$wrongpw" = "400" ] \
+  && pass "无密码账号可直接设密码，之后 hasPassword=true，再改必须验旧密码" || fail "设密码: 设=$setpw hasPassword=$haspw 错旧密码=$wrongpw"
+rkdel "*ratelimit:*"
+curl -s --max-time 10 -o /dev/null -X POST "$U/app/member/user/send-sms-code" -H "Authorization: Bearer $t84" -H "$CT" -d '{"mobile":"+8615000084002","scene":2}'
+mc84=$(rc get "$(rc --scan --pattern "*sms:code:+8615000084002" | head -1)")
+um=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-mobile" -H "Authorization: Bearer $t84" -H "$CT" -d "{\"mobile\":\"+8615000084002\",\"smsCode\":\"$mc84\"}")
+newm=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('mobile'))" 2>/dev/null)
+[ -n "$mc84" ] && [ "$um" = "200" ] && [ "$newm" = "+8615000084002" ] && pass "换绑手机：验证码发到新号码，填对后生效" \
+  || fail "换绑手机: 验证码=${mc84:-无} HTTP=$um 当前手机=$newm"
 
 # ══ S83 个人中心：只能改自己的展示字段；改密码必须验旧密码 ══
 echo "[S83] 个人资料与修改密码"
