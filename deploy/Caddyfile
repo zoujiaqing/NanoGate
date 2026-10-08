@@ -1,4 +1,4 @@
-# NanoGate 边缘反向代理（docker compose 内的 caddy 服务加载）。
+# NetonAPI 边缘反向代理（docker compose 内的 caddy 服务加载）。
 #
 # 为什么必须有这一层：管理台在浏览器里**直连**后端并靠 cookie 认证（credentials: include），
 # 而后端 CORS 硬编码 allowedOrigins=* 且 allowCredentials=false —— 跨源时浏览器根本不会带 cookie，

@@ -1,4 +1,4 @@
-# NanoGate 部署
+# NetonAPI 部署
 
 单机 Docker 部署。PostgreSQL 与 Redis 都在 compose 内，不需要另外准备数据库。
 （产品曾用名 NewGate；下文目录名 `NewGate/`、`newgate/` 为本地布局名，暂不随改名变动。）
@@ -19,7 +19,7 @@ projects/
 │   ├── neton-application-module-member/
 │   ├── neton-application-module-payment/
 │   ├── neton-application-module-platform/
-│   ├── neton-application-module-gateway/   # NanoGate 的核心模块
+│   ├── neton-application-module-gateway/   # NetonAPI 的核心模块
 │   ├── neton-application-front/            # 管理台基础包（前端镜像需要）
 │   ├── neton-application-front-{system,infra,member,payment,platform,gateway}/
 │   └── neton-application-client-{gateway,member,payment}/   # 控制台模块

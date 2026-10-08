@@ -1,9 +1,9 @@
-# NanoGate
+# NetonAPI
 
 面向 LLM API 的开源中转网关：一个 Key 打所有大模型，按 token 计费，自带管理台与用户控制台。
 对标 new-api，用 Neton（Kotlin/Native）实现，单二进制部署，只依赖 PostgreSQL（Redis 可选）。
 
-> 仓库目录与历史命名仍叫 NewGate，产品名是 NanoGate；两者指同一项目。
+> 仓库目录与历史命名仍叫 NewGate，产品名是 NetonAPI；两者指同一项目。
 
 ## 能做什么
 

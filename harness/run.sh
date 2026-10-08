@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NanoGate 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
+# NetonAPI 可靠性 harness：本机共享 PostgreSQL 上的「隔离测试数据库」+ 假上游 + 真实网关，逐场景自动断言。
 # 一条命令：./harness/run.sh   失败即 exit 1，日志留 harness/logs/。
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；库位置由
 #   PGUSER/PGPASS/PGHOST/PGPORT 指定（默认本机 5432），其余端口是写死的：应用 8800、
@@ -75,7 +75,7 @@ fake() {
   echo "⚠️  上游 fake :$2 起不来（5s 内端口没开）—— 这条场景的断言会指向错误的原因" >&2
 }
 
-echo "═══ NanoGate 可靠性 harness (DB=$DB) ═══"
+echo "═══ NetonAPI 可靠性 harness (DB=$DB) ═══"
 
 # ── 前置：编译 + 隔离库 + 迁移 + 基础令牌/账户 ──
 echo "[build] linking app…"
@@ -1378,7 +1378,7 @@ admin_jwt() {
 # 注册一个真会员，回显 "<userId> <accessToken>"（失败回显 "0 <原因>"，从不回显空串）。
 #
 # 为什么走 sms-login 而不是 /auth/register：register 要求 USERNAME_PASSWORD ∈
-# authPolicy.registerModes，而 NanoGate 没 bind MemberAuthPolicy，默认策略只含 PHONE_SMS，
+# authPolicy.registerModes，而 NetonAPI 没 bind MemberAuthPolicy，默认策略只含 PHONE_SMS，
 # 用户名注册会被 REGISTER_MODE_DISABLED 拒。sms-login 对不存在的手机号**自动注册**
 # （MemberAuthLogic.smsLogin → registerNewUser），且注册路径直接收 inviteCode ——
 # 一次调用就能走到 dispatchInviteReward，不必先注册再补绑（那是另一条代码路径）。
@@ -2660,7 +2660,7 @@ st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization
 stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['byModel'] if x['model']=='m-st'][0];print(d['today']['requests'],m['requests'],m['charged'],d['byToken'][0]['requests'])" 2>/dev/null)
 [ "$stn" = "2" ] && [ "$stv" = "2 2 15000 2" ] && pass "用量汇总：今日 2 次、模型 m-st 2 次/15000、按 Key 2 次" || fail "用量汇总: logs=$stn stats='$stv' body=$(echo "$st" | head -c 300)"
 
-# ══ S69 控制台自助注册：用户名密码模式必须开着（NanoGate 在 Main.kt 绑定了 MemberAuthPolicy）══
+# ══ S69 控制台自助注册：用户名密码模式必须开着（NetonAPI 在 Main.kt 绑定了 MemberAuthPolicy）══
 echo "[S69] 用户名密码注册"
 rg=$(curl -s --max-time 30 -o /tmp/nanogate-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
   -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/nanogate-reg.json)
@@ -2798,7 +2798,7 @@ echo "[S77] 邮件通道与邮箱找回密码"
 fake mail 9939; sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 mac=$(curl -s --max-time 10 -o /tmp/nanogate-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
-  -d '{"mail":"noreply@nanogate.test","fromName":"NanoGate","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
+  -d '{"mail":"noreply@nanogate.test","fromName":"NetonAPI","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
 [ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/nanogate-mac.json)"
 rg=$(curl -s --max-time 30 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
 S77T=$(echo "$rg" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['accessToken'])" 2>/dev/null)
@@ -2833,12 +2833,12 @@ PORT=2526 DUMP=/tmp/nanogate-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2
 sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 smc=$(curl -s --max-time 10 -o /tmp/nanogate-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
-  -d '{"mail":"robot@nanogate.test","fromName":"NanoGate 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@nanogate.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
+  -d '{"mail":"robot@nanogate.test","fromName":"NetonAPI 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@nanogate.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
 [ "$smc" = "200" ] && pass "SMTP 邮箱账号创建" || fail "SMTP 账号: HTTP=$smc $(head -c 200 /tmp/nanogate-smc.json)"
 sc8=$(curl -s --max-time 30 -o /tmp/nanogate-sec8.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"s78@example.com","scene":"bind_email"}')
 smv=$(python3 -c "
 import json;d=json.load(open('/tmp/nanogate-smtp.json'))
-print(d['user'],d['password'],d['from'],d['rcpts'][0],d['subject'],d['content_type'],d['has_date'],d['has_message_id'],'NanoGate' in d['from_header'])" 2>/dev/null)
+print(d['user'],d['password'],d['from'],d['rcpts'][0],d['subject'],d['content_type'],d['has_date'],d['has_message_id'],'NetonAPI' in d['from_header'])" 2>/dev/null)
 code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/tmp/nanogate-smtp.json'))['body']).group(0))" 2>/dev/null)
 [ "$sc8" = "200" ] && [ "$smv" = "robot@nanogate.test smtp-pw robot@nanogate.test s78@example.com 验证码 text/plain True True True" ] && [ -n "$code8" ] \
   && pass "SMTP：AUTH LOGIN 凭据、信封、RFC 2047 中文主题与发件人名、Date/Message-ID、base64 正文含验证码" || fail "SMTP 发信: HTTP=$sc8 parsed='$smv' code='$code8' $(head -c 300 /tmp/nanogate-sec8.json)"

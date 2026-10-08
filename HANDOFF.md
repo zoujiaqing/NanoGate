@@ -1,6 +1,6 @@
-# NanoGate 项目交接（曾用名 NewGate）
+# NetonAPI 项目交接（曾用名 NewGate）
 
-> **2026-09-02 改名**：产品更名 NewGate → **NanoGate**。根仓 GitHub 已改名为 `zoujiaqing/nanogate`；
+> **2026-09-02 改名**：产品更名 NewGate → **NetonAPI**。根仓 GitHub 已改名为 `zoujiaqing/nanogate`；
 > 代码仓规划为 `nanogate-backend` / `nanogate-frontend` / `nanogate-client`。
 > **本地目录（`NewGate/`、`newgate/` 等）、`NEWGATE_*` 环境变量、隔离库名暂不改**：
 > `harness/run.sh` 依赖 `$ROOT/newgate` 路径，环境变量是后端配置契约，动了会破 37 断言基线。
@@ -11,7 +11,7 @@
 
 ## 一、这是什么
 
-对标 [new-api](https://github.com/QuantumNous/new-api) 的**开源 LLM API 中转站（产品名 NanoGate）**，用
+对标 [new-api](https://github.com/QuantumNous/new-api) 的**开源 LLM API 中转站（产品名 NetonAPI）**，用
 Kotlin/Native + Neton 框架重写（new-api 是 Go，难维护）。核心能力：任意入站协议 → 任意上游
 协议的 3×3 转发（OpenAI / Anthropic / Gemini），带计费、额度、渠道容错。
 
@@ -28,7 +28,7 @@ Kotlin/Native + Neton 框架重写（new-api 是 Go，难维护）。核心能�
 | `neton-application-front` | 管理台前端底座 | 同组织 |
 | `neton-application-client` | **C 端控制台底座** | 同组织 |
 | `neton-application-module-{member,payment,platform}` | 通用后端模块 | 同组织 |
-| `neton-application-module-gateway` | **网关后端（NanoGate 核心，57 commits）** | 同组织 |
+| `neton-application-module-gateway` | **网关后端（NetonAPI 核心，57 commits）** | 同组织 |
 | `neton-application-front-gateway` | 网关管理台页面 | 同组织 |
 | `neton-application-client-{gateway,member,payment}` | C 端模块（gateway=产品，后两个=通用） | 同组织 |
 
@@ -55,7 +55,7 @@ WIP，从未入过基线），未经过完整评审，上线前需重点看。
 > 每个仓还需设 `NETON_CI_TOKEN` secret（workflow 要 checkout 私有 canonical 仓）。
 >
 > 发布前三项已完成（2026-09-02，待提交）：四仓 Apache-2.0 `LICENSE`、三份产品 README
-> 重写为 NanoGate 身份（修了 `docs/ENGINEERING_RULES.md` 死链与 `includeBuild` 误述）、
+> 重写为 NetonAPI 身份（修了 `docs/ENGINEERING_RULES.md` 死链与 `includeBuild` 误述）、
 > privchat 引用清理（三个产品仓已 0）。
 >
 > ⚠️ **公开不等于可自建**：`module-infra`、`module-gateway`、

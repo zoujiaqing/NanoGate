@@ -90,7 +90,7 @@ services:
       # 而 compose 里写死的默认值会与代码默认值漂移，迟早坑一个人。
       NEWGATE_QUOTA_PER_PRICE_UNIT: ${QUOTA_PER_PRICE_UNIT:-}
       # 按会员分组计价的开关。空/false = 所有用户按同一套组倍率计价。
-      # 开着却没绑 MemberGroupPort 会**启动失败**（NanoGate 已绑，见 Main.kt）——
+      # 开着却没绑 MemberGroupPort 会**启动失败**（NetonAPI 已绑，见 Main.kt）——
       # 那是故意的：绑了不生效会被当成解析器的 bug 去查。
       NEWGATE_MEMBER_GROUP_BILLING: ${MEMBER_GROUP_BILLING:-}
       # 邀请奖励（μUSD）。空或 0 = 该角色不发奖 —— 默认不发，因为发钱的路径不该因为一次
