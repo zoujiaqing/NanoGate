@@ -2846,6 +2846,21 @@ bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
+# ══ S82 站点品牌：后台「配置管理」里改名，用户端匿名读到（登录页在登录前就要显示产品名）══
+echo "[S82] 站点品牌配置"
+site() { curl -s --max-time 10 "$U/admin/system/site/public" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('name',''),'|',d.get('tagline',''))" 2>/dev/null; }
+setsite() { curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/system/setting/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"key\":\"$1\",\"value\":\"$2\"}"; }
+listed=$(curl -s --max-time 10 "$U/admin/system/setting/list?category=site" -H "Authorization: Bearer $GJWT" | grep -o '"key":"site\.[a-z]*"' | sort | tr '\n' ' ')
+[ "$listed" = '"key":"site.name" "key":"site.tagline" ' ] && pass "配置管理里列出 site.name / site.tagline" || fail "配置管理列表: $listed"
+[ "$(site)" = "Neton | " ] && pass "匿名读到默认品牌（Neton，副标题空）" || fail "默认品牌: $(site)"
+c1=$(setsite site.name "Neton Cloud"); c2=$(setsite site.tagline "API GATEWAY")
+[ "$c1" = "200" ] && [ "$c2" = "200" ] && [ "$(site)" = "Neton Cloud | API GATEWAY" ] \
+  && pass "后台改名后匿名接口立即返回新值" || fail "改名: HTTP=$c1/$c2 读到=$(site)"
+c3=$(setsite site.tagline ""); c4=$(setsite site.name "")
+[ "$c3" = "200" ] && [ "$c4" != "200" ] && [ "$(site)" = "Neton Cloud | " ] \
+  && pass "副标题可清空，站点名称不能清空（HTTP=${c4}）" || fail "清空: 副标题HTTP=$c3 名称HTTP=$c4 读到=$(site)"
+q "DELETE FROM system_settings WHERE setting_key IN ('site.name','site.tagline')" >/dev/null
+
 # ══ S81 支付渠道后台：充值链路的配置前提（页面此前建不出渠道，且侧栏里没有入口）══
 echo "[S81] 支付渠道后台"
 # 建渠道用的是前端表单现在的字段形状；此前表单第一项是必填的「应用 ID」，而 pay_channels 没有那一列
