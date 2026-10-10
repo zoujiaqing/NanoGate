@@ -89,9 +89,22 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 | `POSTGRES_PASSWORD` | 自定 | compose 直接报错，不会用弱口令启动 |
 | `JWT_SECRET` | `openssl rand -base64 48` | 同上；用默认值等于管理台可被任意签发令牌 |
 | `CHANNEL_KEY_ENC_KEY` | `openssl rand -base64 32` | 渠道 API Key 明文入库，**数据库泄露 = 你采购的所有上游 Key 泄露** |
+| `MFA_MASTER_KEY` | `openssl rand -base64 32` | 不能给管理员开启 MFA（开了的人登不进来）。**有人绑定过之后不能更换**，换了所有已绑定的动态码失效，只能逐个重置 |
 
 `CHANNEL_KEY_ENC_KEY` 可以后补：配置后新写入的 Key 会加密，存量明文仍可读，无需停机迁移。
 但请尽早配置，并把它与数据库备份分开保管——两者放在一起等于没加密。
+
+## 管理员 MFA 与管理台 IP 白名单
+
+**MFA**：设置 `MFA_MASTER_KEY` 后，在管理台「用户管理」里把某个管理员设为必须 MFA（`PUT /admin/system/user/mfa/{id}`）。
+设置后他已有的会话立即失效；下次用密码登录只拿到一次性挑战，首次要用认证器 App 绑定，之后每次输入 6 位动态码，同一个码不能重复使用。
+丢了手机由其他管理员重置（`POST /admin/system/user/mfa/{id}/reset`，需要「重置密码」权限）。
+
+**白名单**：`ADMIN_IP_ALLOWLIST_ENABLED=true` 加 `ADMIN_IP_ALLOWLIST=你的出口IP或网段`，限制的是整个 `/admin` 路由组，
+包括登录接口，判定发生在认证、限流之前。上线前先确认 `RATELIMIT_TRUSTED_PROXIES` 指向你的反向代理
+（compose 默认是 caddy 的 `172.28.0.10`，裸机部署是 `127.0.0.1,::1`），并在日志 `rateLimit.initialized` 里看到
+`trustedProxies` 不为 0——否则后端看到的来源全是代理自己，白名单会把所有人挡在外面。
+写错锁住了管理台，只能登服务器改配置重启，没有远程绕过接口。配置变更都需要重启。
 
 ## 定价与毛利
 

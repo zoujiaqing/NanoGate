@@ -26,6 +26,9 @@ PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-l
 # PGPORT 必须一起 export：createdb/dropdb/psql 与应用的 DSN 都靠它找库。写死 5432 等于假定
 # 目标库一定在默认端口上（CI 的 postgres 服务容器、或本机跑在非默认端口的集群都不成立）。
 export PGPASSWORD="$PGPASS" PGHOST PGPORT
+# 管理员 MFA 的 TOTP 密钥加密主密钥（module-system，base64 解码后 32 字节）。固定测试值；
+# 不设时「要求 MFA」的管理员根本登不进来（MFA is not configured on this server）。
+export NETON_MFA_MASTER_KEY="${NETON_MFA_MASTER_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
 PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
@@ -2845,6 +2848,46 @@ code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/t
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
 em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
+
+# ══ S85 管理员 MFA：要求 MFA 后密码登录只拿到挑战，TOTP 通过才签发会话；动态码不能重放 ══
+echo "[S85] 管理员 MFA"
+totp() { python3 -c "
+import base64,hmac,hashlib,struct,time,sys
+k=base64.b32decode(sys.argv[1].upper()+'='*(-len(sys.argv[1])%8)); t=int(time.time())//30+int(sys.argv[2])
+h=hmac.new(k,struct.pack('>Q',t),hashlib.sha1).digest(); o=h[-1]&15
+print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))" "$1" "${2:-0}"; }
+# JSON null 输出空串：挑战阶段 accessToken 是 null，print(None) 会变成非空的 "None"
+jf() { python3 -c "import sys,json;d=json.load(open(sys.argv[1])).get('data') or {};v=d.get(sys.argv[2]);print('' if v is None else v)" "$1" "$2" 2>/dev/null; }
+mlogin() { curl -s --max-time 30 -o /tmp/ng-mfa-login.json -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"s85mfa","password":"s85pass1234"}'; }
+curl -s --max-time 30 -o /tmp/ng-mfa-u.json -X POST "$U/admin/system/user/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"username":"s85mfa","password":"s85pass1234","nickname":"S85 MFA"}'
+uid85=$(python3 -c "import json;print(json.load(open('/tmp/ng-mfa-u.json')).get('data',''))" 2>/dev/null)
+q "INSERT INTO system_user_roles (user_id, role_id, created_at) SELECT $uid85, id, 0 FROM system_roles WHERE code='readonly'" >/dev/null
+rkdel "*ratelimit:*"
+mlogin; plain=$(jf /tmp/ng-mfa-login.json accessToken)
+pol=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/system/user/mfa/$uid85" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"required":true}')
+stale=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/admin/system/auth/get-permission-info" -H "Authorization: Bearer $plain")
+mlogin; st1=$(jf /tmp/ng-mfa-login.json status); ch1=$(jf /tmp/ng-mfa-login.json challengeToken); tok1=$(jf /tmp/ng-mfa-login.json accessToken)
+[ -n "$plain" ] && [ "$pol" = "200" ] && [ "$stale" = "401" ] && [ "$st1" = "mfa_enrollment_required" ] && [ ${#ch1} -eq 64 ] && [ -z "$tok1" ] \
+  && pass "要求 MFA 后：旧会话立即失效(401)，密码登录只得到绑定挑战、不签发 token" \
+  || fail "MFA 策略: 未开时token=${plain:+有} 设置=$pol 旧会话=$stale 状态=$st1 挑战长度=${#ch1} 是否发token=${tok1:+是}"
+curl -s --max-time 10 -o /tmp/ng-mfa-en.json -X POST "$U/admin/system/auth/mfa/enrollment" -H "$CT" -d "{\"challengeToken\":\"$ch1\"}"
+secret=$(jf /tmp/ng-mfa-en.json secret)
+bad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/system/auth/mfa/verify" -H "$CT" -d "{\"challengeToken\":\"$ch1\",\"code\":\"000000\"}")
+code1=$(totp "$secret")
+curl -s --max-time 10 -o /tmp/ng-mfa-v.json -X POST "$U/admin/system/auth/mfa/verify" -H "$CT" -d "{\"challengeToken\":\"$ch1\",\"code\":\"$code1\"}"
+mjwt=$(jf /tmp/ng-mfa-v.json accessToken)
+pi=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/admin/system/auth/get-permission-info" -H "Authorization: Bearer $mjwt")
+[ -n "$secret" ] && [ "$bad" != "200" ] && [ -n "$mjwt" ] && [ "$pi" = "200" ] \
+  && pass "绑定：错误动态码被拒(HTTP=$bad)，正确 TOTP 通过后签发会话且可调用后台接口" \
+  || fail "MFA 绑定: secret=${secret:+有} 错码=$bad token=${mjwt:+有} 后台接口=$pi body=$(head -c 160 /tmp/ng-mfa-v.json)"
+mlogin; st2=$(jf /tmp/ng-mfa-login.json status); ch2=$(jf /tmp/ng-mfa-login.json challengeToken)
+replay=$(curl -s --max-time 10 -o /tmp/ng-mfa-r.json -w "%{http_code}" -X POST "$U/admin/system/auth/mfa/verify" -H "$CT" -d "{\"challengeToken\":\"$ch2\",\"code\":\"$code1\"}")
+rtok=$(jf /tmp/ng-mfa-r.json accessToken)
+[ "$st2" = "mfa_required" ] && [ -z "$rtok" ] \
+  && pass "再次登录要求输入动态码；同一个动态码不能重放(HTTP=$replay)" \
+  || fail "MFA 二次登录: 状态=$st2 重放HTTP=$replay 是否发token=${rtok:+是}"
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/mfa/$uid85" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"required":false}'
 
 # ══ S84 会员个人资料：响应不带密码哈希；昵称 / 设密码 / 换绑手机走各自的接口 ══
 echo "[S84] 会员个人资料与安全设置"
