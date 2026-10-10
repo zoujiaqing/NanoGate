@@ -155,10 +155,10 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
   fi
 fi
 # 基础令牌 + 账户（harness 直插 gateway 令牌）。
-# ⚠️ member_users **没有迁移种子**：admin/admin123 那个用户来自 module-infra 的 system_users，
-# member 侧的 id=1 是 S26 自己 INSERT 出来的。这一行原本写的是「member 用户 id=1 由迁移种子
+# ⚠️ account_users **没有迁移种子**：admin/admin123 那个用户来自 module-infra 的 system_users，
+# account 侧的 id=1 是 S26 自己 INSERT 出来的。这一行原本写的是「账号 id=1 由迁移种子
 # 提供」，全仓 SQL 里根本没有那条 INSERT —— 它把一次「能不能开户」的排查带偏了很久。
-# 顺带记下相关事实：member_users_id_seq 由迁移 setval 到 GREATEST(MAX(id),10000)，所以 S26 显式
+# 顺带记下相关事实：account_users_id_seq 由迁移 setval 到 GREATEST(MAX(id),10000)，所以 S26 显式
 # 插的 id=1 与 sms-login 自动注册取到的号（10000 起）不会撞。
 q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
    INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT (key_hash) DO NOTHING;" >/dev/null
@@ -808,7 +808,8 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
    INSERT INTO gateway_groups (code,name,ratio,description,deleted,created_at,updated_at) VALUES ('vip26','VIP 26','2.0',NULL,0,0,0),('del26','待删组','1.0',NULL,0,0,0);
    INSERT INTO member_groups (id,name,status,created_at,updated_at) VALUES (9926,'未映射会员组',1,0,0);
-   INSERT INTO member_users (id,nickname,status,group_id) VALUES (1,'harness',1,9926);" >/dev/null
+   INSERT INTO account_users (id,nickname,status) VALUES (1,'harness',1);
+   INSERT INTO member_profiles (user_id,group_id) VALUES (1,9926);" >/dev/null
 VIP26=$(GID vip26)
 
 # (a) 令牌覆盖指向不存在的 code。修复前这里是 `?: "default"`：请求照常放行、按 default 计价，
@@ -995,7 +996,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-snap31'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-snap31','2.5','10','0','0',5000,'manual',0,0,0);
    INSERT INTO member_groups (id,name,status,created_at,updated_at) VALUES (9927,'热点会员组',1,0,0) ON CONFLICT (id) DO NOTHING;
-   UPDATE member_users SET group_id=9926 WHERE id=1;
+   UPDATE member_profiles SET group_id=9926 WHERE user_id=1;
    UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
 # 组与映射走管理端 API 建（而不是直插 SQL）：顺便让 requireMappingFree 与会员组列真的跑一遍
 hot=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
@@ -1012,14 +1013,14 @@ else
   # 在途改组：上游 2s 慢响应，sleep 1 后请求必然已预留、未结算
   ( relay31 >/tmp/s31-code-$$ ) & CURL31=$!
   sleep 1
-  q "UPDATE member_users SET group_id=9927 WHERE id=1" >/dev/null
+  q "UPDATE member_profiles SET group_id=9927 WHERE user_id=1" >/dev/null
   wait "$CURL31"; sleep 1
   ci=$(cat /tmp/s31-code-$$ 2>/dev/null); rm -f /tmp/s31-code-$$
   si=$(charged31)
   # 对照二：变更生效后的**新**请求按 hot31 的 5.0 收 37500。这一发是关键：
   # 没它就无法区分「快照真的冻结了」与「会员组映射根本没生效」（后者也会停在 15000）。
   c2=$(relay31); sleep 1; s2=$(charged31)
-  q "UPDATE member_users SET group_id=9926 WHERE id=1" >/dev/null   # 还原，不污染后续场景
+  q "UPDATE member_profiles SET group_id=9926 WHERE user_id=1" >/dev/null   # 还原，不污染后续场景
   [ "$c0" = "200" ] && [ "$s0" = "15000" ] && [ "$ci" = "200" ] && [ "$si" = "15000" ] && [ "$c2" = "200" ] && [ "$s2" = "37500" ] \
     && pass "在途改会员组不改本次计价：改前=${s0} 在途=${si}（仍按 vip26 的 2.0）改后新请求=${s2}（按 hot31 的 5.0）" \
     || fail "在途改组影响了计价: 改前=${c0}/${s0}(期望200/15000) 在途=${ci}/${si}(期望200/15000) 改后=${c2}/${s2}(期望200/37500)"
@@ -1121,7 +1122,7 @@ ngtx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='wallet:rech
   || fail "两个账本串了: 建单=${w1} 发起=${w2} 回调=${w3} 钱包pay_status=${wps}(期望1) 钱包余额=${wbal}(期望200) 网关充值单=${nrc34}->${nrc34b} 网关余额=${gbal34}->${gbal34b} wallet前缀台账=${ngtx}(期望0)"
 
 echo "[S35] 会员组没配计费组 → 403，且 5xx/4xx 的日志级别分得开"
-# 解析第 3 层的拒绝：member_users.group_id 命中了，但没有 gateway_groups.member_group_id 指向它。
+# 解析第 3 层的拒绝：member_profiles.group_id 命中了，但没有 gateway_groups.member_group_id 指向它。
 # 这是部署决策（这批用户没开通），不是故障 —— 配置不变就永远 403，回 5xx 客户端会一直重试撞墙，
 # 与 RelayEngine 里 no_candidate 非 retryable 走 404 是同一条标准（见 GroupReject 的 KDoc）。
 # 拒绝走 respondError、不抛异常，所以框架那条「5xx → 落 infra_api_error_logs」的路径不可达，
@@ -1135,11 +1136,11 @@ echo "[S35] 会员组没配计费组 → 403，且 5xx/4xx 的日志级别分得
 # 403 确实由 group_id=9999 造成，而不是普遍坏掉。对照组的期望值是 **503 no_available_channel**
 # 而不是 404：渠道表为空时 noCandidateReason 第一层就返回 NO_CHANNEL_ENABLED，而它的
 # retryable=true（渠道全下线是运维态、可能自行恢复，与「模型根本没配」不同）。
-q "UPDATE member_users SET group_id=9999 WHERE id=1" >/dev/null
+q "UPDATE member_profiles SET group_id=9999 WHERE user_id=1" >/dev/null
 na=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
   -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
 nabody=$(grep -c "billing_group_not_allowed" "$GB")
-q "UPDATE member_users SET group_id=9926 WHERE id=1" >/dev/null
+q "UPDATE member_profiles SET group_id=9926 WHERE user_id=1" >/dev/null
 ctl=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
   -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
 ctlbody=$(grep -c "no_available_channel" "$GB")
@@ -1624,15 +1625,15 @@ echo "[S48] 用户级计价例外：管理端能写、写了真的改变计价�
 # 写死期望值会把「定价变了」误报成「例外没生效」（S27 已经因为 normalize 剔尾零踩过一次）。
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
-# 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 member_users(1) 的会员组是 S26 留下的
+# 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 account_users(1) 的会员组是 S26 留下的
 # 未映射组，基线那一发会变成 403 而不是按 default 计价。关掉它，比较才是干净的两层：例外 vs default。
 seed_reset; fake ok 9948; sleep 1
-# ⚠️ 必须先把 member_users(2) 建出来：下面三发「写入校验」用的都是 userId=2，而 create 现在会
+# ⚠️ 必须先把 account_users(2) 建出来：下面三发「写入校验」用的都是 userId=2，而 create 现在会
 # **先**校验 userId 是不是一个活会员（MemberDirectoryPort，见 S54）。库里没有 id=2 的话，那三发
 # 仍然回 400、行数仍然是 0，但理由从「组码悬空 / 空白 / 超长」悄悄换成「没有这个会员」——
 # 结果码一模一样，三条覆盖就这么静默失效（S28 那次假绿正是这个形状：409 不变、理由全错）。
 # status 显式写 1：DDL 的默认是 0(DISABLED)，与 Kotlin model 的默认 1(NORMAL) 相反。
-q "INSERT INTO member_users (id,nickname,status,deleted,created_at,updated_at) VALUES (2,'s48-second',1,0,0,0)
+q "INSERT INTO account_users (id,nickname,status,deleted,created_at,updated_at) VALUES (2,'s48-second',1,0,0,0)
      ON CONFLICT (id) DO UPDATE SET status=1, deleted=0;
    INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c48','openai_compatible','http://127.0.0.1:9948','default,vip48','m-grp',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c48'),'k',1,0,0,0,0);
@@ -2138,11 +2139,11 @@ bal53f=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 #    之后运营要的正是删掉那条例外，而按当前 status 拦 delete 会让它永远删不掉，谈判价就
 #    永久留在表里指向一个不再存在的客户。
 echo "[S54] 写计费例外校验 userId：不存在/注销/禁用一律 400 且零副作用，既有例外仍可清理"
-# 显式 id 远离 member_users_id_seq（迁移把它 setval 到 GREATEST(MAX(id),10000)，自增从 10001 起，
+# 显式 id 远离 account_users_id_seq（迁移把它 setval 到 GREATEST(MAX(id),10000)，自增从 10001 起，
 # 所以 S26 的 id=1、S48 的 id=2 与 sms_register 拿到的 10000+ 互不相撞，这里同理）。
 # status 必须显式写：DDL 默认 0(DISABLED) 而 Kotlin model 默认 1(NORMAL)，靠默认值会插出一个
 # 与代码语义相反的账号 —— 块 D 就变成在测「DDL 默认值」而不是「禁用」。
-q "INSERT INTO member_users (id,nickname,status,deleted,created_at,updated_at) VALUES
+q "INSERT INTO account_users (id,nickname,status,deleted,created_at,updated_at) VALUES
      (90541,'s54-normal',1,0,0,0),(90542,'s54-deleted',2,0,0,0),(90543,'s54-disabled',0,0,0,0)
    ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, deleted=0;
    DELETE FROM gateway_group_overrides WHERE user_id IN (90541,90542,90543,999554);" >/dev/null
@@ -2169,15 +2170,15 @@ cB54=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHER
   || fail "块B 把合法写入也挡了（校验过宽）: create=${aB54}(期望200) 行数=${nB54}(期望1) group_code=${cB54}(期望default) body=$(head -c 160 "$GB" 2>/dev/null)"
 
 # ── 块 C：注销会员（status=DELETED 但 deleted=0）→ 400 ──
-mbr54c=$(q "SELECT COUNT(*) FROM member_users WHERE id=90542 AND deleted=0")
-st54c=$(q "SELECT status FROM member_users WHERE id=90542")
+mbr54c=$(q "SELECT COUNT(*) FROM account_users WHERE id=90542 AND deleted=0")
+st54c=$(q "SELECT status FROM account_users WHERE id=90542")
 aC54=$(ov54 90542); mC54=$(jm54); nC54=$(row54 90542)
 [ "$mbr54c" = "1" ] && [ "$st54c" = "2" ] && [ "$aC54" = "400" ] && [ "$nC54" = "0" ] \
-  && pass "块C 注销会员挂不上例外：member_users(90542) 确实**查得到**（deleted=0 的行 ${mbr54c} 条）而 status=${st54c}(DELETED) —— 只判存在性的实现会放行它；实际 ${aC54} 且零副作用(${nC54})" \
+  && pass "块C 注销会员挂不上例外：account_users(90542) 确实**查得到**（deleted=0 的行 ${mbr54c} 条）而 status=${st54c}(DELETED) —— 只判存在性的实现会放行它；实际 ${aC54} 且零副作用(${nC54})" \
   || fail "块C 注销会员被放行了: 库里查得到=${mbr54c}(期望1，0 说明 INSERT 没成、本块在测空气) status=${st54c}(期望2=DELETED) create=${aC54}(期望400，200 意味着判据写成了 MemberTable.get()!=null) 行数=${nC54}(期望0) message='${mC54:0:120}'"
 
 # ── 块 D：DISABLED 会员 → 400（判据是白名单，不是 status != DELETED）──
-st54d=$(q "SELECT status FROM member_users WHERE id=90543")
+st54d=$(q "SELECT status FROM account_users WHERE id=90543")
 aD54=$(ov54 90543); nD54=$(row54 90543)
 [ "$st54d" = "0" ] && [ "$aD54" = "400" ] && [ "$nD54" = "0" ] \
   && pass "块D 禁用会员也挂不上：status=${st54d}(DISABLED) → ${aD54}、零副作用(${nD54})。判据是 status==NORMAL 白名单，与 member 的登录/刷新同一套，不自创第二套账号可用性规则" \
@@ -2812,7 +2813,7 @@ lmv=$(echo "$lm" | python3 -c "import sys,json;d=json.load(sys.stdin);b=d['body'
 [ "$sc" = "200" ] && [ -n "$code" ] && [ "$lmv" = "Bearer mail-key /send noreply@nanogate.test s77@example.com 验证码" ] \
   && pass "发码：厂商收到 Bearer 鉴权、发件人、小写归一的收件人与主题，正文含 6 位码" || fail "发码: HTTP=$sc code='$code' mail='$lmv' $(echo "$lm" | head -c 200)"
 bd=$(curl -s --max-time 10 -o /tmp/nanogate-bd.json -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
-em=$(q "SELECT email FROM member_users WHERE username='s77user'")
+em=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd" = "200" ] && [ "$em" = "s77@example.com" ] && pass "绑定邮箱落库" || fail "绑定邮箱: HTTP=$bd email=$em $(head -c 200 /tmp/nanogate-bd.json)"
 wrong=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
 [ "$wrong" = "400" ] && pass "验证码一次性：重放被拒" || fail "验证码重放: HTTP=$wrong"
@@ -2846,7 +2847,7 @@ code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/t
 [ "$sc8" = "200" ] && [ "$smv" = "robot@nanogate.test smtp-pw robot@nanogate.test s78@example.com 验证码 text/plain True True True" ] && [ -n "$code8" ] \
   && pass "SMTP：AUTH LOGIN 凭据、信封、RFC 2047 中文主题与发件人名、Date/Message-ID、base64 正文含验证码" || fail "SMTP 发信: HTTP=$sc8 parsed='$smv' code='$code8' $(head -c 300 /tmp/nanogate-sec8.json)"
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
-em8=$(q "SELECT email FROM member_users WHERE username='s77user'")
+em8=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
 # ══ S85 管理员 MFA：要求 MFA 后密码登录只拿到挑战，TOTP 通过才签发会话；动态码不能重放 ══
