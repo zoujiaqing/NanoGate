@@ -29,6 +29,9 @@ export PGPASSWORD="$PGPASS" PGHOST PGPORT
 # 管理员 MFA 的 TOTP 密钥加密主密钥（module-system，base64 解码后 32 字节）。固定测试值；
 # 不设时「要求 MFA」的管理员根本登不进来（MFA is not configured on this server）。
 export NETON_MFA_MASTER_KEY="${NETON_MFA_MASTER_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
+# JWT 签名密钥：仓库配置里只有占位值，应用检测到占位或短于 32 字符的密钥会拒绝启动（system 的
+# requireUsableJwtSecret）。harness 用一个只在本脚本里出现的测试值。
+export NETON_SECURITY__JWT__SECRETKEY="${NETON_SECURITY__JWT__SECRETKEY:-harness-only-jwt-secret-not-for-production-000}"
 PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
