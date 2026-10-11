@@ -16,12 +16,13 @@ projects/
 │   ├── geolite4k/                          # GeoIP（includeBuild）
 │   ├── neton-application-module-system/
 │   ├── neton-application-module-infra/
+│   ├── neton-application-module-account/
 │   ├── neton-application-module-member/
 │   ├── neton-application-module-payment/
 │   ├── neton-application-module-platform/
 │   ├── neton-application-module-gateway/   # NetonAPI 的核心模块
 │   ├── neton-application-front/            # 管理台基础包（前端镜像需要）
-│   ├── neton-application-front-{system,infra,member,payment,platform,gateway}/
+│   ├── neton-application-front-{system,infra,account,member,payment,platform,gateway}/
 │   └── neton-application-client-{gateway,member,payment}/   # 控制台模块
 └── NewGate/                                # 本仓（含 docker-compose.yml）
     ├── newgate/                            # 后端发行版（Dockerfile 在此）

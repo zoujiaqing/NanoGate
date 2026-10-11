@@ -2990,7 +2990,7 @@ badact=$(q "SELECT COALESCE(string_agg(DISTINCT permission, ' '), '') FROM syste
 #    模块源码路径沿用本 harness 一贯的仓库布局假设（与 gradle 的 ../../Neton 同源）
 MODSRC="$HERE/../../Neton"
 if [ -d "$MODSRC" ]; then
-  for m in system infra member payment platform gateway; do
+  for m in system infra account member payment platform gateway; do
     grep -rhoE '@Permission\("[^"]+"\)' "$MODSRC/neton-application-module-$m/src/commonMain/kotlin" 2>/dev/null | sed 's/@Permission("//;s/")//'
   done | sort -u > /tmp/nanogate-backend-perms.txt
   q "SELECT DISTINCT permission FROM system_menus WHERE permission <> '' AND status = 1" | sort -u > /tmp/nanogate-menu-perms.txt
