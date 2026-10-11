@@ -36,7 +36,9 @@ PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
 cleanup() {
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  # PIDS 里记的是包着应用的子 shell（boot_app 的 `( cd … && "$APP" ) &`）：只杀子 shell 会把应用
+  # 留成孤儿、一直占着 $PORT，下一次 harness 启动即失败。与 stop_app 一样先收它的子进程。
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && { pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; }; done
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null; done
   # 明确库名 + --force（断开残留连接）；失败输出警告而非静默吞掉。
   if ! dropdb --if-exists --force -U "$PGUSER" "$DB" 2>/tmp/harness-drop-$$.err; then
@@ -104,6 +106,9 @@ WORK="$LOGS/work-$$"; mkdir -p "$WORK/config" "$WORK/logs"
 cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
 # 端口可由 NEWGATE_HARNESS_PORT 覆盖：本机跑着演示实例时不用停它
 sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f "$WORK/config/application.conf.bak"
+# 没有短信/邮件通道时，验证码服务默认直接报错（不再假装发送成功）；harness 打开 simulate：
+# 码只写进隔离 Redis 不发送，场景从 Redis 读码（键见 sms_code_of）。
+printf '\n[security.verification]\nsimulate = true\n' >> "$WORK/config/application.conf"
 cat > "$WORK/config/database.conf" <<EOF
 [default]
 driver = "POSTGRESQL"
@@ -204,7 +209,7 @@ bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$sc" = "150000" ] && [ "$sc" = "$sd" ] && [ "$sc" = "$bd" ] && [ "$sc" = "$tu" ] \
   && pass "20 并发 → charged=$sc == debit=$sd == balanceΔ=$bd == quotaUsed=$tu" \
-  || fail "四项不等: charged=$sc debit=$sd balanceΔ=$bd quotaUsed=$tu（日志行数=$n1，期望 20）"
+  || fail "四项不等: charged=$sc debit=$sd balanceΔ=$bd quotaUsed=${tu}（日志行数=${n1}，期望 20）"
 
 # ══ S2 dead→live 首字节前重试 ══
 echo "[S2] dead→live 故障转移"
@@ -797,9 +802,63 @@ fi
 # 乘上组倍率就是该收的数：ratio 1.0 → 7500、2.0 → 15000、5.0 → 37500。
 # 与 S1/S17 同一套数，不引入新的计价假设。
 # ════════════════════════════════════════════════════════════════════
+# 注册一个真会员，回显 "<userId> <accessToken>"（失败回显 "0 <原因>"，从不回显空串）。
+#
+# 为什么走 sms-login 而不是 /auth/register：register 要求 USERNAME_PASSWORD ∈
+# authPolicy.registerModes，而 NetonAPI 没 bind MemberAuthPolicy，默认策略只含 PHONE_SMS，
+# 用户名注册会被 REGISTER_MODE_DISABLED 拒。sms-login 对不存在的手机号**自动注册**
+# （MemberAuthLogic.smsLogin → registerNewUser），且注册路径直接收 inviteCode ——
+# 一次调用就能走到 dispatchInviteReward，不必先注册再补绑（那是另一条代码路径）。
+#
+# 没有短信通道也走得通：上面给隔离配置打开了 security.verification.simulate，码只存不发，
+# 这里直接从隔离实例把码读出来。
+#
+# 验证码键（system 的 VerificationCodeService）：<keyPrefix>:vc:<身份域>:<用途>:sms:[@<发起人>:]<号码>，
+# 换绑手机的码绑定了发起人。按号码结尾通配，不把用途与发起人写死。要求 sms 前有两段（身份域、用途），
+# 否则会命中同样以号码结尾的发送冷却键 vc:cooldown:sms:<号码>（值是 1）；:fails 计错键不以号码结尾。
+sms_code_of() { rc get "$(rc --scan --pattern "*vc:*:*:sms:*$1" | head -1)"; }
+
+sms_register() {
+  local mobile="$1" invite="${2:-}" code body resp out
+  # send-sms-code 与 sms-login 各限 5 次/60s/IP，而隔离 Redis 跨 app 重启存活 ——
+  # 本批要注册 6 个用户，不清计数必然撞 429（表现成「注册失败」，会被误判成代码问题）。
+  # 键名实测是 <keyPrefix>:ratelimit:<controller.method>:IP:<ip>:<window>；这里原先写的是
+  # `*ngrl:*`，一个键都匹配不上 —— 清计数其实一直没发生，全靠 60s 窗口自然过期，机器一忙就漏。
+  rkdel "*ratelimit:*"
+  curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-sms-code" -H "$CT" \
+    -d "{\"mobile\":\"$mobile\",\"scene\":1}"
+  # 键名带 keyPrefix（ngharness），一律通配匹配，不把前缀写死（与 rksum/rkdel 同一约定）。
+  code=$(sms_code_of "$mobile")
+  if [ -z "$code" ]; then echo "0 NO_SMS_CODE_IN_REDIS"; return 0; fi
+  if [ -n "$invite" ]; then
+    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\",\"inviteCode\":\"$invite\"}"
+  else
+    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\"}"
+  fi
+  resp=$(curl -s --max-time 15 -X POST "$U/app/auth/sms-login" -H "$CT" -d "$body")
+  out=$(printf '%s' "$resp" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(d.get('userId') or 0, d.get('accessToken') or '')" 2>/dev/null)
+  if [ -z "$out" ]; then
+    echo "0 BAD_RESPONSE:$(printf '%s' "$resp" | tr -d '\n' | head -c 160)"
+  else
+    echo "$out"
+  fi
+}
+
 GB=/tmp/s26-body-$$
 GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
-# /app 与 /admin 共用 JWT 体系（只有 gateway 组走 sk- 令牌，见 GatewaySecurityConfig）
+# 令牌按身份域隔离（neton-docs spec application/identity-realm）：/admin 只认管理员令牌，/app 只认
+# 账号令牌，gateway 组走 sk- 令牌。以前这里拿管理员令牌直接调 /app，靠的是管理员 id 与用户 id
+# 碰巧都是 1 —— 那正是评审 R01 的越权漏洞，现在一律 401。
+# 「用户 1」改成一个真实账号，与网关账户 user_id=1 的账面断言对齐。账号 id 序列默认从 10000 起，
+# 这个一次性库里还没有任何账号：临时把序列拨回 1，注册仍走完整的正常路径，注册完立即恢复原值 ——
+# 否则后面注册的用户会拿到 2、3…，撞上场景里直插的小 id 账号（S48 的 id=2 等）。
+# 令牌跨应用重启有效（会话状态在库与隔离 Redis 里），后面重启后不必重取。
+[ "$(q "SELECT count(*) FROM account_users")" = "0" ] || { echo "注册用户 1 之前库里已有账号，无法保证 id=1"; exit 1; }
+SEQ0=$(q "SELECT last_value || ',' || is_called FROM account_users_id_seq")
+q "SELECT setval('account_users_id_seq', 1, false)" >/dev/null
+read -r U1ID UJWT <<<"$(sms_register '+8613900000001')"
+q "SELECT setval('account_users_id_seq', ${SEQ0%,*}, '${SEQ0#*,}')" >/dev/null
+[ "$U1ID" = "1" ] || { echo "用户 1 注册失败或 id 不是 1（得到 ${U1ID} ${UJWT}）：/app 场景无法与 user_id=1 的账面对齐"; exit 1; }
 GID() { q "SELECT id FROM gateway_groups WHERE code='$1'"; }
 relay26() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-grp","messages":[]}'; }
 charged26() { q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-grp' ORDER BY id DESC LIMIT 1"; }
@@ -811,8 +870,8 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
    INSERT INTO gateway_groups (code,name,ratio,description,deleted,created_at,updated_at) VALUES ('vip26','VIP 26','2.0',NULL,0,0,0),('del26','待删组','1.0',NULL,0,0,0);
    INSERT INTO member_groups (id,name,status,created_at,updated_at) VALUES (9926,'未映射会员组',1,0,0);
-   INSERT INTO account_users (id,nickname,status) VALUES (1,'harness',1);
-   INSERT INTO member_profiles (user_id,group_id) VALUES (1,9926);" >/dev/null
+   INSERT INTO account_users (id,nickname,status) VALUES (1,'harness',1) ON CONFLICT (id) DO NOTHING;
+   INSERT INTO member_profiles (user_id,group_id) VALUES (1,9926) ON CONFLICT (user_id) DO UPDATE SET group_id=EXCLUDED.group_id;" >/dev/null
 VIP26=$(GID vip26)
 
 # (a) 令牌覆盖指向不存在的 code。修复前这里是 `?: "default"`：请求照常放行、按 default 计价，
@@ -925,10 +984,10 @@ echo "[S29] 用户不能自行提组"
 # 放宽了它，提组依然必须失败。所以只断言不变量：无论注入请求结局如何，自助路径写不进
 # group_override；并额外走一遍干净请求，证明接口本身是通的（否则「零泄漏」只是接口坏掉的副作用）。
 inj=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/token/create" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"name":"s29inj","groupOverride":"vip26"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"name":"s29inj","groupOverride":"vip26"}')
 # 按名字收窄：S28 为了测删除保护，用 SQL 给 harness 令牌写过 group_override
 leak=$(q "SELECT COUNT(*) FROM gateway_tokens WHERE name LIKE 's29%' AND group_override IS NOT NULL")
-mytok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+mytok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d '{"name":"s29ok"}')
 TID=$(echo "$mytok" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null)
 go=$(q "SELECT COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$TID")
@@ -937,7 +996,7 @@ go=$(q "SELECT COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$T
   || fail "用户能自行提组: 泄漏行=${leak}(期望0) 干净建Key id=${TID} group_override=${go}(期望 <null>) 注入HTTP=${inj} body=$(head -c 200 "$GB")"
 # 组管理只在 admin 组：app 组没有这条路由，且 admin 路由不带凭据必须拒
 ratioBefore=$(q "SELECT ratio FROM gateway_groups WHERE id=$VIP26")
-appgrp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/group/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"id\":$VIP26,\"name\":\"x\",\"ratio\":\"0.1\"}")
+appgrp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/group/update" -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"id\":$VIP26,\"name\":\"x\",\"ratio\":\"0.1\"}")
 noauth=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/group/update" -H "$CT" -d "{\"id\":$VIP26,\"name\":\"x\",\"ratio\":\"0.1\"}")
 ratioNow=$(q "SELECT ratio FROM gateway_groups WHERE id=$VIP26")
 # 倍率跟攻击前读到的值比，不硬编码 "2.0"：建组时过了 PricingCalc.normalize，它会剥掉尾随零，
@@ -961,7 +1020,7 @@ nlog0=$(q "SELECT COUNT(*) FROM infra_api_error_logs")
 # 写 100000000 等于把前面场景的花费误报成「充值入口漏了额度」。
 balBefore=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 r1=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 nrc1=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 ntx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
 bal0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -977,7 +1036,7 @@ errmsg=$(q "SELECT COALESCE(exception_message,'') FROM infra_api_error_logs ORDE
 # channelCode 必填：payment 没有「默认渠道」这回事（PayOrderLogic.resolveRoute 收到 null 直接判不可用），
 # 留空只会在下单那步才 400，白白在钱据表里留一张开完就关的单 —— 对账时那是纯噪声。
 r2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100}')
 nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 [ "$r2" = "400" ] && [ "$nrc2" = "$nrc0" ] \
   && pass "缺 channelCode → 400 且不留意图单(${nrc2})，校验在建单之前" \
@@ -1039,7 +1098,7 @@ q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updat
      ON CONFLICT (setting_key) DO UPDATE SET value='true';
    DELETE FROM gateway_quota_recharges;" >/dev/null
 rc32=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 jdata() { python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('$1',''))" < "$GB" 2>/dev/null; }
 RID=$(jdata rechargeId); MOID=$(jdata merchantOrderId); AMT=$(jdata amountMicro)
 poid=$(q "SELECT COALESCE(pay_order_id,0) FROM gateway_quota_recharges WHERE id=${RID:-0}")
@@ -1074,7 +1133,7 @@ ntx32b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID'")
 
 echo "[S33] 入账失败可恢复：整笔回滚，不留「付了钱没额度」也不留「已支付但台账没记」"
 rc33=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":50,"channelCode":"sandbox_alipay"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":50,"channelCode":"sandbox_alipay"}')
 RID2=$(jdata rechargeId); MOID2="gateway:quota:$RID2"
 # 伪装成「已关闭」：markPaid 见到非待支付状态会抛，异常沿 SYNC 监听者传回 payment 的
 # updateSuccess 事务 → 整笔回滚。这正是想要的：宁可支付单停在未支付（可重投），
@@ -1107,10 +1166,10 @@ echo "[S34] 钱包充值不增网关额度（两个账本不共用余额）"
 nrc34=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 gbal34=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 w1=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/pay/wallet-recharge/create" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"totalPrice":200,"payPrice":200,"bonusPrice":0}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"totalPrice":200,"payPrice":200,"bonusPrice":0}')
 WRID=$(python3 -c "import sys,json;print(json.load(sys.stdin).get('data',''))" < "$GB" 2>/dev/null)
 w2=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/pay/wallet-recharge/submit?rechargeId=$WRID&channelCode=sandbox_alipay" \
-  -H "Authorization: Bearer $GJWT")
+  -H "Authorization: Bearer $UJWT")
 w3=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" \
   -H "$CT" -d "{\"merchantOrderId\":\"wallet:recharge:$WRID\"}")
 sleep 1
@@ -1173,7 +1232,7 @@ raw36=$(q "SELECT code FROM gateway_redemption_codes WHERE batch_id='$batch36' O
 c1bare=$(printf '%s' "$c1" | tr -d '-' | tr 'a-z' 'A-Z')
 bal36=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 red36() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d "$1"; }
 d1=$(red36 "{\"code\":\"$c1\"}"); sleep 1
 bal36a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 tx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
@@ -1202,7 +1261,7 @@ bal37=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 RC=/tmp/s37-codes-$$; : > "$RC"; RB=""
 for i in 1 2 3 4 5; do
   curl -s --max-time 20 -o /dev/null -w "%{http_code}\n" -X POST "$U/app/gateway/redeem" \
-    -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$c37\"}" >> "$RC" & RB="$RB $!"
+    -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"code\":\"$c37\"}" >> "$RC" & RB="$RB $!"
 done
 wait $RB; sleep 1
 ok37=$(grep -c '^200$' "$RC"); rm -f "$RC"
@@ -1226,7 +1285,7 @@ a1=$(echo "$c38" | cut -d' ' -f1); a2=$(echo "$c38" | cut -d' ' -f2); a3=$(echo 
 b1=$(printf '%s' "$a1" | tr -d '-' | tr 'a-z' 'A-Z'); b2=$(printf '%s' "$a2" | tr -d '-' | tr 'a-z' 'A-Z'); b3=$(printf '%s' "$a3" | tr -d '-' | tr 'a-z' 'A-Z')
 id2=$(q "SELECT id FROM gateway_redemption_codes WHERE code='$b2'")
 red38() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d "$1"; }
 adm38() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/$1" \
   -H "Authorization: Bearer $GJWT" -H "$CT" ${2:+-d "$2"}; }
 # 出生即过期的码不允许造：它能创建成功就是一行永远兑不了的死数据，而运营看不出来
@@ -1268,16 +1327,16 @@ echo "[S39] 兑换码权限边界：用户不能造码，app 组不暴露管理�
 genSk=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
   -H "$AUTH" -H "$CT" -d '{"quotaMicro":50000,"count":1}')
 appGen=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/redemption/generate" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":50000,"count":1}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"quotaMicro":50000,"count":1}')
 appDis=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/redemption/disable/1" \
-  -H "Authorization: Bearer $GJWT" -H "$CT")
+  -H "Authorization: Bearer $UJWT" -H "$CT")
 gen39=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":10000,"count":1,"note":"S39 内部备注"}')
 c39=$(printf '%s' "$gen39" | python3 -c "import sys,json;print(((json.load(sys.stdin).get('data') or {}).get('codes') or [''])[0])" 2>/dev/null)
 raw39=$(printf '%s' "$c39" | tr -d '-' | tr 'a-z' 'A-Z')
 n39a=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
 inj39=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$c39\",\"quotaMicro\":99999999}")
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"code\":\"$c39\",\"quotaMicro\":99999999}")
 sleep 1
 n39b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
 # 面额按**这张码的 ref** 取，不是全表 MAX：S36/S37/S38 各留了不同面额的台账，
@@ -1307,7 +1366,7 @@ nrc40a=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 npo40a=$(q "SELECT COUNT(*) FROM pay_orders")
 bal40=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 bad40=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_40"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_40"}')
 sleep 1
 nrc40b=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 rid40=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
@@ -1382,41 +1441,6 @@ admin_jwt() {
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null
 }
 
-# 注册一个真会员，回显 "<userId> <accessToken>"（失败回显 "0 <原因>"，从不回显空串）。
-#
-# 为什么走 sms-login 而不是 /auth/register：register 要求 USERNAME_PASSWORD ∈
-# authPolicy.registerModes，而 NetonAPI 没 bind MemberAuthPolicy，默认策略只含 PHONE_SMS，
-# 用户名注册会被 REGISTER_MODE_DISABLED 拒。sms-login 对不存在的手机号**自动注册**
-# （MemberAuthLogic.smsLogin → registerNewUser），且注册路径直接收 inviteCode ——
-# 一次调用就能走到 dispatchInviteReward，不必先注册再补绑（那是另一条代码路径）。
-#
-# 没有短信通道也走得通：MessageSendLogic.sendVerificationCode 总是**先**把码写进 Redis，
-# 再尝试模板发送，无模板就降级成 dev-mode 的 message_log。所以这里直接从隔离实例把码读出来。
-sms_register() {
-  local mobile="$1" invite="${2:-}" code body resp out
-  # send-sms-code 与 sms-login 各限 5 次/60s/IP，而隔离 Redis 跨 app 重启存活 ——
-  # 本批要注册 6 个用户，不清计数必然撞 429（表现成「注册失败」，会被误判成代码问题）。
-  # 键名实测是 <keyPrefix>:ratelimit:<controller.method>:IP:<ip>:<window>；这里原先写的是
-  # `*ngrl:*`，一个键都匹配不上 —— 清计数其实一直没发生，全靠 60s 窗口自然过期，机器一忙就漏。
-  rkdel "*ratelimit:*"
-  curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-sms-code" -H "$CT" \
-    -d "{\"mobile\":\"$mobile\",\"scene\":1}"
-  # 键名带 keyPrefix（ngharness），一律通配匹配，不把前缀写死（与 rksum/rkdel 同一约定）。
-  code=$(rc get "$(rc --scan --pattern "*sms:code:$mobile" | head -1)")
-  if [ -z "$code" ]; then echo "0 NO_SMS_CODE_IN_REDIS"; return 0; fi
-  if [ -n "$invite" ]; then
-    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\",\"inviteCode\":\"$invite\"}"
-  else
-    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\"}"
-  fi
-  resp=$(curl -s --max-time 15 -X POST "$U/app/auth/sms-login" -H "$CT" -d "$body")
-  out=$(printf '%s' "$resp" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(d.get('userId') or 0, d.get('accessToken') or '')" 2>/dev/null)
-  if [ -z "$out" ]; then
-    echo "0 BAD_RESPONSE:$(printf '%s' "$resp" | tr -d '\n' | head -c 160)"
-  else
-    echo "$out"
-  fi
-}
 
 # 取某个用户的专属邀请码（服务端不存在则生成）。
 invite_code_of() {
@@ -1702,9 +1726,9 @@ del=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/g
 gone48=$(q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id=1")
 del2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
 nfbody=$(curl -s --max-time 10 "$U/admin/gateway/group-override/get/1" -H "Authorization: Bearer $GJWT")
-ac1=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/group-override/create" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip48"}')
-ac2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/group-override/list" -H "Authorization: Bearer $GJWT")
-ac3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/app/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
+ac1=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/group-override/create" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip48"}')
+ac2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/group-override/list" -H "Authorization: Bearer $UJWT")
+ac3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/app/gateway/group-override/delete/1" -H "Authorization: Bearer $UJWT")
 leak48=$(q "SELECT COUNT(*) FROM gateway_group_overrides")
 [ "$del" = "200" ] && [ "$gone48" = "0" ] && [ "$del2" = "404" ] \
   && printf '%s' "$nfbody" | grep -q '"data":null' \
@@ -1823,7 +1847,7 @@ done < "$P50"
 rid1=$(head -1 "$P50" | cut -d' ' -f1); rcode1=$(head -1 "$P50" | cut -d' ' -f2-)
 bal50=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 d50=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"code\":\"$rcode1\"}"); sleep 1
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"code\":\"$rcode1\"}"); sleep 1
 bal50a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 m50=$(python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null)
 ntx50=$(q "SELECT COUNT(*) FROM gateway_quota_transactions t JOIN gateway_redemption_codes r ON t.ref='redeem:'||r.code WHERE r.batch_id='$batch50'")
@@ -2061,12 +2085,12 @@ jmsg53() { python3 -c "import json;print(json.load(open('$GB')).get('message') o
 # ── 块 A：刚下的单 —— 待支付、额度已算定、paidAt 还是空 ──
 bal53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 rc53=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 RID53=$(jf53 rechargeId); MOID53=$(jf53 merchantOrderId); AMT53=$(jf53 amountMicro)
 # 下单响应的 message 与 body 必须在这里就存下来：下面 st53 会覆盖 $GB，那时再取就变成
 # 回读端点的响应了 —— fail 信息指着错的那半边，比没有信息更坑（S8 就踩过这类坑）。
 mrc53=$(jmsg53); brc53=$(head -c 200 "$GB")
-hA53=$(st53 "${RID53:-0}" "$GJWT")
+hA53=$(st53 "${RID53:-0}" "$UJWT")
 rowA53="$(jf53 payStatus) $(jf53 amountMicro) $(jf53 price) $(jf53 merchantOrderId) $(jf53 paidAt)"
 [ "$rc53" = "200" ] && [ "$hA53" = "200" ] && [ "$rowA53" = "0 $AMT53 100 gateway:quota:$RID53 null" ] \
   && pass "块A 刚下的单可读：下单 ${rc53} → 回读 ${hA53}，payStatus=0(待支付) amountMicro=${AMT53} price=100 merchantOrderId=gateway:quota:${RID53} paidAt=null" \
@@ -2076,7 +2100,7 @@ rowA53="$(jf53 payStatus) $(jf53 amountMicro) $(jf53 price) $(jf53 merchantOrder
 cb53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
   "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID53\"}")
 sleep 1
-hB53=$(st53 "$RID53" "$GJWT")
+hB53=$(st53 "$RID53" "$UJWT")
 psB53=$(jf53 payStatus); paB53=$(jf53 paidAt); moB53=$(jf53 merchantOrderId)
 balB53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 ntx53=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID53' AND type='recharge'")
@@ -2095,7 +2119,7 @@ hC53=$(st53 "$RID53" "$tc53"); mC53=$(jmsg53)
   || fail "块C 归属门没拦住: 新会员 id=${c53}(期望非0且非1，0 说明注册失败、环境未搭好) 回读=${hC53}(期望404) message='${mC53}'"
 
 # ── 块 D：不存在的 id 也是 404，且 message 与块 C 逐字相同 ──
-hD53=$(st53 999999999 "$GJWT"); mD53=$(jmsg53)
+hD53=$(st53 999999999 "$UJWT"); mD53=$(jmsg53)
 [ "$hD53" = "404" ] && [ -n "$mC53" ] && [ "$mC53" = "$mD53" ] \
   && pass "块D 「不是你的」与「不存在」同形：两者均 404 且 message 逐字相同（'${mD53}'）—— 分开就等于把存在性泄给了探测者" \
   || fail "块D 两种 404 可区分: 不存在id=${hD53}(期望404) message='${mD53}' vs 跨用户 message='${mC53}'（两者必须非空且相等，空串相等是提取链断了的假绿）"
@@ -2103,14 +2127,14 @@ hD53=$(st53 999999999 "$GJWT"); mD53=$(jmsg53)
 # ── 块 E：下单失败被 close() 关掉的单仍可读，且回读成「已关闭」 ──
 bal53e=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 bad53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_53"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_53"}')
 sleep 1
 # 这条路回 400（payment 的 resolveRoute 抛），响应体里没有 rechargeId，只能取 MAX(id) ——
 # 与 S40 同一做法：本场景没有并发写手。多断一条 rid53e != RID53 把「根本没建新行」这种情况
 # 从「pay_status 对不上」里分出来，否则 fail 信息会把人指到错的那半边。
 rid53e=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
 psE53db=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$rid53e")
-hE53=$(st53 "$rid53e" "$GJWT")
+hE53=$(st53 "$rid53e" "$UJWT")
 psE53=$(jf53 payStatus); paE53=$(jf53 paidAt)
 ntx53e=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='gateway:quota:$rid53e'")
 bal53f=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -2368,7 +2392,7 @@ q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updat
    INSERT INTO pay_channels (code,platform_code,method,platform_channel_id,display_mode,config,status,remark)
      VALUES ('alipay56','alipay','ALIPAY','WAP','REDIRECT_URL','$CFG56',1,'S56 回调地址');" >/dev/null
 rc56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 pl56=$(jf56 payload)
 nu56=$(pq56 "$pl56" notify_url); ru56=$(pq56 "$pl56" return_url); bc56=$(pq56 "$pl56" biz_content)
 ENU56="$BASE56/app/pay/channel-notify/alipay56"
@@ -2400,7 +2424,7 @@ hc56=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U$pb56/nop
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcC56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plC56=$(jf56 payload)
 # 两面都断言：既要「没有回调参数」，也要「payload 仍是那条真 alipay 跳转地址」。
 # 只断言前者的话，一个把整个 prepay 弄挂的实现（payload 空）同样能过 —— 与块A 的正反配对同一个道理。
@@ -2428,7 +2452,7 @@ BAD56="pay.nanogate.test"
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BAD56" NEWGATE_PAY_RETURN_URL="$RET56"
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plD56=$(jf56 payload)
 ndD56=no; printf '%s' "$plD56" | grep -q "notify_url=" && ndD56=yes
 rdD56=no; printf '%s' "$plD56" | grep -q "return_url=" && rdD56=yes
@@ -2645,25 +2669,25 @@ seed_reset; fake ok 9968; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-st','openai_compatible','http://127.0.0.1:9968','default','m-st',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-st'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-st','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
-s68tok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"name":"s68"}')
+s68tok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"name":"s68"}')
 S68ID=$(echo "$s68tok" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null)
 q "UPDATE gateway_tokens SET rpm_limit=7, group_override='default' WHERE id=$S68ID" >/dev/null
 s68future=$(( $(date +%s) * 1000 + 86400000 ))
-up=$(curl -s --max-time 10 -o /tmp/nanogate-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+up=$(curl -s --max-time 10 -o /tmp/nanogate-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"s68-renamed\",\"quotaBudget\":5000000,\"expiresAt\":$s68future,\"allowedModels\":\"m-st\",\"allowedIps\":\"\"}")
 row=$(q "SELECT name||'/'||quota_budget||'/'||allowed_models||'/'||rpm_limit||'/'||COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$S68ID")
 [ "$up" = "200" ] && [ "$row" = "s68-renamed/5000000/m-st/7/default" ] \
   && pass "自助更新：名称/预算/模型范围改了，rpm_limit=7 与 group_override 原样" || fail "自助更新: HTTP=$up row=$row body=$(cat /tmp/nanogate-s68.json)"
-inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"x\",\"rpmLimit\":9999}")
 rl=$(q "SELECT rpm_limit FROM gateway_tokens WHERE id=$S68ID")
 [ "$inj" = "400" ] && [ "$rl" = "7" ] && pass "塞 rpmLimit 被拒（400）且限速不变" || fail "限速注入: HTTP=$inj rpm_limit=$rl"
-past=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+past=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"x\",\"expiresAt\":1000}")
 [ "$past" = "400" ] && pass "过去的有效期被拒" || fail "过去有效期: HTTP=$past"
 for _ in 1 2; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-st","messages":[]}'; done
 stn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-st'" 2)
-st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization: Bearer $GJWT")
+st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization: Bearer $UJWT")
 stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['byModel'] if x['model']=='m-st'][0];print(d['today']['requests'],m['requests'],m['charged'],d['byToken'][0]['requests'])" 2>/dev/null)
 [ "$stn" = "2" ] && [ "$stv" = "2 2 15000 2" ] && pass "用量汇总：今日 2 次、模型 m-st 2 次/15000、按 Key 2 次" || fail "用量汇总: logs=$stn stats='$stv' body=$(echo "$st" | head -c 300)"
 
@@ -2824,12 +2848,19 @@ curl -s --max-time 5 -X POST "http://127.0.0.1:9939/reset" -H "$CT" -d '{}' >/de
 unk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"nobody@example.com","scene":"reset_password"}')
 lm2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json;print(json.load(sys.stdin).get('body',{}).get('to',[''])[0])" 2>/dev/null)
 [ "$unk" = "200" ] && [ "$lm2" != "nobody@example.com" ] && pass "未绑定的邮箱：返回 200 但不发信（不泄露账号存在）" || fail "未知邮箱: HTTP=$unk lastTo=$lm2"
+# 同一收件人 60 秒内只能发一次码（VerificationCodeService 的重发冷却，跨用途）。上面刚给这个邮箱发过
+# 绑定码，这里与路由限流同样处理：先清冷却位再发。
+rkdel "*vc:cooldown:*"
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"s77@example.com","scene":"reset_password"}'
 code2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
 rp=$(curl -s --max-time 10 -o /tmp/nanogate-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
 lg=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
 old=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
 [ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/nanogate-rp.json)"
+# 重置密码作废该账号的全部会话（spec identity-realm）：旧令牌必须 401；S78 继续用这个账号，按新密码重新登录。
+stale77=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/user/get" -H "Authorization: Bearer $S77T")
+S77T=$(curl -s --max-time 30 -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
+[ "$stale77" = "401" ] && [ -n "$S77T" ] && pass "重置密码后旧令牌失效" || fail "重置密码后会话: 旧令牌=${stale77}(期望401) 新令牌=${S77T:-无}"
 ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com' AND send_status=0")
 [ "$ml" = "2" ] && pass "两封验证码邮件都进了邮件日志" || fail "邮件日志行=$ml"
 
@@ -2904,13 +2935,17 @@ nk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/
 nkv=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('nickname'))" 2>/dev/null)
 [ "$nk" = "200" ] && [ "$nkv" = "S84 会员" ] && pass "改昵称走 update-nickname（页面原来调的 /update 并不存在）" || fail "改昵称: HTTP=$nk 读到=$nkv"
 setpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"","newPassword":"s84-pass-123"}')
+# 设密码同样作废该账号的全部会话（spec identity-realm）：旧令牌 401，用手机号 + 新密码重新登录。
+stale84=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/user/get" -H "Authorization: Bearer $t84")
+t84=$(curl -s --max-time 30 -X POST "$U/app/auth/login" -H "$CT" -d '{"mobile":"+8615000084001","password":"s84-pass-123"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
+[ "$stale84" = "401" ] && [ -n "$t84" ] && pass "设密码后旧令牌失效，新密码可登录" || fail "设密码后会话: 旧令牌=${stale84}(期望401) 新登录令牌=${t84:-无}"
 haspw=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('hasPassword'))" 2>/dev/null)
 wrongpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"nope-nope","newPassword":"s84-pass-456"}')
 [ "$setpw" = "200" ] && [ "$haspw" = "True" ] && [ "$wrongpw" = "400" ] \
   && pass "无密码账号可直接设密码，之后 hasPassword=true，再改必须验旧密码" || fail "设密码: 设=$setpw hasPassword=$haspw 错旧密码=$wrongpw"
 rkdel "*ratelimit:*"
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/member/user/send-sms-code" -H "Authorization: Bearer $t84" -H "$CT" -d '{"mobile":"+8615000084002","scene":2}'
-mc84=$(rc get "$(rc --scan --pattern "*sms:code:+8615000084002" | head -1)")
+mc84=$(sms_code_of "+8615000084002")
 um=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-mobile" -H "Authorization: Bearer $t84" -H "$CT" -d "{\"mobile\":\"+8615000084002\",\"smsCode\":\"$mc84\"}")
 newm=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('mobile'))" 2>/dev/null)
 [ -n "$mc84" ] && [ "$um" = "200" ] && [ "$newm" = "+8615000084002" ] && pass "换绑手机：验证码发到新号码，填对后生效" \
@@ -2936,10 +2971,15 @@ wrong=$(pw "not-my-password" "s83-new-pass")
 [ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "当前密码不正确" /tmp/nanogate-pw.json \
   && pass "改密码：不带旧密码 400，旧密码错误 400（当前密码不正确）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/nanogate-pw.json)"
 ok1=$(pw "admin123" "s83-new-pass")
-newlogin=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"s83-new-pass"}' | grep -c accessToken)
+# 改密作废该管理员的全部会话（spec identity-realm）：旧令牌必须 401，用新密码重新登录后再改回。
+stale=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/admin/system/user/profile/get" -H "Authorization: Bearer $GJWT")
+GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"s83-new-pass"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
+newlogin=$([ -n "$GJWT" ] && echo 1 || echo 0)
 ok2=$(pw "s83-new-pass" "admin123")
-[ "$ok1" = "200" ] && [ "$newlogin" = "1" ] && [ "$ok2" = "200" ] && pass "旧密码正确能改，新密码能登录，已改回" \
-  || fail "改密码: 改=$ok1 新密码登录=$newlogin 改回=$ok2"
+GJWT=$(admin_jwt)
+[ "$ok1" = "200" ] && [ "$stale" = "401" ] && [ "$newlogin" = "1" ] && [ "$ok2" = "200" ] && [ -n "$GJWT" ] \
+  && pass "旧密码正确能改，改后旧令牌失效，新密码能登录，已改回" \
+  || fail "改密码: 改=$ok1 旧令牌=${stale}(期望401) 新密码登录=$newlogin 改回=$ok2"
 
 # ══ S82 站点品牌：后台「配置管理」里改名，用户端匿名读到（登录页在登录前就要显示产品名）══
 echo "[S82] 站点品牌配置"
@@ -2977,7 +3017,7 @@ grep -q "已存在" /tmp/nanogate-dup.json && [ "$dup" != "500" ] \
   && pass "重复编码给的是人话而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/nanogate-dup.json)"
 # 侧栏里要有入口，且用户端能看到这条渠道
 pcmenu=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/channel/index' AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
-pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $GJWT" | grep -c "s81_alipay")
+pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT" | grep -c "s81_alipay")
 [ "$pcmenu" = "1" ] && [ "$pcapp" = "1" ] && pass "支付中心下有「支付渠道」入口，且用户端选渠道时看得到它" \
   || fail "入口或用户端可见性: 菜单=$pcmenu 用户端命中=$pcapp"
 
@@ -3064,7 +3104,7 @@ deny=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/ga
 allow=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X GET "$U/admin/gateway/usage-log/page?pageNo=1&pageSize=1" -H "Authorization: Bearer $JWT_support")
 created=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s79-should-fail'")
 [ "$deny" != "200" ] && [ "$created" = "0" ] && pass "后端真拦：客服建渠道被拒（HTTP=${deny}），库里没有多出渠道行" \
-  || fail "越权没拦住: 建渠道 HTTP=$deny 库里行数=$created（查日志 HTTP=$allow）"
+  || fail "越权没拦住: 建渠道 HTTP=$deny 库里行数=${created}（查日志 HTTP=${allow}）"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
