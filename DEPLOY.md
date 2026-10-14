@@ -212,7 +212,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 ## 渠道
 
-七种类型：`openai_compatible`、`azure_openai`、`anthropic`、`gemini`、`bedrock`、`vertex_anthropic`、`vertex_gemini`。协议转换在网关内完成，
+八种类型：`openai_compatible`、`azure_openai`、`anthropic`、`gemini`、`bedrock`、`bedrock_converse`、`vertex_anthropic`、`vertex_gemini`。协议转换在网关内完成（实现在 neton-ai 协议层），
 客户端用哪种协议进来都能打到任一类型的上游（错误体也会改写成客户端协议的形状，不会把
 OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
@@ -232,10 +232,19 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
   （region 从主机名推，也可在厂商参数里写 `{"region":"us-east-1"}`），渠道 Key 填 `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`，
   模型映射的目标名就是 Bedrock 模型 id（如 `anthropic.claude-sonnet-4-20250514-v1:0`）。请求走 SigV4 签名，
   流式响应的 AWS event-stream 二进制帧由网关还原成标准 SSE。
+- **Bedrock Converse**（类型 `bedrock_converse`，任意 Bedrock 模型：Nova、Llama、Mistral、Claude 等）：Base URL、Key、region
+  与 `bedrock` 相同，模型映射的目标名是 Bedrock 模型 id（如 `amazon.nova-pro-v1:0`）。走 Converse 接口，网关负责协议转换。
 - **Vertex AI**（类型 `vertex_anthropic` / `vertex_gemini`）：Base URL 填 `https://<location>-aiplatform.googleapis.com`，
   厂商参数必填 `{"project":"<gcp-project>","location":"us-east5"}`，渠道 Key 填服务账号 JSON 整段
   （网关用它换 OAuth token 并缓存到过期前）或直接填一枚 access token（调试用）。模型映射目标名即
-  发布者模型 id（`claude-sonnet-4@20250514` / `gemini-2.5-pro`）。这三种类型没有模型列表接口，模型清单手填。
+  发布者模型 id（`claude-sonnet-4@20250514` / `gemini-2.5-pro`）。Bedrock 与 Vertex 类型没有模型列表接口，模型清单手填。
+- **损耗策略**（`loss_policy`，默认 `allow`）：跨协议转换会丢东西时怎么办。`allow` 照常转发、诊断写应用日志；
+  `safe` 在工具行为、内容或必要状态会变时（如 Anthropic 的 web_search 托管工具打到 OpenAI 系上游）跳过这个渠道、换下一个；
+  `strict` 任何差异都跳过。涉及工具调用的渠道建议 `safe`。
+- **推理尾缀**（`reasoning_suffix`，默认关）：开启后，客户端请求 `claude-sonnet-4-5-thinking-8000`、`gpt-5-high` 这类
+  名字而没有渠道直接服务它时，按去掉尾缀的模型路由与计价，并把推理设置写进请求。
+- **`/v1/responses`** 也能打非 OpenAI 渠道，但只限无状态请求：带 `previous_response_id`、`conversation`、
+  `background` 或 OpenAI 托管工具的请求只走 OpenAI 渠道。
 - Base URL 与代理地址写入时做 SSRF 校验，见「上游地址与 SSRF」。
 
 ## 端点能力
