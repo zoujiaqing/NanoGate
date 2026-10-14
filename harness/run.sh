@@ -96,7 +96,11 @@ echo "[build] linking app…"
 # 拿别人留下的 sqlite klib 去链接（或者 link 自己也判 UP-TO-DATE，直接复用那个已经链错的
 # kexe —— 实测两种都发生过）。产物一跑就死在 NETON-DB-VARIANT mismatch。
 DB_VARIANT=postgres
-link_app() { ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" ); }
+# 框架 main 处于 WebSocket 集成阶段：协议栈用 ../../Neton 下的兄弟目录源码，其中 tls 依赖的
+# openssl 4.0.2-3 还没发布，要用本地 openssl-kotlin 源码顶上。这个开关只能走命令行：
+# 根构建的 gradle.properties 传不到被 includeBuild 的框架 settings 里。openssl 发布后删掉。
+NETON_BUILD_FLAGS=(-Pnetonstream.local.openssl=true)
+link_app() { ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
 link_app || { echo "build failed"; exit 1; }
 createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 隔离 workdir：config/ 指向隔离库；app 与 migrate 都从此目录启动（config 相对 CWD 解析）
@@ -152,7 +156,7 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
   if grep -q 'NETON-DB-VARIANT' "$LOGS/migrate.log"; then
     echo "  ⚠️  链进二进制的 sqlx4k variant 不是 ${DB_VARIANT}（多半是共享 Neton/neton 的兄弟项目刚用" >&2
     echo "     -Pneton.database.driver=sqlite 跑过测试）：--rerun-tasks 重编重链一次…" >&2
-    ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" ) \
+    ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ) \
       || { echo "rebuild failed"; exit 1; }
     if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
       echo "  ⚠️  自愈后仍不匹配：有别的构建正在并发改写那份共享 klib，等它跑完再重跑 harness" >&2

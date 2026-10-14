@@ -435,6 +435,10 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
   `libcurl.so` 软链，再
   `./gradlew :application:linkReleaseExecutableLinuxX64 -Pnewgate.linuxX64.libDir=<该目录绝对路径>`
   （或环境变量 `NEWGATE_LINUX_X64_LIBDIR`）。头文件仓里已 vendor，只缺链接用的 so。
+- **框架处于 WebSocket 集成阶段时**（框架 `gradle.properties` 里 `netonstream.local=true`），协议栈用
+  `../../Neton` 下的兄弟目录源码，其中 tls 依赖的 openssl 4.0.2-3 尚未发布：所有 gradlew 命令都要加
+  `-Pnetonstream.local.openssl=true`，改用本地 `openssl-kotlin` 源码。写进本仓 `gradle.properties` 不生效——
+  根构建的属性传不到被 includeBuild 的框架 settings。openssl 发布后去掉。
 - **运行时依赖**：EL10 要装 `libxcrypt-compat`（二进制链的是 `libcrypt.so.1`），否则启动即
   `libcrypt.so.1 => not found`。`ldd nanogate | grep "not found"` 应为空。
 - **前端在目标机构建**：Node 24 + pnpm 11.20，按 Dockerfile 的布局把 `Neton/` 与 `NewGate/` 两层
