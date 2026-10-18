@@ -27,7 +27,7 @@ PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-l
 # 目标库一定在默认端口上（CI 的 postgres 服务容器、或本机跑在非默认端口的集群都不成立）。
 export PGPASSWORD="$PGPASS" PGHOST PGPORT
 # 管理员 MFA 的 TOTP 密钥加密主密钥（module-system，base64 解码后 32 字节）。固定测试值；
-# 不设时「要求 MFA」的管理员根本登不进来（MFA is not configured on this server）。
+# 不设时「要求 MFA」的管理员根本登不进来（MFA_NOT_CONFIGURED）。
 export NETON_MFA_MASTER_KEY="${NETON_MFA_MASTER_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
 # JWT 签名密钥：仓库配置里只有占位值，应用检测到占位或短于 32 字符的密钥会拒绝启动（system 的
 # requireUsableJwtSecret）。harness 用一个只在本脚本里出现的测试值。
@@ -2972,8 +2972,8 @@ curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" 
 pw() { curl -s --max-time 10 -o /tmp/nanogate-pw.json -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"oldPassword\":\"$1\",\"newPassword\":\"$2\"}"; }
 nopw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"newPassword":"s83-new-pass"}')
 wrong=$(pw "not-my-password" "s83-new-pass")
-[ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "当前密码不正确" /tmp/nanogate-pw.json \
-  && pass "改密码：不带旧密码 400，旧密码错误 400（当前密码不正确）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/nanogate-pw.json)"
+[ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "OLD_PASSWORD_INCORRECT" /tmp/nanogate-pw.json \
+  && pass "改密码：不带旧密码 400，旧密码错误 400（OLD_PASSWORD_INCORRECT）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/nanogate-pw.json)"
 ok1=$(pw "admin123" "s83-new-pass")
 # 改密作废该管理员的全部会话（spec identity-realm）：旧令牌必须 401，用新密码重新登录后再改回。
 stale=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/admin/system/user/profile/get" -H "Authorization: Bearer $GJWT")
