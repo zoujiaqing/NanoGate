@@ -101,7 +101,12 @@ DB_VARIANT=postgres
 # 根构建的 gradle.properties 传不到被 includeBuild 的框架 settings 里。openssl 发布后删掉。
 NETON_BUILD_FLAGS=(-Pnetonstream.local.openssl=true)
 link_app() { ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
-link_app || { echo "build failed"; exit 1; }
+# NEWGATE_SKIP_LINK=1：产物已由外部构建好（例如多个项目共用框架 composite build、需经构建锁串行时），跳过这一步。
+if [ "${NEWGATE_SKIP_LINK:-0}" = "1" ]; then
+  [ -x "$APP" ] || { echo "NEWGATE_SKIP_LINK=1 但 $APP 不存在"; exit 1; }
+else
+  link_app || { echo "build failed"; exit 1; }
+fi
 createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 隔离 workdir：config/ 指向隔离库；app 与 migrate 都从此目录启动（config 相对 CWD 解析）
 # 只保留最近 2 次运行的 work 目录，避免长期跑 harness 占满磁盘
@@ -113,6 +118,8 @@ sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f
 # 没有短信/邮件通道时，验证码服务默认直接报错（不再假装发送成功）；harness 打开 simulate：
 # 码只写进隔离 Redis 不发送，场景从 Redis 读码（键见 sms_code_of）。
 printf '\n[security.verification]\nsimulate = true\n' >> "$WORK/config/application.conf"
+# simulate 只在显式声明的 dev/local/test 环境放行（system 的 requireSimulationAllowed，否则启动即 fail-fast）。
+export NETON_ENV=test
 cat > "$WORK/config/database.conf" <<EOF
 [default]
 driver = "POSTGRESQL"
@@ -789,7 +796,7 @@ dom=$(mkch "https://api.openai.com/v1" dom); reason=$(cat "/tmp/s25-dom-$$" 2>/d
 rm -f "/tmp/s25-"*"-$$"
 if [ "$dom" = "200" ]; then
   pass "域名渠道经 DNS 复查后放行（api.openai.com）"
-elif echo "$reason" | grep -q "could not be resolved"; then
+elif echo "$reason" | grep -q "UPSTREAM_URL_UNRESOLVABLE"; then
   echo "  ⚠️  本机解析不出 api.openai.com → 按 fail-closed 拒绝（DNS 不可用时的预期行为，不计失败）" >&2
 else
   fail "域名渠道被意外拒绝: ${dom} ${reason}"
@@ -971,9 +978,9 @@ q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH'" >
 d3=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
 m3=$(head -c 300 "$GB" 2>/dev/null)
 a3=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
-p1=$(printf '%s' "$m1" | grep -c 'per-user override')
-p2=$(printf '%s' "$m2" | grep -c 'token group override')
-p3=$(printf '%s' "$m3" | grep -c 'channel(s)')
+p1=$(printf '%s' "$m1" | grep -c '"message":"GROUP_IN_USE_BY_OVERRIDE"')
+p2=$(printf '%s' "$m2" | grep -c '"message":"GROUP_IN_USE_BY_TOKEN"')
+p3=$(printf '%s' "$m3" | grep -c '"message":"GROUP_IN_USE_BY_CHANNEL"')
 [ "$c28" = "200" ] && [ "$rm28" = "200" ] \
   && [ "$d1" = "409" ] && [ "$a1" = "0" ] && [ "$p1" = "1" ] \
   && [ "$d2" = "409" ] && [ "$a2" = "0" ] && [ "$p2" = "1" ] \
@@ -1516,8 +1523,10 @@ rr44=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST \
   "$U/admin/member/invite-code/retry-invite-reward/$rid43" -H "Authorization: Bearer $GJWT")
 # 记录不存在必须报错而不是 200：dispatchInviteReward 对缺失记录是 `?: return`（正常链路不该因为
 # 一条脏记录影响注册），但运维手工补发时拿到 200 却什么都没发生，比拿到 400 糟得多。
-ghost44=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
+ghost44=$(curl -s --max-time 10 -o /tmp/ng-ghost44-$$.json -w "%{http_code}" -X POST \
   "$U/admin/member/invite-code/retry-invite-reward/99999999" -H "Authorization: Bearer $GJWT")
+grep -q '"message":"INVITE_RECORD_NOT_FOUND"' /tmp/ng-ghost44-$$.json || ghost44="${ghost44}/$(head -c 120 /tmp/ng-ghost44-$$.json)"
+rm -f /tmp/ng-ghost44-$$.json
 noauth44=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
   "$U/admin/member/invite-code/retry-invite-reward/$rid43")
 sleep 1
@@ -1528,10 +1537,10 @@ skip44b=$(grep -c "quota debit idempotent skip" "$WORK/logs/all.log" 2>/dev/null
 # 恰好 +2：两个 ref 各被唯一约束挡下一次。断「增加了」不够 —— 那兼容「重放其实什么都没干」；
 # 断「恰好 2」才证明重放真的走到了发钱那一步、并且是被幂等闸门拦下的。
 dskip44=$((skip44b - skip44a))
-[ "$rr44" = "200" ] && [ "$ghost44" = "400" ] && [ "$noauth44" = "401" ] \
+[ "$rr44" = "200" ] && [ "$ghost44" = "404" ] && [ "$noauth44" = "401" ] \
   && [ "$tot44" = "2" ] && [ "$ba44" = "50000" ] && [ "$bb44" = "20000" ] && [ "$dskip44" = "2" ] \
   && pass "重放幂等：retry-invite-reward(${rid43}) → ${rr44}，台账仍 ${tot44} 条、余额仍 ${ba44}/${bb44}，幂等跳过日志恰好 +${dskip44}（两个 ref 各挡一次，证明重放真走到了发钱那步）；不存在的记录 → ${ghost44}、无凭据 → ${noauth44}" \
-  || fail "重放不幂等或补偿端点不对: 重放=${rr44}(期望200) 不存在记录=${ghost44}(期望400) 无凭据=${noauth44}(期望401) invite台账=${tot44}(期望2) 余额=${ba44}/${bb44}(期望50000/20000) 幂等跳过增量=${dskip44}(期望2) body=$(head -c 160 "$GB")"
+  || fail "重放不幂等或补偿端点不对: 重放=${rr44}(期望200) 不存在记录=${ghost44}(期望404 INVITE_RECORD_NOT_FOUND) 无凭据=${noauth44}(期望401) invite台账=${tot44}(期望2) 余额=${ba44}/${bb44}(期望50000/20000) 幂等跳过增量=${dskip44}(期望2) body=$(head -c 160 "$GB")"
 
 echo "[S45] 额度配置非法：该角色不发奖但必须响，且不连累另一个角色"
 # `1e3` 是个很可能的笔误（想写 1000）。把它静默读成「不奖励」的后果是：运营以为活动已上线、
@@ -1633,9 +1642,9 @@ sleep 1
 bal47b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 nled47b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
 ngrp47b=$(q "SELECT COUNT(*) FROM gateway_groups")
-k1=no; printf '%s' "$b1" | grep -q 'gateway:quota:grant' && k1=yes
-k2=no; printf '%s' "$b2" | grep -q 'pay:refund:create' && k2=yes
-k3=no; printf '%s' "$b3" | grep -q 'gateway:group:create' && k3=yes
+k1=no; printf '%s' "$b1" | grep -q '"message":"PERMISSION_DENIED"' && k1=yes
+k2=no; printf '%s' "$b2" | grep -q '"message":"PERMISSION_DENIED"' && k2=yes
+k3=no; printf '%s' "$b3" | grep -q '"message":"PERMISSION_DENIED"' && k3=yes
 [ "$h1" = "403" ] && [ "$h2" = "403" ] && [ "$h3" = "403" ] \
   && [ "$k1" = "yes" ] && [ "$k2" = "yes" ] && [ "$k3" = "yes" ] \
   && [ "$bal47b" = "$bal47a" ] && [ "$nled47b" = "$nled47a" ] && [ "$ngrp47b" = "$ngrp47a" ] \
@@ -1694,7 +1703,7 @@ dang=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gatewa
 # —— fail 信息指着错的那半边，比没有信息更坑（S53 块 A 踩过同一类坑）。
 # 点名 'ghost48' 是真守卫：userId=2 现在也是一个合法会员（见上面 seed 的注释），少了这条
 # 断言，一发因「没有这个会员」而回的 400 会冒充「组码悬空」的 400，两者状态码与行数完全一样。
-mdang=$(python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null)
+mdang=$(python3 -c "import json;d=json.load(open('$GB'));print((d.get('message') or '')+'|'+','.join((e.get('field') or '')+'='+(e.get('code') or '') for e in (d.get('errors') or [])))" 2>/dev/null)
 blank=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":2,"groupCode":"   "}')
 LONGR48=$(python3 -c 'print("x"*257)')
@@ -1704,7 +1713,7 @@ nonpos=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":0,"groupCode":"vip48"}')
 n2=$(q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id IN (0,2)")
 [ "$dang" = "400" ] && [ "$blank" = "400" ] && [ "$longr" = "400" ] && [ "$nonpos" = "400" ] && [ "$n2" = "0" ] \
-  && printf '%s' "$mdang" | grep -q "ghost48" \
+  && [ "$mdang" = "GROUP_CODE_UNKNOWN|groupCode=GROUP_CODE_UNKNOWN" ] \
   && pass "写入校验在驱动之前：悬空组=${dang}（message 点名 'ghost48' 而不是 '没有这个会员'）、空白组=${blank}、257 字 remark=${longr}、userId=0 均 400（非 500），且一行也没写进去（user 0/2 共 ${n2} 条）" \
   || fail "写入校验不对: 悬空=${dang}(期望400) 空白=${blank}(期望400) 超长remark=${longr}(期望400) userId=0=${nonpos}(期望400) 写入行数=${n2}(期望0) 悬空message='${mdang:0:120}'(期望点名 ghost48；若写的是 'no chargeable member' 则本发测的是 S54 那件事、组码校验已失去覆盖)"
 
@@ -1860,10 +1869,10 @@ dis50=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/disable/$rid1
 dcode50=$(printf '%s' "$dis50" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('code',''))" 2>/dev/null)
 # 404「兑换码无效」而不是 400「格式不正确」：前者是「查不到这张码」，后者意味着脱敏串
 # 归一化后反而变长了 —— 两者都兑不动，但只有前者是设计意图。
-case "$m50" in *"无效"*) okmsg=1;; *) okmsg=0;; esac
+[ "$m50" = "REDEMPTION_CODE_NOT_FOUND" ] && okmsg=1 || okmsg=0
 [ "$d50" = "404" ] && [ "$okmsg" = "1" ] && [ "$bal50a" = "$bal50" ] && [ "$ntx50" = "0" ] && [ "$dcode50" = "$rcode1" ] && [ -n "$dcode50" ] \
   && pass "拿 /page 的脱敏串去兑 → 404「${m50}」、余额 ${bal50}→${bal50a} 一分未动、本批 redeem 台账 ${ntx50} 条；/disable 的响应同样脱敏（${dcode50}）" \
-  || fail "脱敏形同虚设: 兑 /page 给的串 HTTP=${d50}(期望404) message='${m50}'(期望含「无效」) 余额=${bal50}->${bal50a}(期望不变) 台账=${ntx50}(期望0) /disable 返回='${dcode50}'(期望等于 /page 的 '${rcode1}')"
+  || fail "脱敏形同虚设: 兑 /page 给的串 HTTP=${d50}(期望404) message='${m50}'(期望 REDEMPTION_CODE_NOT_FOUND) 余额=${bal50}->${bal50a}(期望不变) 台账=${ntx50}(期望0) /disable 返回='${dcode50}'(期望等于 /page 的 '${rcode1}')"
 rm -f "$P50"
 
 # ══ S51 额度撤回：能发就得能收，收了要真收得住 ══
@@ -1951,7 +1960,7 @@ hE251=$(rv51 "$GJWT" '{"userId":1,"amount":0,"ref":"revoke:s51-e2"}'); mE251=$(m
 sleep 1
 balD51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 nledD51b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
-case "$mD51" in *"gateway:quota:grant"*) okD51=1;; *) okD51=0;; esac
+[ "$mD51" = "QUOTA_REVOKE_AMOUNT_INVALID" ] && okD51=1 || okD51=0
 [ "$hD51" = "400" ] && [ "$okD51" = "1" ] && [ "$hE51" = "400" ] && [ "$hE251" = "400" ] \
   && [ "$balD51b" = "$balD51" ] && [ "$nledD51b" = "$nledD51" ] \
   && pass "非法入参一律 400 且零副作用：负数 amount=${hD51}（理由点名 gateway:quota:grant）、空 ref=${hE51}、零 amount=${hE251}；余额仍 ${balD51b}、台账仍 ${nledD51b} 行" \
@@ -1962,7 +1971,7 @@ balF51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 hF51=$(rv51 "$csjwt51" '{"userId":1,"amount":1000,"ref":"revoke:s51-f"}'); mF51=$(msg51); sleep 1
 balF51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 nF51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-f'")
-case "$mF51" in *"gateway:quota:revoke"*) okF51=1;; *) okF51=0;; esac
+[ "$mF51" = "PERMISSION_DENIED" ] && okF51=1 || okF51=0
 [ -n "$csjwt51" ] && [ "$csrole51" = "0" ] && [ "$hF51" = "403" ] && [ "$okF51" = "1" ] \
   && [ "$balF51b" = "$balF51" ] && [ "$nF51" = "0" ] && [ "$hA51" = "200" ] \
   && pass "撤回要授权不只是认证：零角色账号（角色数 ${csrole51}）登录成功但撤回=${hF51} 且理由点名 gateway:quota:revoke、余额仍 ${balF51b}、台账 ${nF51} 行；同一接口换 super_admin → ${hA51}" \
@@ -2189,9 +2198,9 @@ row54() { q "SELECT COUNT(*) FROM gateway_group_overrides WHERE user_id=$1"; }
 # ── 块 A：不存在的 id → 400、点名原因、一行也不写 ──
 aA54=$(ov54 999554); mA54=$(jm54); nA54=$(row54 999554)
 [ "$g54" = "default" ] && [ "$aA54" = "400" ] && [ "$nA54" = "0" ] \
-  && printf '%s' "$mA54" | grep -q "no chargeable member" \
+  && [ "$mA54" = "MEMBER_NOT_CHARGEABLE" ] \
   && pass "块A 打错 id 会响：userId=999554（库里没有）→ ${aA54}、message 点名原因（'${mA54:0:58}…'），一行也没写进去(${nA54})" \
-  || fail "块A 不存在的 userId 没被拦: default组=${g54}(期望default，否则这发测的是组码校验) create=${aA54}(期望400，500 意味着 message 不进信封) 写入行数=${nA54}(期望0) message='${mA54:0:120}'(期望含 'no chargeable member')"
+  || fail "块A 不存在的 userId 没被拦: default组=${g54}(期望default，否则这发测的是组码校验) create=${aA54}(期望400，500 意味着 message 不进信封) 写入行数=${nA54}(期望0) message='${mA54:0:120}'(期望 MEMBER_NOT_CHARGEABLE)"
 
 # ── 块 B：NORMAL 会员 → 200 且例外真的落库 ──
 aB54=$(ov54 90541); nB54=$(row54 90541)
@@ -2830,6 +2839,10 @@ nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio
 
 # ══ S77 邮件通道：自定义 HTTP 厂商发信；绑定邮箱 → 邮箱找回密码 → 新密码登录；未知邮箱不发也不报错 ══
 echo "[S77] 邮件通道与邮箱找回密码"
+# S77/S78 验的是真实投递（厂商 HTTP 与 SMTP 握手），而 harness 全局开着验证码模拟通道（只存不发，
+# 短信与邮件一视同仁）。这两段临时以环境变量关掉模拟重启网关，S78 之后按 S72 的环境恢复。
+S72_ENV=(NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NEWGATE_METRICS_TOKEN=mt)
+stop_app; boot_app "${S72_ENV[@]}" NETON_SECURITY__VERIFICATION__SIMULATE=false
 fake mail 9939; sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 mac=$(curl -s --max-time 10 -o /tmp/nanogate-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
@@ -2889,6 +2902,7 @@ em8=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
 # ══ S85 管理员 MFA：要求 MFA 后密码登录只拿到挑战，TOTP 通过才签发会话；动态码不能重放 ══
+stop_app; boot_app "${S72_ENV[@]}"
 echo "[S85] 管理员 MFA"
 totp() { python3 -c "
 import base64,hmac,hashlib,struct,time,sys
@@ -2944,9 +2958,10 @@ stale84=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/us
 t84=$(curl -s --max-time 30 -X POST "$U/app/auth/login" -H "$CT" -d '{"mobile":"+8615000084001","password":"s84-pass-123"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
 [ "$stale84" = "401" ] && [ -n "$t84" ] && pass "设密码后旧令牌失效，新密码可登录" || fail "设密码后会话: 旧令牌=${stale84}(期望401) 新登录令牌=${t84:-无}"
 haspw=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('hasPassword'))" 2>/dev/null)
-wrongpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"nope-nope","newPassword":"s84-pass-456"}')
-[ "$setpw" = "200" ] && [ "$haspw" = "True" ] && [ "$wrongpw" = "400" ] \
-  && pass "无密码账号可直接设密码，之后 hasPassword=true，再改必须验旧密码" || fail "设密码: 设=$setpw hasPassword=$haspw 错旧密码=$wrongpw"
+wrongpw=$(curl -s --max-time 10 -o /tmp/ng-wrongpw-$$.json -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"nope-nope","newPassword":"s84-pass-456"}')
+[ "$setpw" = "200" ] && [ "$haspw" = "True" ] && [ "$wrongpw" = "401" ] && grep -q '"message":"INVALID_CREDENTIALS"' /tmp/ng-wrongpw-$$.json \
+  && pass "无密码账号可直接设密码，之后 hasPassword=true，再改必须验旧密码" || fail "设密码: 设=$setpw hasPassword=$haspw 错旧密码=$wrongpw(期望401 INVALID_CREDENTIALS) $(head -c 160 /tmp/ng-wrongpw-$$.json)"
+rm -f /tmp/ng-wrongpw-$$.json
 rkdel "*ratelimit:*"
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/member/user/send-sms-code" -H "Authorization: Bearer $t84" -H "$CT" -d '{"mobile":"+8615000084002","scene":2}'
 mc84=$(sms_code_of "+8615000084002")
@@ -3017,8 +3032,8 @@ oldshape=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admi
 # 重复编码要给人话，不能是 500
 dup=$(curl -s --max-time 10 -o /tmp/nanogate-dup.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"code":"s81_alipay","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{}"}')
-grep -q "已存在" /tmp/nanogate-dup.json && [ "$dup" != "500" ] \
-  && pass "重复编码给的是人话而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/nanogate-dup.json)"
+grep -q '"message":"PAY_CHANNEL_CODE_EXISTS"' /tmp/nanogate-dup.json && [ "$dup" = "409" ] \
+  && pass "重复编码给的是机器码 PAY_CHANNEL_CODE_EXISTS 而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/nanogate-dup.json)"
 # 侧栏里要有入口，且用户端能看到这条渠道
 pcmenu=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/channel/index' AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
 pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT" | grep -c "s81_alipay")
