@@ -2991,6 +2991,131 @@ bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member
 em8=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
 
+# ══ S88 定价体检：VIP 折扣把毛利压穿时查得出来；单模型加价率能修；改官方价不冲掉售价设置；
+#    同步不把写死的售价变成亏本价；渠道映射到便宜模型时成本按上游模型算 ══
+echo "[S88] 定价体检"
+seed_reset; fake ok 9996
+q "DELETE FROM gateway_groups WHERE code='vip88';
+   INSERT INTO gateway_groups (code,name,ratio,description,deleted,created_at,updated_at) VALUES ('vip88','VIP 88','0.8',NULL,0,0,0);
+   INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at) VALUES ('gateway','gateway.pricing.markup','1.2','全站加价率',0,0)
+     ON CONFLICT (setting_key) DO UPDATE SET value='1.2';
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES
+     ('m-pc','2','10','0','0',5000,'manual',0,0,0),('m-map','10','10','0','0',5000,'manual',0,0,0),('m-cheap','1','1','0','0',5000,'manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-pc','openai_compatible','http://127.0.0.1:9996','default,vip88','m-pc,m-map','{\"m-map\":\"m-cheap\"}',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-pc'),'k',1,0,0,0,0);" >/dev/null
+# 加价率是后台配置（带 10 秒缓存），重启让它立即生效
+stop_app; boot_app "${S72_ENV[@]}"
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)
+chk88() { curl -s --max-time 15 "$U/admin/gateway/price/check" -H "Authorization: Bearer $GJWT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data') or {}
+r=next((x for x in d.get('rows',[]) if x['model']==sys.argv[1]),{})
+w=r.get('worst') or {}
+print(d.get('markup'), r.get('status'), r.get('mode'), w.get('groupCode'), w.get('costModel'), r.get('saleInput'))" "$1" 2>/dev/null; }
+c1=$(chk88 m-pc)
+# 售价 2×1.2=2.4，VIP 0.8 倍 → 实收 1.92 < 成本 2：亏本，最坏组合是 vip88
+[ "$c1" = "1.2 LOSS FOLLOW vip88 m-pc 2.4" ] \
+  && pass "体检查出 VIP 折扣造成的亏本（售价 2.4 × 0.8 = 1.92 < 成本 2，最坏组合 vip88）" || fail "体检亏本: '$c1'（期望 '1.2 LOSS FOLLOW vip88 m-pc 2.4'）"
+PID88=$(q "SELECT id FROM gateway_model_prices WHERE model='m-pc'")
+upd88() { curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/price/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+u1=$(upd88 "{\"id\":$PID88,\"model\":\"m-pc\",\"inputPrice\":\"2\",\"outputPrice\":\"10\",\"defaultMaxOutputTokens\":5000,\"saleOverride\":\"{\\\"markup\\\":\\\"1.3\\\"}\"}")
+c2=$(chk88 m-pc)
+[ "$u1" = "200" ] && [ "$c2" = "1.2 OK MODEL_MARKUP vip88 m-pc 2.6" ] \
+  && pass "本模型加价率 1.3 → VIP 实收 2.08 ≥ 成本 2，体检转正常" || fail "单模型加价率: HTTP=$u1 体检='$c2'（期望 '1.2 OK MODEL_MARKUP vip88 m-pc 2.6'）"
+# 只改官方价（请求不带 saleOverride）：售价设置要保留
+u2=$(upd88 "{\"id\":$PID88,\"model\":\"m-pc\",\"inputPrice\":\"1.9\",\"outputPrice\":\"10\",\"defaultMaxOutputTokens\":5000}")
+so88=$(q "SELECT sale_override FROM gateway_model_prices WHERE id=$PID88")
+[ "$u2" = "200" ] && [ "$so88" = '{"markup":"1.3"}' ] \
+  && pass "只改官方价不冲掉单独设的售价（sale_override 仍为 ${so88}）" || fail "改官方价冲掉了售价设置: HTTP=$u2 sale_override='$so88'"
+# 写死售价后同步一个更高的官方价：会亏本 → 扣下不写，旧官方价保留
+u3=$(upd88 "{\"id\":$PID88,\"model\":\"m-pc\",\"inputPrice\":\"1.9\",\"outputPrice\":\"10\",\"defaultMaxOutputTokens\":5000,\"saleOverride\":\"{\\\"input\\\":\\\"2.5\\\",\\\"output\\\":\\\"13\\\"}\"}")
+imp88=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"items":[{"model":"m-pc","inputPrice":"3","outputPrice":"10"}],"overwrite":true}' | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('updated'),','.join(d.get('heldForLoss') or []))" 2>/dev/null)
+ip88=$(q "SELECT input_price FROM gateway_model_prices WHERE id=$PID88")
+[ "$u3" = "200" ] && [ "$imp88" = "0 m-pc" ] && [ "$ip88" = "1.9" ] \
+  && pass "写死售价 2.5 时同步官方价 3 会亏本 → 扣下不写（官方价仍 ${ip88}）" || fail "同步亏本闸门: 设价=$u3 导入='$imp88'（期望 '0 m-pc'） 官方价=$ip88（期望 1.9）"
+# 模型映射：m-map 映射到 m-cheap，成本按 m-cheap（1/1）而不是 m-map（10/10）
+c4=$(chk88 m-map)
+curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-map","messages":[]}'
+wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-map'" 1 30 >/dev/null
+cc88=$(q "SELECT charged||' '||cost FROM gateway_usage_logs WHERE request_model='m-map' ORDER BY id DESC LIMIT 1")
+ch88=${cc88% *}; co88=${cc88#* }
+[ "$(echo "$c4" | cut -d' ' -f5)" = "m-cheap" ] && [ -n "$co88" ] && [ "${co88:-0}" -gt 0 ] && [ $(( co88 * 5 )) -lt "${ch88:-0}" ] \
+  && pass "渠道映射到便宜模型：体检与结算都按 m-cheap 算成本（收入 ${ch88} / 成本 ${co88}）" \
+  || fail "映射成本: 体检='$c4' 收入/成本='${cc88}'（期望成本约为收入的 1/12）"
+q "DELETE FROM system_settings WHERE setting_key='gateway.pricing.markup'; DELETE FROM gateway_groups WHERE code='vip88';" >/dev/null
+seed_reset
+
+# ══ S89 校准官方价：价源差异看得到、只写勾选的、写了留调价记录；OpenRouter 的厂商前缀能对上 ══
+echo "[S89] 校准官方价"
+seed_reset
+q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at) VALUES
+     ('gateway','gateway.pricing.source_format','litellm','官方价价源格式',0,0),
+     ('gateway','gateway.pricing.source_url','http://127.0.0.1:9996/litellm.json','官方价价源地址',0,0)
+   ON CONFLICT (setting_key) DO UPDATE SET value=EXCLUDED.value;
+   DELETE FROM gateway_price_history;
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES
+     ('cal-a','2.5','10','0.25','0',5000,'manual',0,0,0),('cal-b','1','2','0','0',5000,'manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-cal','openai_compatible','http://127.0.0.1:9996','default','cal-a,cal-b,cal-new',1,1,1,30000,90000,'1.0',0,0,0);" >/dev/null
+calp() { curl -s --max-time 20 "$U/admin/gateway/price/calibrate/preview" -H "Authorization: Bearer $GJWT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data') or {}
+print(' '.join(f\"{r['model']}:{r['status']}:{r.get('sourceInput')}:{r.get('changeBp')}:{r.get('sourceKey')}\" for r in d.get('rows',[])), d.get('error') or '')" 2>/dev/null; }
+p1=$(calp)
+[ "$p1" = "cal-a:CHANGED:3:5000:cal-a cal-b:SAME:1:0:cal-b cal-new:NEW:0.5:0:cal-new " ] \
+  && pass "LiteLLM 价源：cal-a 有变化（输出 10→15，+50%）、cal-b 一致、渠道已承载未定价的 cal-new 建议新增" \
+  || fail "校准预览: '$p1'"
+ap89=$(curl -s --max-time 20 -X POST "$U/admin/gateway/price/calibrate/apply" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"models":["cal-a","cal-new"]}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('created'),d.get('updated'),len(d.get('errors') or []))" 2>/dev/null)
+pa89=$(q "SELECT input_price||'/'||output_price||'/'||cache_read_price||'/'||source FROM gateway_model_prices WHERE model='cal-a'")
+pn89=$(q "SELECT input_price||'/'||output_price||'/'||COALESCE(default_max_output_tokens::text,'') FROM gateway_model_prices WHERE model='cal-new'")
+pb89=$(q "SELECT source FROM gateway_model_prices WHERE model='cal-b'")
+h89=$(q "SELECT action FROM gateway_price_history WHERE model='cal-a' ORDER BY id DESC LIMIT 1")
+[ "$ap89" = "1 1 0" ] && [ "$pa89" = "3/15/0.3/calibrate" ] && [ "$pn89" = "0.5/1/" ] && [ "$pb89" = "manual" ] && [ "$h89" = "calibrate" ] \
+  && pass "应用所选：cal-a 写成价源价（${pa89}）、cal-new 新增、没勾的 cal-b 不动，调价记录有 calibrate" \
+  || fail "校准应用: 结果='$ap89'(期望 '1 1 0') cal-a='$pa89' cal-new='$pn89' cal-b.source='$pb89' 记录='$h89'"
+q "UPDATE system_settings SET value='openrouter' WHERE setting_key='gateway.pricing.source_format';
+   UPDATE system_settings SET value='http://127.0.0.1:9996/openrouter.json' WHERE setting_key='gateway.pricing.source_url';" >/dev/null
+p2=$(calp)
+[ "$(echo "$p2" | tr ' ' '\n' | grep '^cal-a:')" = "cal-a:CHANGED:4:3333:acme/cal-a" ] \
+  && pass "OpenRouter 价源：acme/cal-a 去掉厂商前缀后对上 cal-a" || fail "OpenRouter 匹配: '$p2'"
+q "DELETE FROM system_settings WHERE setting_key LIKE 'gateway.pricing.source_%';" >/dev/null
+seed_reset
+
+# ══ S90 利润看板与令牌专属分组：亏本请求在概览里看得到；分组/渠道有收入；令牌只能指向存在的分组 ══
+echo "[S90] 利润看板与令牌分组"
+seed_reset
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-loss','10','10','0','0',5000,'manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-loss','openai_compatible','http://127.0.0.1:9996','default','m-loss',1,1,1,30000,90000,'2.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-loss'),'k',1,0,0,0,0);" >/dev/null
+curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-loss","messages":[]}'
+wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-loss'" 1 30 >/dev/null
+ov90=$(curl -s --max-time 15 "$U/admin/gateway/info/overview?days=1" -H "Authorization: Bearer $GJWT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data') or {}
+g={x['groupCode']:x for x in d.get('groups',[])}.get('default',{})
+c={x['name']:x for x in d.get('channels',[])}.get('c-loss',{})
+print(d.get('lossRequests'), d.get('lossAmount',0)>0, g.get('charged',0)>0, c.get('charged',0)>0 and c.get('cost',0)>c.get('charged',0))" 2>/dev/null)
+[ "$ov90" = "1 True True True" ] \
+  && pass "概览：折扣 2.0 的渠道让 1 笔请求亏本，亏损金额、分组收入、渠道收入与成本都看得到" || fail "利润看板: '$ov90'（期望 '1 True True True'）"
+TID90=$(q "SELECT id FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+q "DELETE FROM gateway_groups WHERE code='vip90'; INSERT INTO gateway_groups (code,name,ratio,description,deleted,created_at,updated_at) VALUES ('vip90','VIP 90','0.9',NULL,0,0,0);" >/dev/null
+g1=$(curl -s --max-time 10 -o /tmp/ng-s90.json -w "%{http_code}" -X PUT "$U/admin/gateway/token/update-group?id=$TID90&groupCode=ghost90" -H "Authorization: Bearer $GJWT")
+gm1=$(grep -o 'GROUP_CODE_UNKNOWN' /tmp/ng-s90.json | head -1)
+go1=$(q "SELECT COALESCE(group_override,'') FROM gateway_tokens WHERE id=$TID90")
+g2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/token/update-group?id=$TID90&groupCode=vip90" -H "Authorization: Bearer $GJWT")
+go2=$(q "SELECT COALESCE(group_override,'') FROM gateway_tokens WHERE id=$TID90")
+g3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/token/update-group?id=$TID90&groupCode=" -H "Authorization: Bearer $GJWT")
+go3=$(q "SELECT COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$TID90")
+[ "$g1" = "400" ] && [ "$gm1" = "GROUP_CODE_UNKNOWN" ] && [ -z "$go1" ] && [ "$g2" = "200" ] && [ "$go2" = "vip90" ] && [ "$g3" = "200" ] && [ "$go3" = "<null>" ] \
+  && pass "令牌专属分组：不存在的组被拒（GROUP_CODE_UNKNOWN）、存在的组能设、留空即取消" \
+  || fail "令牌分组: 悬空=${g1}/${gm1}/'${go1}' 设置=${g2}/'${go2}' 取消=${g3}/'${go3}'"
+q "DELETE FROM gateway_groups WHERE code='vip90';" >/dev/null; rm -f /tmp/ng-s90.json
+seed_reset
+
 # ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
 echo "[S87] 人机验证"
 # 核验地址指到本地假 siteverify（fakes.py turnstile：secret 必须是 ts-secret，凭证 ok:<action> 通过且只能用一次）

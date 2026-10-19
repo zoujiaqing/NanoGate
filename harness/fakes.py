@@ -40,6 +40,20 @@ class H(BaseHTTPRequestHandler):
             self._json(200, _last_mail or {}); return
         if self.path == "/last-verify":
             self._json(200, _last_verify or {}); return
+        if self.path == "/litellm.json":
+            # LiteLLM 价目表形状：每 token 美元价；sample_spec 是它文件里的说明条目，必须被跳过
+            self._json(200, {
+                "sample_spec": {"input_cost_per_token": 0, "output_cost_per_token": 0},
+                "cal-a": {"input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07, "max_output_tokens": 8192, "mode": "chat"},
+                "cal-b": {"input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06, "mode": "chat"},
+                "cal-new": {"input_cost_per_token": 5e-07, "output_cost_per_token": 1e-06, "mode": "chat"},
+            }); return
+        if self.path == "/openrouter.json":
+            # OpenRouter /api/v1/models 形状：id 带厂商前缀，价格是每 token 美元价的字符串
+            self._json(200, {"data": [
+                {"id": "acme/cal-a", "pricing": {"prompt": "0.000004", "completion": "0.00002", "input_cache_read": "0.0000004"}},
+                {"id": "acme/cal-b", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+            ]}); return
         if self.path == "/prices.json":
             # 价源同步用的价目表（对象形状）
             self._json(200, {"sync-a": {"input": 1.5, "output": 6, "maxOutput": 4096}, "sync-b": {"inputPrice": "0.2", "outputPrice": "0.8"}})
