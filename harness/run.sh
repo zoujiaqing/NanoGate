@@ -32,6 +32,12 @@ export NETON_MFA_MASTER_KEY="${NETON_MFA_MASTER_KEY:-AAECAwQFBgcICQoLDA0ODxAREhM
 # JWT 签名密钥：仓库配置里只有占位值，应用检测到占位或短于 32 字符的密钥会拒绝启动（system 的
 # requireUsableJwtSecret）。harness 用一个只在本脚本里出现的测试值。
 export NETON_SECURITY__JWT__SECRETKEY="${NETON_SECURITY__JWT__SECRETKEY:-harness-only-jwt-secret-not-for-production-000}"
+# 假上游都在 127.0.0.1 的各个端口上：渠道流量走受控出站客户端，默认只连公网 80/443，所以 harness 按运维方式
+# 放行这一个字面量（application.conf [egress] allowed_hosts，任意端口）。别的回环写法（localhost、[::1]、127.0.0.2）
+# 与云元数据仍被拒，S25b 就靠这一点验证请求时强制；它的假上游端口 9976 额外放进 allowed_ports，
+# 让 localhost:9976 走到地址判定（而不是先因端口被拒）。
+export NETON_EGRESS__ALLOWED_HOSTS="127.0.0.1"
+export NETON_EGRESS__ALLOWED_PORTS="80,443,9976"
 PASS=0; FAIL=0; PIDS=()
 
 # 清理：只终结本次 run 创建的进程（PIDS），逐个等待退出后再 drop 明确库名；不 pkill 全机同名进程。
@@ -792,21 +798,53 @@ mkch() { curl -s --max-time 10 -o "/tmp/s25-$2-$$" -w "%{http_code}" -X POST "$U
   -H "Authorization: Bearer $JWT" -H "$CT" -d "{\"name\":\"s25-$2\",\"type\":\"openai_compatible\",\"baseUrl\":\"$1\"}"; }
 meta=$(mkch "http://169.254.169.254/latest/meta-data" meta)
 loop=$(mkch "http://[::1]:9974/v1" loop)
-pub=$(mkch "http://8.8.8.8:8080/v1" pub)
-nbad=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name IN ('s25-meta','s25-loop')")
+port=$(mkch "http://8.8.8.8:8080/v1" port); portbody=$(cat "/tmp/s25-port-$$" 2>/dev/null)
+pub=$(mkch "http://8.8.8.8/v1" pub)
+nbad=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name IN ('s25-meta','s25-loop','s25-port')")
 npub=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s25-pub'")
-[ "$meta" = "400" ] && [ "$loop" = "400" ] && [ "$nbad" = "0" ] && [ "$pub" = "200" ] && [ "$npub" = "1" ] \
-  && pass "SSRF：云元数据 169.254.169.254 与 [::1] 被拒(400/未落库)、公网字面量正常创建(200/落库=${npub})" \
-  || fail "SSRF 校验错: 元数据=${meta}(期望400) ipv6回环=${loop}(期望400) 未落库=${nbad}(期望0) 公网=${pub}(期望200/落库${npub})"
+[ "$meta" = "400" ] && [ "$loop" = "400" ] && [ "$port" = "400" ] && echo "$portbody" | grep -q UPSTREAM_URL_PORT_FORBIDDEN \
+  && [ "$nbad" = "0" ] && [ "$pub" = "200" ] && [ "$npub" = "1" ] \
+  && pass "SSRF：云元数据 169.254.169.254、[::1]、非放行端口 8080 被拒(400/未落库)、公网字面量正常创建(200/落库=${npub})" \
+  || fail "SSRF 校验错: 元数据=${meta}(期望400) ipv6回环=${loop}(期望400) 端口=${port}(期望400 PORT_FORBIDDEN) 未落库=${nbad}(期望0) 公网=${pub}(期望200/落库${npub})"
 dom=$(mkch "https://api.openai.com/v1" dom); reason=$(cat "/tmp/s25-dom-$$" 2>/dev/null)
 rm -f "/tmp/s25-"*"-$$"
 if [ "$dom" = "200" ]; then
   pass "域名渠道经 DNS 复查后放行（api.openai.com）"
 elif echo "$reason" | grep -q "UPSTREAM_URL_UNRESOLVABLE"; then
   echo "  ⚠️  本机解析不出 api.openai.com → 按 fail-closed 拒绝（DNS 不可用时的预期行为，不计失败）" >&2
+elif echo "$reason" | grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" && dscacheutil -q host -a name api.openai.com 2>/dev/null | grep -Eq 'ip_address: 198\.(18|19)\.'; then
+  echo "  ⚠️  本机 DNS 是 fake-IP 模式（api.openai.com → 198.18.0.0/15）→ 按非公网地址拒绝（预期行为，不计失败）" >&2
 else
   fail "域名渠道被意外拒绝: ${dom} ${reason}"
 fi
+
+# ══ S25b 请求时强制（写库绕过写入时校验的渠道）══
+# 写入时校验只是快速反馈；真正的强制点是请求时的受控出站客户端。这里直接往库里插指向回环别名与云元数据的渠道
+# （管理 API 会拒，DB 直写不会），验证：转发 503（localhost 别名若被放行就会打到同一个假上游而成功）、Key 不计失败、
+# 探测结果带机器码；
+# 同一个假上游经运维放行的 127.0.0.1 照常可用（自托管内网上游的正路）。
+echo "[S25b] 渠道请求时出站校验"
+seed_reset; fake ok 9976; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+   ('s25b-alias','openai_compatible','http://localhost:9976','default','m-ssrf',1,1,1,3000,3000,'1.0',0,0,0),
+   ('s25b-meta','openai_compatible','http://169.254.169.254','default','m-ssrf',1,1,1,3000,3000,'1.0',0,0,0),
+   ('s25b-ok','openai_compatible','http://127.0.0.1:9976','default','m-ok25',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at)
+     SELECT id,'k',1,0,0,0,0 FROM gateway_channels WHERE name LIKE 's25b-%';
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES
+   ('m-ssrf','1','1','0','0',5000,'manual',0,0,0),('m-ok25','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
+blocked=$(curl -s --max-time 15 -o /tmp/s25b-$$ -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ssrf","messages":[]}')
+bbody=$(cat /tmp/s25b-$$ 2>/dev/null); rm -f /tmp/s25b-$$
+okc=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-ok25","messages":[]}')
+kf=$(q "SELECT COALESCE(SUM(fail_count),0) FROM gateway_channel_keys k JOIN gateway_channels c ON c.id=k.channel_id WHERE c.name IN ('s25b-alias','s25b-meta')")
+probe=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-meta)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
+palias=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-alias)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
+refused=$(grep -c "relay target refused" "$WORK/logs/all.log")
+[ "$blocked" = "503" ] && echo "$bbody" | grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" && [ "$okc" = "200" ] && [ "$kf" = "0" ] \
+  && echo "$probe" | grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' && echo "$palias" | grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' \
+  && [ "$refused" -ge 2 ] \
+  && pass "请求时拒绝 localhost 别名与 169.254.169.254（503、Key 不计失败、探测 errorCode=UPSTREAM_URL_PRIVATE_ADDRESS）；放行的 127.0.0.1 照常 200" \
+  || fail "请求时出站校验错: 拦截=${blocked}(期望503) body=${bbody:0:200} 放行=${okc}(期望200) Key失败=${kf}(期望0) 探测=${probe:0:200} 别名探测=${palias:0:200} 日志拒绝条数=${refused}"
 
 # ════════════════════════════════════════════════════════════════════
 # S26–S34：计费组身份（gateway V002）与充值闭环（gateway V003）

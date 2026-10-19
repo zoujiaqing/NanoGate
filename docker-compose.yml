@@ -73,8 +73,11 @@ services:
       NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
       # 未设置则渠道 Key 以明文入库——数据库一旦泄露，你采购的所有上游 Key 都会泄露
       NEWGATE_CHANNEL_KEY_ENC_KEY: ${CHANNEL_KEY_ENC_KEY:-}
-      # 自托管且上游在内网时才打开（默认拒绝内网地址以防 SSRF）
-      NEWGATE_ALLOW_PRIVATE_UPSTREAM: ${ALLOW_PRIVATE_UPSTREAM:-false}
+      # 运维出站策略（application.conf [egress]）：渠道 / 短信 / 邮件 / 支付这些后台可改的出站地址默认只连公网 80/443。
+      # 自托管上游在内网时按网段或主机精确放行（见 DEPLOY.md「上游地址与 SSRF」）；留空 = 只连公网。
+      NETON_EGRESS__ALLOWED_PORTS: ${EGRESS_ALLOWED_PORTS:-80,443}
+      NETON_EGRESS__ALLOWED_HOSTS: ${EGRESS_ALLOWED_HOSTS:-}
+      NETON_EGRESS__ALLOWED_NETWORKS: ${EGRESS_ALLOWED_NETWORKS:-}
       # 双轨计价：售价 = sale_override 或官方价 × 加价率（收入）；成本 = 官方价 × 渠道折扣
       NEWGATE_SALE_MARKUP: ${SALE_MARKUP:-1}
       # 发布闸门：售价低于「官方成本 × 此倍率」的定价不得保存

@@ -424,30 +424,39 @@ systemctl daemon-reload && systemctl enable --now netonapi-watch.timer
 - 网络层仍建议只允许反代连到网关端口：不是为了防 IP 伪造（对端地址伪造不了，上面那条已经关掉），
   而是为了让 TLS / WAF / 代理侧限流这些控制不被直连绕过。
 
-## 上游地址与 SSRF
+## 上游地址与 SSRF（出站策略）
 
-渠道的 `baseUrl` / `proxyUrl` 决定网关往哪儿发请求，配错（或被越权改）就等于把网关变成打内网的跳板。
-写入时做两层校验，任一层不过即 `400` 且不落库：
+渠道的 `baseUrl` / `proxyUrl`、Vertex 服务账号 Key 里的 `token_uri` 都是管理员在后台录入的数据，决定网关往哪儿发请求；
+配错（或被越权改）就等于把网关变成打内网的跳板。短信 / 邮件渠道的地址、支付渠道的网关地址同理。
 
-1. **字面量**：非 http(s)、带 userinfo、回环 / RFC1918 / 链路本地（含云元数据 `169.254.169.254`）/
-   IPv6 ULA 与链路本地 / CGNAT / `0.0.0.0/8`，以及 `localhost`、`*.localhost`、`*.local`、`*.internal`。
-2. **DNS 复查**：域名再解析一次，**任一** A/AAAA 记录落在上述范围即拒绝（多条记录里混一个内网地址
-   正是绕过一次性检查的常见手法）；解析不出来一律 fail-closed——把「DNS 挂了」当成「地址安全」
-   是这类校验最典型的失效方式。
+**强制点在请求时。** 这些流量全部走受控出站客户端（neton-http `GuardedHttpClientProvider`）：每条新连接解析一次主机名，
+**全部** A/AAAA 记录都必须是公网地址（IANA 特殊用途段一律拒：回环、RFC1918、CGNAT、链路本地含云元数据
+`169.254.169.254`、IPv6 ULA / 链路本地、保留段，IPv4 映射 / NAT64 / 6to4 按内嵌的 IPv4 判断，`2130706433` 这类非规范写法直接拒），
+端口必须在放行列表里（默认 80、443），然后**只连校验过的那个 IP**：校验与连接之间改 DNS（重绑定）挪不走连接，TLS 仍按原主机名
+做 SNI 与证书校验。经代理时代理只会收到校验过的 IP（`CONNECT <ip>:443`，http 用指向 IP 的 absolute-form、`Host` 保留原主机），
+代理地址本身也按同一规则校验。被拒的请求一个包都不发：转发换下一个候选渠道（不计 Key 失败，全部被拒时 `503 no_available_channel`，
+消息里带机器码），探测 / 拉模型结果带 `errorCode`（`UPSTREAM_URL_PRIVATE_ADDRESS` / `UPSTREAM_URL_PORT_FORBIDDEN` /
+`UPSTREAM_URL_UNRESOLVABLE` / `UPSTREAM_PROXY_FORBIDDEN`），日志搜 `relay target refused`。
 
-必须知道的边界：
+写入时（新建 / 修改渠道、添加 Key）用**同一个**策略和同一个解析器先校验一遍，不过即 `400` 且不落库——那只是快速反馈，
+直接写库的渠道同样在请求时被拦。
 
-- 这是**写入时**检查，挡不住「先指向公网通过校验、再改 DNS 记录指向内网」的重绑定。那一层只能靠
-  部署侧出网过滤：给网关容器一个只允许出公网 443/80 的 egress 策略，并在云上关掉/挡住元数据服务
-  （IMDSv2 + 安全组）。**不要把出网过滤当成可选项**——它是唯一能覆盖重绑定的一层。
-- 解析是阻塞调用，只发生在管理员写渠道这类低频路径，不进中转热路径（每请求解析一次等于把 DNS
-  变成延迟与故障源）。
-- 自托管确实要连内网上游时设 `NEWGATE_ALLOW_PRIVATE_UPSTREAM=true`：它同时关掉上面两层
-  （连内网上游是明确的经营决定，不该靠校验疏漏来实现）。
-- Windows(mingw) 构建**不提供解析器**：WinSock 的 `getaddrinfo` 需要先 `WSAStartup`，而初始化时序由
-  HTTP 引擎掌握、不在本模块手里，且该目标在本仓只能交叉编译、无法运行验证——一旦解析在运行期失败，
-  fail-closed 会让 Windows 部署完全无法新增域名渠道。此时只剩字面量校验，每次渠道写入会打一条降级
-  告警（日志里搜 `DNS re-check unavailable`）。生产请用 Linux 构建。
+**放行内网上游只有一个口子：部署配置。** 自托管模型在 10.x、出口代理在内网时，在 `application.conf` 的 `[egress]`
+（或环境变量）里放行，后台改不了它：
+
+```toml
+[egress]
+allowed_ports = "80,443,8000"          # 默认 80,443
+allowed_hosts = "vllm.internal"        # 主机名 / IP 字面量精确匹配：解析到哪、什么端口都放行
+allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍按 allowed_ports）
+```
+
+环境变量写法：`NETON_EGRESS__ALLOWED_NETWORKS=10.20.0.0/16`（compose 里对应 `EGRESS_ALLOWED_*`，见 `.env.example`）。
+任一放行项非空时启动日志打 WARN `egress.allowlist.enabled`。旧的 `NEWGATE_ALLOW_PRIVATE_UPSTREAM` 已删除——它一刀关掉全部校验，
+现在只能按网段 / 主机精确放行。
+
+仍建议的部署侧措施：给网关容器只允许出公网 443/80 的网络策略，云上开 IMDSv2 并用安全组挡元数据服务。它们是纵深防御，
+不再是唯一能覆盖重绑定的一层。
 
 ## Redis
 
