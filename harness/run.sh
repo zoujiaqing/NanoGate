@@ -1144,12 +1144,12 @@ ntx32b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID'")
 
 echo "[S33] 入账失败可恢复：整笔回滚，不留「付了钱没额度」也不留「已支付但台账没记」"
 rc33=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
-  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":50,"channelCode":"sandbox_alipay"}')
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 RID2=$(jdata rechargeId); MOID2="gateway:quota:$RID2"
-# 伪装成「已关闭」：markPaid 见到非待支付状态会抛，异常沿 SYNC 监听者传回 payment 的
+# 伪装成「已退款」：markPaid 见到不可入账的状态会抛（已关闭仍可入账：过期临界点付款的钱要认），异常沿 SYNC 监听者传回 payment 的
 # updateSuccess 事务 → 整笔回滚。这正是想要的：宁可支付单停在未支付（可重投），
 # 也不要它变成已支付而额度没发 —— 后者没人会再去看，钱就静静消失了。
-q "UPDATE gateway_quota_recharges SET pay_status=2 WHERE id=$RID2" >/dev/null
+q "UPDATE gateway_quota_recharges SET pay_status=3 WHERE id=$RID2" >/dev/null
 cb33=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID2\"}")
 sleep 1
 pos33=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID2'")
@@ -1166,9 +1166,55 @@ pos33b=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID2'")
 ntx33b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID2'")
 bal33b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 ps33b=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$RID2")
-[ "$cb33b" = "200" ] && [ "$pos33b" = "1" ] && [ "$ntx33b" = "1" ] && [ "$bal33b" = "100150000" ] && [ "$ps33b" = "1" ] \
-  && pass "重投即恢复：支付单转已支付、台账 1 条、余额 ${bal33}→${bal33b}(+50000)" \
-  || fail "重投没恢复: HTTP=${cb33b} pay_orders.status=${pos33b}(期望1) 台账=${ntx33b}(期望1) 余额=${bal33b}(期望100150000) pay_status=${ps33b}(期望1)"
+[ "$cb33b" = "200" ] && [ "$pos33b" = "1" ] && [ "$ntx33b" = "1" ] && [ "$bal33b" = "100200000" ] && [ "$ps33b" = "1" ] \
+  && pass "重投即恢复：支付单转已支付、台账 1 条、余额 ${bal33}→${bal33b}(+100000)" \
+  || fail "重投没恢复: HTTP=${cb33b} pay_orders.status=${pos33b}(期望1) 台账=${ntx33b}(期望1) 余额=${bal33b}(期望100200000) pay_status=${ps33b}(期望1)"
+
+echo "[S86] 充值金额边界、回调金额核对、退款扣回额度"
+# 三处钱的口子，各一条断言：
+#   ① 下单金额有上下限（gateway.recharge.min_price / max_price，单位分）—— 1 分钱订单只会刷手续费
+#   ② 回调带来的实付金额必须等于订单金额 —— 否则改一下回调里的金额就能 1 分钱买 100 元额度
+#   ③ 退款按比例扣回已发放的额度，台账留一条 refund —— 否则「先充值、用掉、再退款」白拿额度
+lo86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":99,"channelCode":"sandbox_alipay"}')
+klo86=no; grep -q 'RECHARGE_PRICE_TOO_LOW' "$GB" && klo86=yes
+hi86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":1000001,"channelCode":"sandbox_alipay"}')
+khi86=no; grep -q 'RECHARGE_PRICE_TOO_HIGH' "$GB" && khi86=yes
+[ "$lo86" = "400" ] && [ "$klo86" = "yes" ] && [ "$hi86" = "400" ] && [ "$khi86" = "yes" ] \
+  && pass "充值金额边界：99 分 → TOO_LOW、1000001 分 → TOO_HIGH" \
+  || fail "充值金额边界: 低=${lo86}(期望400,点名=${klo86}) 高=${hi86}(期望400,点名=${khi86})"
+
+c86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
+  -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":200,"channelCode":"sandbox_alipay"}')
+RID86=$(jdata rechargeId); MOID86="gateway:quota:$RID86"
+bal86a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+curl -s --max-time 15 -o /dev/null -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" \
+  -d "{\"merchantOrderId\":\"$MOID86\",\"amount\":\"1\"}"
+sleep 1
+pos86=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
+ntx86=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID86'")
+curl -s --max-time 15 -o /dev/null -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" \
+  -d "{\"merchantOrderId\":\"$MOID86\",\"amount\":\"200\"}"
+sleep 1
+pos86b=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
+bal86b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+[ "$c86" = "200" ] && [ "$pos86" = "0" ] && [ "$ntx86" = "0" ] && [ "$pos86b" = "1" ] && [ "$bal86b" = "$((bal86a+200000))" ] \
+  && pass "回调金额核对：实付 1 分 ≠ 订单 200 分 → 不入账；实付相符 → 入账 +200000" \
+  || fail "回调金额核对: 下单=${c86} 不符后支付单=${pos86}(期望0) 台账=${ntx86}(期望0) 相符后=${pos86b}(期望1) 余额=${bal86a}→${bal86b}(期望+200000)"
+
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)
+rf86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/pay/refund/create" \
+  -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"merchantOrderId\":\"$MOID86\",\"merchantRefundId\":\"s86-refund-$RID86\",\"refundAmount\":100}")
+sleep 1
+bal86c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ps86=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$RID86")
+rtx86=$(q "SELECT type||':'||amount FROM gateway_quota_transactions WHERE ref='refund:$MOID86'")
+pos86c=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
+[ "$rf86" = "200" ] && [ "$bal86c" = "$((bal86b-100000))" ] && [ "$ps86" = "3" ] && [ "$rtx86" = "refund:-100000" ] \
+  && pass "退款扣回额度：退一半(100/200 分) → 扣回 100000、台账 ${rtx86}、充值单转已退款" \
+  || fail "退款扣回: HTTP=${rf86} 余额=${bal86b}→${bal86c}(期望-100000) pay_status=${ps86}(期望3) 台账='${rtx86}'(期望refund:-100000) 支付单=${pos86c} body=$(head -c 200 "$GB")"
 
 echo "[S34] 钱包充值不增网关额度（两个账本不共用余额）"
 # 同一笔支付不能既进钱包又进网关额度：那样一次付款发放两份价值。
