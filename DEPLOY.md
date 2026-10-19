@@ -97,13 +97,20 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 ## 管理员 MFA 与管理台 IP 白名单
 
+**人机验证**：在 Cloudflare Turnstile 建一个站点，secret key 设为 `CAPTCHA_SECRET`（容器内 `NETON_CAPTCHA_SECRET`），
+然后在管理台「配置管理」打开 `system.security.captcha.enabled`、填 `system.security.captcha.site_key`，
+`system.security.captcha.actions` 选需要验证的动作（默认 `register,send_code`：注册与匿名发短信/邮件验证码；
+还可加 `login` 用户登录、`admin_login` 管理员登录）。凭证由后端向 Turnstile 核验，并核对它是为哪个动作签发的；
+开了开关却没配 secret、或 Turnstile 不可达时，这些动作返回 503 而不是放行。大陆网络访问 Turnstile 不稳定，
+面向大陆用户时先实测登录注册页能否加载组件。
+
 **MFA**：设置 `MFA_MASTER_KEY` 后，在管理台「用户管理」里把某个管理员设为必须 MFA（`PUT /admin/system/user/mfa/{id}`）。
 设置后他已有的会话立即失效；下次用密码登录只拿到一次性挑战，首次要用认证器 App 绑定，之后每次输入 6 位动态码，同一个码不能重复使用。
 丢了手机由其他管理员重置（`POST /admin/system/user/mfa/{id}/reset`，需要「重置密码」权限）。
 
 **白名单**：`ADMIN_IP_ALLOWLIST_ENABLED=true` 加 `ADMIN_IP_ALLOWLIST=你的出口IP或网段`，限制的是整个 `/admin` 路由组，
 包括登录接口，判定发生在认证、限流之前。上线前先确认 `RATELIMIT_TRUSTED_PROXIES` 指向你的反向代理
-（compose 默认是 caddy 的 `172.28.0.10`，裸机部署是 `127.0.0.1,::1`），并在日志 `rateLimit.initialized` 里看到
+（compose 默认是 caddy 与控制台的 `172.28.0.10,172.28.0.11`，裸机部署是 `127.0.0.1,::1`），并在日志 `rateLimit.initialized` 里看到
 `trustedProxies` 不为 0——否则后端看到的来源全是代理自己，白名单会把所有人挡在外面。
 写错锁住了管理台，只能登服务器改配置重启，没有远程绕过接口。配置变更都需要重启。
 
@@ -270,7 +277,10 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 - [ ] 三个密钥都已设置，且不是示例值
 - [ ] 数据库端口未对公网暴露（compose 默认只 `expose` 不 `ports`）
 - [ ] 网关放在 TLS 终止层之后（本服务不处理证书）
-- [ ] 前置反代时已设 `TRUSTED_PROXIES`（容器内为 `NEWGATE_TRUSTED_PROXIES`），否则令牌 IP 白名单看到的是代理自己的地址
+- [ ] 前置反代时已设 `RATELIMIT_TRUSTED_PROXIES`（容器内为 `NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES`），否则限流与令牌 IP 白名单看到的都是代理自己的地址；旧的 `NEWGATE_TRUSTED_PROXIES` 已删除
+- [ ] 验证码全站日上限按短信预算设置（`NETON_SECURITY__VERIFICATION__DAILY_LIMIT_GLOBAL`，默认 1000 条/天/通道；0 = 不限，被刷时账单没有上限）
+- [ ] 数据库每天备份并同步到另一台机器或对象存储，且**做过一次恢复演练**（见「备份与恢复」）
+- [ ] 告警已接通：`netonapi-watch.timer` 在跑、webhook 收到过测试消息，另有外部拨测打 `/health`（见「可观测性」）
 - [ ] 多实例部署共用同一个 Redis，否则限流上限被放大到实例数倍
 - [ ] 网关容器的出网已收敛（云元数据服务与内网不可达）——写入时 SSRF 校验挡不住 DNS 重绑定
 - [ ] 为令牌设置 RPM / TPM / 并发上限——不限意味着单个用户就能打爆你的上游配额与成本
@@ -307,8 +317,9 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 | 其余（含管理台自己的 `/platform/api` 等页面） | 管理台 `front:3000` |
 | `CONSOLE_SITE` 整站 | 控制台 `console:3000`（它自带 `/api/backend` 服务端代理，不直连） |
 
-Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUSTED_PROXIES` 默认只信它——
-这样令牌 IP 白名单拿到的是真实客户端地址，而直连 `8800` 的请求伪造转发头也无效。
+Caddy 与控制台在 compose 默认网络里固定为 `172.28.0.10` / `172.28.0.11`，后端 `NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES`
+默认只信它们——控制台的服务端代理原样透传 Caddy 写入的 `X-Forwarded-For`，所以登录限流、令牌 IP 白名单拿到的
+都是真实客户端地址，而直连 `8800` 的请求伪造转发头也无效。
 后端 `/health`（匿名，DB 能应答才 200）与两个前端镜像都自带 HEALTHCHECK，compose 的 `depends_on` 一律用 `service_healthy`。
 
 生产：`.env` 填 `ADMIN_SITE` / `CONSOLE_SITE` 为域名，并叠加 `deploy/docker-compose.prod.yml` 发布 80/443，Caddy 自动签发证书。
@@ -361,7 +372,25 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
   - `gateway-price-sync`（每天 03:10）：从 `NEWGATE_PRICE_SYNC_URL` 拉价目表导入（格式与管理台批量导入一致），
     `NEWGATE_PRICE_SYNC_OVERWRITE=false` 则只补新模型。管理台「模型定价 → 同步价源」可立即拉一次。
 
-没有 metrics 端点（框架未引入 Prometheus 之类的依赖，这是下一步）。上线前至少能看这三样：
+**告警**：没有 Prometheus 时用 `deploy/monitor/netonapi-watch.sh`（systemd 定时器每分钟跑），出事向
+`WATCH_ALERT_WEBHOOK` 发 `{"text": "..."}`：`/health` 不是 200、有结算进入人工复核、启用中的渠道测速全部失败、
+26 小时内没有新备份。每项独立去重 —— 变坏报一次、持续坏每 6 小时提醒、恢复报一次，不会每分钟轰炸。
+
+```bash
+install -m 755 deploy/monitor/netonapi-watch.sh /usr/local/bin/
+install -m 644 deploy/monitor/netonapi-watch.{service,timer} /etc/systemd/system/
+cat > /etc/netonapi/watch.env <<'ENV'
+NETONAPI_URL=http://127.0.0.1:8800
+WATCH_ALERT_WEBHOOK=https://...
+# NETONAPI_METRICS_TOKEN=...      与 NEWGATE_METRICS_TOKEN 相同
+# BACKUP_DIR=/data/backups/netonapi
+ENV
+systemctl daemon-reload && systemctl enable --now netonapi-watch.timer
+```
+
+它跑在网关同一台机器上，机器整个宕掉时发不出告警 —— 外加一个外部拨测（云监控、UptimeRobot 之类）打 `/health`。
+
+日志里还能看这几样：
 
 | 看什么 | 在哪 |
 |---|---|
@@ -378,16 +407,17 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
 网关自身不终止 TLS。前置 Nginx/Caddy 时请注意：
 
 - 流式响应需关闭代理缓冲（Nginx：`proxy_buffering off;`），否则 SSE 会被攒着一次性吐出。
-- **`NEWGATE_TRUSTED_PROXIES` 决定网关认哪个地址是「客户端」**，令牌 IP 白名单完全建在它上面：
+- **`NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES`（`routing.conf` `[ratelimit] trusted_proxies`）决定后端认哪个地址是「客户端」**，
+  路由限流、管理台白名单、令牌 IP 白名单、审计 IP 都建在它上面：
 
-  | 配置 | 网关认定的客户端 IP | 后果 |
+  | 配置 | 后端认定的客户端 IP | 后果 |
   |---|---|---|
-  | 未设置（默认） | TCP 对端地址（= 你的反代） | `X-Forwarded-For` / `X-Real-IP` **一律忽略**。伪造转发头绕不过白名单，但所有用户共用代理这一个身份：白名单要么全过、要么全不过 |
-  | `NEWGATE_TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1` | 从 `X-Forwarded-For` **最右**往左剥掉每一跳可信代理，停在第一个不可信地址 | 才是真实客户端 IP |
+  | 未设置（默认） | TCP 对端地址（= 你的反代） | `X-Forwarded-For` / `X-Real-IP` **一律忽略**。伪造转发头绕不过白名单，但所有用户共用代理这一个身份：限流全站一个桶，白名单要么全过、要么全不过 |
+  | `127.0.0.1,::1` | 从 `X-Forwarded-For` **最右**往左剥掉每一跳可信代理，停在第一个不可信地址 | 才是真实客户端 IP |
 
-  格式：逗号分隔的精确 IP 或 IPv4 CIDR（IPv6 只支持精确地址）。**空 = 谁都不信**，这是刻意的默认：
-  宁可白名单退化成「按代理判定」，也不能让任何客户端用一个请求头把自己伪装成白名单里的 IP。
-  多级代理要把每一跳都列进去；只列最近一跳会让剥链提前停下、拿到上一级代理的地址。
+  格式：逗号分隔的精确 IP（不支持 CIDR）。`X-Real-IP` 始终不采信。**空 = 谁都不信**，这是刻意的默认。
+  多级代理要把每一跳都列进去，包括用户控制台（它的服务端代理替浏览器调后端）；只列最近一跳会让剥链提前停下。
+  旧的 `NEWGATE_TRUSTED_PROXIES` 已删除，仍设着后端拒绝启动，升级时从环境里去掉。
 - 为什么不能直接采信 `X-Forwarded-For`：它由客户端自由填写，直连网关时攻击者写什么就是什么；
   经反代时反代通常把真实对端**追加到链尾**，所以剥链必须从右往左、停在第一个不可信地址，
   客户端塞在链首的白名单 IP 一律不算数。
@@ -457,7 +487,8 @@ Caddy 在 compose 默认网络里固定为 `172.28.0.10`，后端 `NEWGATE_TRUST
   构建产物目录可整体拷走（node_modules 里没有指出仓库的软链）。用 `next start -H 127.0.0.1` 起。
 - **边缘**：Caddy 按域名分流——管理台域名下把 `/admin/* /app/* /manage/* /platform/*` 转后端（同源，
   理由见上节），控制台域名整站转控制台，API 域名只放行 `/v1/* /v1beta/* /health
-  /app/pay/channel-notify/*`、其余 404。后端设 `NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1`。
+  /app/pay/channel-notify/*`、其余 404。后端设 `NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES=127.0.0.1,::1`，
+  控制台只监听 `127.0.0.1`（它透传的 `X-Forwarded-For` 才可信）。
 - **后端监听地址**：框架目前写死监听 `0.0.0.0`（`server.host` 不生效），8800 与 Next 的端口要靠
   防火墙挡。腾讯云这类机器上已有主机安全写的 iptables 规则，**别用 `nftables.service`**——它的
   stop/reload 会 `flush ruleset` 把别人的规则一起清掉；单独建一张 `inet` 表、用只增删这张表的
@@ -525,3 +556,46 @@ platform / cs）的 `neton.migration.dialects` 都硬编码 `postgresql`，而 `
 结论：改 schema **只需改 `sql/postgresql/`**。那两个目录是历史遗留，别照着它们补新脚本 ——
 补齐了也跑不到，只会让人误以为 mysql 是支持目标。要真支持 mysql，得先给 infra 等模块
 补方言（含 `system_menus` 的建表），那是一个独立的、比 gateway 大得多的工程。
+
+## 备份与恢复
+
+额度余额、充值与消费流水、令牌、渠道密钥（加密后）都在 PostgreSQL 里，丢了就是丢钱；Redis 只放限流计数、
+验证码、会话吊销这类可丢的状态，不用备份。`deploy/backup/` 提供一个 `pg_dump` 脚本和 systemd 定时器：
+
+- 自定义格式（`-Fc`）导出，先写 `.partial`，`pg_restore --list` 读得出目录才改名为正式备份 —— 截断的导出不会顶掉旧备份；
+- 本地保留 `BACKUP_KEEP_DAYS` 天（默认 14），永远至少留最新一份；
+- 设了 `BACKUP_RCLONE_REMOTE`（如腾讯云 COS 的 rclone 远端）就同步一份到异地，并按同样天数清理。**只放本机的备份不算备份**；
+- 失败非零退出，设了 `BACKUP_ALERT_WEBHOOK` 时 POST `{"text": "..."}` 告警（Slack、企业微信、钉钉机器人都认）。
+
+裸机安装：
+
+```bash
+install -m 755 deploy/backup/netonapi-backup.sh /usr/local/bin/
+install -m 644 deploy/backup/netonapi-backup.{service,timer} /etc/systemd/system/
+install -d -m 700 /etc/netonapi
+cat > /etc/netonapi/backup.env <<'ENV'
+PGHOST=127.0.0.1
+PGUSER=netonapi
+PGPASSWORD=...
+PGDATABASE=netonapi
+BACKUP_DIR=/data/backups/netonapi
+# BACKUP_RCLONE_REMOTE=cos:netonapi-backup/db
+# BACKUP_ALERT_WEBHOOK=https://...
+ENV
+chmod 600 /etc/netonapi/backup.env
+systemctl daemon-reload && systemctl enable --now netonapi-backup.timer
+systemctl start netonapi-backup.service && journalctl -u netonapi-backup -n 5   # 立刻跑一次确认
+```
+
+Docker 部署：在 `backup.env` 里设 `PG_DUMP="docker compose -f /path/to/docker-compose.yml exec -T postgres pg_dump -U <用户>"`
+和对应的 `PG_RESTORE`，其余相同。
+
+恢复（先在另一个库演练，确认数据对了再切）：
+
+```bash
+createdb netonapi_restore
+pg_restore --no-owner -d netonapi_restore /data/backups/netonapi/netonapi-<时间>.dump
+# 核对：SELECT count(*), sum(balance) FROM gateway_quota_accounts; 与线上量级一致
+```
+
+渠道密钥用 `CHANNEL_KEY_ENC_KEY` 加密存储：恢复到新机器时要带上同一个密钥，否则渠道全部解不开。密钥与备份分开保管。

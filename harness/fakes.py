@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
-MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio | mail
+MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio | mail | turnstile
 """
 import json, os, time, threading, hashlib, hmac, base64, struct, zlib, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +12,9 @@ PORT = int(os.environ.get("PORT", "9990"))
 # 若网关泄漏 producer 协程（仍在读上游），bigstream handler 不会退出，计数停在 >0——据此断言无残留。
 _inflight = 0
 _last_mail = None
+# turnstile：用过的凭证（模拟一次性）与最后一次核验请求
+_used_tokens = set()
+_last_verify = None
 _lock = threading.Lock()
 
 
@@ -35,6 +38,8 @@ class H(BaseHTTPRequestHandler):
         # GET /inflight → 当前在途请求数（供 harness 轮询断连后归零）
         if self.path == "/last-mail":
             self._json(200, _last_mail or {}); return
+        if self.path == "/last-verify":
+            self._json(200, _last_verify or {}); return
         if self.path == "/prices.json":
             # 价源同步用的价目表（对象形状）
             self._json(200, {"sync-a": {"input": 1.5, "output": 6, "maxOutput": 4096}, "sync-b": {"inputPrice": "0.2", "outputPrice": "0.8"}})
@@ -50,6 +55,23 @@ class H(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def _turnstile(self):
+        """Turnstile siteverify：secret 必须是 ts-secret；凭证 ok:<action> 通过且只能用一次，其余失败。"""
+        global _last_verify
+        body = json.loads(self._raw_body or b"{}")
+        _last_verify = body
+        token = body.get("response", "")
+        if body.get("secret") != "ts-secret":
+            self._json(200, {"success": False, "error-codes": ["invalid-input-secret"]}); return
+        with _lock:
+            reused = token in _used_tokens
+            _used_tokens.add(token)
+        if reused:
+            self._json(200, {"success": False, "error-codes": ["timeout-or-duplicate"]}); return
+        if token.startswith("ok:"):
+            self._json(200, {"success": True, "action": token[3:], "hostname": "localhost", "error-codes": []}); return
+        self._json(200, {"success": False, "error-codes": ["invalid-input-response"]})
+
     def do_POST(self):
         _enter()
         try:
@@ -61,6 +83,8 @@ class H(BaseHTTPRequestHandler):
                 self._json(200, {"id": "mail_1"}); return
             if MODE == "audio":
                 self._audio(); return
+            if MODE == "turnstile":
+                self._turnstile(); return
             body = json.loads(self._raw_body or b"{}")
             stream = bool(body.get("stream"))
             if MODE == "err500":

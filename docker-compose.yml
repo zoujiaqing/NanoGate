@@ -79,18 +79,19 @@ services:
       NEWGATE_SALE_MARKUP: ${SALE_MARKUP:-1}
       # 发布闸门：售价低于「官方成本 × 此倍率」的定价不得保存
       NEWGATE_MIN_MARGIN: ${MIN_MARGIN:-1}
-      # 前置反代时**必须**设：它决定网关认哪个地址是「客户端」，令牌 IP 白名单完全建在它上面。
-      # 空 = 不信任任何转发头（X-Forwarded-For / X-Real-IP 一律忽略），直连部署留空即可。
-      # 注意这与 IP 白名单的语义相反：白名单空是放开限制，代理名单空是收紧信任。
-      NEWGATE_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.28.0.10}
-      # 框架层（路由限流、管理台白名单）的可信代理。与上面的 NEWGATE_TRUSTED_PROXIES 是两套：
-      # 那个只管网关 Key 的 IP 白名单。不设时框架把所有请求都算成 caddy 发来的——
-      # 登录限流变成全站共用一个计数，打开管理台白名单还会把所有人挡在外面。
-      NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES: ${RATELIMIT_TRUSTED_PROXIES:-172.28.0.10}
+      # 可信代理：后端只对这些对端采信 X-Forwarded-For，从右往左剥掉可信跳得到真实客户端。
+      # 路由限流、管理台白名单、网关 Key 的 IP 白名单、审计 IP 都用这一个结果。
+      # 默认信 caddy（172.28.0.10）与控制台（172.28.0.11，它的服务端代理替浏览器调后端）。
+      # 不设时所有请求都算成代理发来的：登录限流全站共用一个计数，白名单要么全过要么全挡。
+      # 旧的 NEWGATE_TRUSTED_PROXIES 已废弃，设了后端拒绝启动。
+      NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES: ${RATELIMIT_TRUSTED_PROXIES:-172.28.0.10,172.28.0.11}
       # 管理员 MFA（TOTP）密钥的加密主密钥，base64 编码后的 32 字节：openssl rand -base64 32。
       # 不设就不能给管理员开启 MFA —— 开了的人会因「MFA is not configured」登不进来。
       # 一旦有人绑定过就不能更换，换了已绑定的动态码全部失效，只能逐个重置。
       NETON_MFA_MASTER_KEY: ${MFA_MASTER_KEY:-}
+      # 人机验证（Cloudflare Turnstile）的服务端 secret。开关、站点 key、需要验证的动作在管理台「配置管理」
+      # 的 system.security.captcha.*。开了开关却没设这里，相关动作一律 503 拒绝（不会静默放行）。
+      NETON_CAPTCHA_SECRET: ${CAPTCHA_SECRET:-}
       # 管理台 IP 白名单（module-system 网络准入，先于登录与认证）。逗号分隔的 IP / CIDR。
       # 打开且列表为空 = 管理台全部拒绝。写错了只能登服务器改配置重启，没有远程绕过入口。
       NETON_SECURITY__NETWORK__ADMIN__ENABLED: ${ADMIN_IP_ALLOWLIST_ENABLED:-false}
@@ -157,6 +158,10 @@ services:
     environment:
       NETON_BACKEND_URL: http://newgate:8800
     expose: ["3000"]
+    # 固定 IP：它的服务端代理透传 X-Forwarded-For，后端要把它列为可信代理
+    networks:
+      default:
+        ipv4_address: 172.28.0.11
 
   # ── 边缘反代：deploy/Caddyfile。固定 IP 使后端能把它列为唯一受信代理 ──
   caddy:
@@ -181,7 +186,7 @@ services:
       default:
         ipv4_address: 172.28.0.10
 
-# 默认网络固定网段：caddy 需要一个可被后端 NEWGATE_TRUSTED_PROXIES 引用的稳定地址
+# 默认网络固定网段：caddy 与控制台需要可被后端 RATELIMIT_TRUSTED_PROXIES 引用的稳定地址
 networks:
   default:
     ipam:

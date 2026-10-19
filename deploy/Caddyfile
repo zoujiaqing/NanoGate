@@ -4,6 +4,9 @@
 # 而后端 CORS 硬编码 allowedOrigins=* 且 allowCredentials=false —— 跨源时浏览器根本不会带 cookie，
 # 登录态在另一个端口上永远无效。所以管理台与后端 API 必须是同一个源，只能在这里按路径分流。
 # 用户控制台没有这个问题：它自带 /api/backend 服务端代理，浏览器不直连后端。
+#
+# 客户端来源：Caddy 不信任外来的 X-Forwarded-For，会改写成真实对端；X-Real-IP 原样透传，所以每个
+# reverse_proxy 都删掉它（后端本就不采信，这里是纵深防御，防止别处误用）。
 {
 	admin off
 }
@@ -21,17 +24,22 @@
 	@backend path /admin/* /app/* /manage/* /platform/* /v1/* /v1beta/*
 	handle @backend {
 		reverse_proxy newgate:8800 {
+			header_up -X-Real-IP
 			# SSE 流式响应：禁止代理缓冲，否则整段攒完一次性吐出（DEPLOY.md「反向代理」）
 			flush_interval -1
 		}
 	}
 	handle {
-		reverse_proxy front:3000
+		reverse_proxy front:3000 {
+			header_up -X-Real-IP
+		}
 	}
 }
 
 # ── 用户控制台 ──
 {$CONSOLE_SITE}
 	encode zstd gzip
-	reverse_proxy console:3000
+	reverse_proxy console:3000 {
+		header_up -X-Real-IP
+	}
 }

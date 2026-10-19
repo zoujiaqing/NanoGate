@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily NetonAPI PostgreSQL backup
+
+[Timer]
+# 每天 03:30（服务器本地时间），错过（关机）则开机后补跑；随机延迟避免多台同时打存储
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

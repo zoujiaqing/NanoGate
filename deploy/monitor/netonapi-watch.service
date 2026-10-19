@@ -1,0 +1,8 @@
+[Unit]
+Description=NetonAPI health and money checks
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/netonapi/watch.env
+ExecStart=/usr/local/bin/netonapi-watch.sh
+StateDirectory=netonapi-watch

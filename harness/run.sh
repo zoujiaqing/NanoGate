@@ -117,7 +117,13 @@ cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
 sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f "$WORK/config/application.conf.bak"
 # 没有短信/邮件通道时，验证码服务默认直接报错（不再假装发送成功）；harness 打开 simulate：
 # 码只写进隔离 Redis 不发送，场景从 Redis 读码（键见 sms_code_of）。
-printf '\n[security.verification]\nsimulate = true\n' >> "$WORK/config/application.conf"
+python3 -I - "$WORK/config/application.conf" <<'PYEOF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+h='[security.verification]\n'
+s=s.replace(h, h+'simulate = true\n', 1) if h in s else s+'\n'+h+'simulate = true\n'
+open(p,'w').write(s)
+PYEOF
 # simulate 只在显式声明的 dev/local/test 环境放行（system 的 requireSimulationAllowed，否则启动即 fail-fast）。
 export NETON_ENV=test
 cat > "$WORK/config/database.conf" <<EOF
@@ -472,7 +478,7 @@ q "UPDATE gateway_tokens SET rpm_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/d
 # 白名单只能建立在**传输层对端**之上：XFF 由客户端自由填写，无条件采信最左项等于
 # 「一个请求头就能把自己伪装成白名单里的 IP」——那比没有白名单更糟（它给运营者虚假的安全感）。
 #  - A 段（默认：未配可信代理）→ 转发头一律忽略，伪造 XFF 必须被拒；
-#  - B 段（NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1，即 curl 的对端）→ 才采信 XFF，且从**右**往左剥链：
+#  - B 段（NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES=127.0.0.1,::1，即 curl 的对端）→ 才采信 XFF，且从**右**往左剥链：
 #    客户端自己塞在链首的白名单 IP 不算数（真实部署里反代会把客户端真实 IP 追加到链尾，
 #    剥链必须停在第一个不可信地址）。
 echo "[S14] IP 白名单 + XFF 信任边界"
@@ -487,7 +493,7 @@ lg=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 [ "$spoof" = "403" ] && [ "$plain" = "403" ] && [ "$lg" = "0" ] \
   && pass "未配可信代理：伪造 XFF=203.0.113.7（名单内）被拒 ${spoof}、无转发头也被拒 ${plain}、零计费" \
   || fail "XFF 信任边界失效: 伪造名单内IP=${spoof}(期望403) 无头=${plain}(期望403) 计费=${lg}(期望0)"
-stop_app; boot_app NEWGATE_TRUSTED_PROXIES=127.0.0.1,::1
+stop_app; boot_app NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES=127.0.0.1,::1
 allow=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 203.0.113.7" -d '{"model":"m-ip","messages":[]}')
 deny=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -H "X-Forwarded-For: 198.51.100.9" -d '{"model":"m-ip","messages":[]}')
 # 链首伪造：客户端先写一个名单内 IP，反代再追加它自己的真实地址 → 剥链应停在后者
@@ -2946,6 +2952,60 @@ code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/t
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
 em8=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
+
+# ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
+echo "[S87] 人机验证"
+# 核验地址指到本地假 siteverify（fakes.py turnstile：secret 必须是 ts-secret，凭证 ok:<action> 通过且只能用一次）
+fake turnstile 9895
+stop_app; boot_app "${S72_ENV[@]}" NETON_CAPTCHA_SECRET=ts-secret NETON_CAPTCHA_VERIFY_URL=http://127.0.0.1:9895/siteverify \
+  NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES=127.0.0.1,::1
+rkdel "*ratelimit:*"
+GJWT=$(admin_jwt)
+q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at) VALUES
+     ('system','system.security.captcha.enabled','true','人机验证',0,0),
+     ('system','system.security.captcha.site_key','sk-test','人机验证站点 key',0,0),
+     ('system','system.security.captcha.actions','register,send_code,admin_login','需要人机验证的动作',0,0)
+   ON CONFLICT (setting_key) DO UPDATE SET value=EXCLUDED.value;" >/dev/null
+pub87=$(curl -s --max-time 10 "$U/admin/system/site/public" | python3 -c "import sys,json;c=(json.load(sys.stdin).get('data') or {}).get('captcha') or {};print(c.get('provider'),c.get('siteKey'),','.join(c.get('actions') or []))" 2>/dev/null)
+[ "$pub87" = "turnstile sk-test register,send_code,admin_login" ] \
+  && pass "公开配置下发供应商、站点 key 与动作（不含 secret）" || fail "人机验证公开配置: '$pub87'"
+
+reg87() { # $1=凭证（空=不带） $2=用户名 $3=XFF
+  local h=(); [ -n "$1" ] && h=(-H "X-Captcha-Token: $1")
+  curl -s --max-time 15 -o /tmp/ng-s87.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" ${h[@]+"${h[@]}"} -H "X-Forwarded-For: $3" \
+    -d "{\"mode\":\"USERNAME_PASSWORD\",\"username\":\"$2\",\"password\":\"s87pass123\"}"
+}
+msg87() { python3 -c "import json;print(json.load(open('/tmp/ng-s87.json')).get('message',''))" 2>/dev/null; }
+r1=$(reg87 "" s87a 203.0.113.91); m1=$(msg87)
+r2=$(reg87 "ok:send_code" s87a 203.0.113.92); m2=$(msg87)
+n87=$(q "SELECT COUNT(*) FROM account_users WHERE username='s87a'")
+[ "$r1" = "400" ] && [ "$m1" = "CAPTCHA_REQUIRED" ] && [ "$r2" = "400" ] && [ "$m2" = "CAPTCHA_INVALID" ] && [ "$n87" = "0" ] \
+  && pass "注册：不带凭证 → CAPTCHA_REQUIRED；拿发码的凭证来注册 → CAPTCHA_INVALID；都没建出账号" \
+  || fail "注册拦截: 无凭证=${r1}/${m1} 错动作=${r2}/${m2} 账号数=${n87}(期望0)"
+
+r3=$(reg87 "ok:register" s87a 203.0.113.93)
+lv87=$(curl -s --max-time 5 http://127.0.0.1:9895/last-verify | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('secret'),d.get('remoteip'))" 2>/dev/null)
+r4=$(reg87 "ok:register" s87b 203.0.113.94); m4=$(msg87)
+n87b=$(q "SELECT COUNT(*) FROM account_users WHERE username IN ('s87a','s87b')")
+[ "$r3" = "200" ] && [ "$lv87" = "ts-secret 203.0.113.93" ] && [ "$r4" = "400" ] && [ "$m4" = "CAPTCHA_INVALID" ] && [ "$n87b" = "1" ] \
+  && pass "凭证有效 → 注册成功，核验带 secret 与真实客户端 IP（${lv87#* }）；同一凭证再用 → CAPTCHA_INVALID" \
+  || fail "注册放行/重放: 有效=${r3} 核验='${lv87}'(期望 ts-secret 203.0.113.93) 重放=${r4}/${m4} 账号数=${n87b}(期望1)"
+
+al1=$(curl -s --max-time 15 -o /tmp/ng-s87.json -w "%{http_code}" -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}'); am1=$(msg87)
+al2=$(curl -s --max-time 15 -o /tmp/ng-s87.json -w "%{http_code}" -X POST "$U/admin/system/auth/login" -H "$CT" -H "X-Captcha-Token: ok:admin_login" -d '{"username":"admin","password":"admin123"}')
+[ "$al1" = "400" ] && [ "$am1" = "CAPTCHA_REQUIRED" ] && [ "$al2" = "200" ] \
+  && pass "管理员登录：不带凭证 → CAPTCHA_REQUIRED（先于密码校验），带凭证 → 200" \
+  || fail "管理员登录人机验证: 无凭证=${al1}/${am1} 有凭证=${al2}"
+
+# 缺 secret：打开了开关却没配密钥，必须拒绝，不能退化成不验证
+stop_app; boot_app "${S72_ENV[@]}" NETON_CAPTCHA_VERIFY_URL=http://127.0.0.1:9895/siteverify NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES=127.0.0.1,::1
+r5=$(reg87 "ok:register" s87c 203.0.113.95); m5=$(msg87)
+n87c=$(q "SELECT COUNT(*) FROM account_users WHERE username='s87c'")
+[ "$r5" = "503" ] && [ "$m5" = "CAPTCHA_UNAVAILABLE" ] && [ "$n87c" = "0" ] \
+  && pass "开了人机验证却没配 secret → 503 CAPTCHA_UNAVAILABLE，不放行" \
+  || fail "缺 secret 应拒绝: HTTP=${r5}/${m5} 账号数=${n87c}(期望0)"
+q "DELETE FROM system_settings WHERE setting_key LIKE 'system.security.captcha.%'" >/dev/null
+rm -f /tmp/ng-s87.json
 
 # ══ S85 管理员 MFA：要求 MFA 后密码登录只拿到挑战，TOTP 通过才签发会话；动态码不能重放 ══
 stop_app; boot_app "${S72_ENV[@]}"

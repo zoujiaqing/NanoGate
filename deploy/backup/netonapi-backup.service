@@ -1,0 +1,13 @@
+[Unit]
+Description=NetonAPI PostgreSQL backup
+After=postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/netonapi/backup.env
+ExecStart=/usr/local/bin/netonapi-backup.sh
+# 备份跑在低优先级，不和网关抢 CPU / IO
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
