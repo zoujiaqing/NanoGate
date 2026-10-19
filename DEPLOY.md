@@ -123,6 +123,8 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 | 售价（收入） | 官方价 × 加价率（本模型单独设的优先，否则全站加价率），或逐项填的固定售价；再 × 用户所在分组的倍率 | 用户扣款 `charged` |
 | 成本 | **实际打给上游的模型**的官方价 × 渠道 `cost_discount`（渠道做了模型映射时按映射目标算，映射目标没定价则按请求模型） | 结算行与用量日志的 `cost`，不动用户余额 |
 
+完整规则见 neton-docs 的《网关计价与定价管理》（`docs/zh-hans/spec/application/gateway-pricing-spec.md`）。
+
 日常调价都在管理台「AI 网关 → 模型定价」一页完成：
 
 - **全站加价率、最低毛利**在「配置管理」的 `gateway.pricing.markup` / `gateway.pricing.min_margin`，改完 10 秒内生效。
