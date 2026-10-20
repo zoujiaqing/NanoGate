@@ -51,7 +51,7 @@ projects/
 # 后端：编译后用一份本地配置目录起（database.conf 指向本机 PostgreSQL，redis.conf 指向本机 Redis）
 cd NewGate/netonapi-backend && ./gradlew :application:linkDebugExecutableMacosArm64 -Pneton.database.driver=postgres
 cd ../local && ../netonapi-backend/application/build/bin/macosArm64/debugExecutable/application.kexe migrate up
-NETON_SECURITY__JWT__SECRETKEY=<随便一串> NEWGATE_QUOTA_PER_PRICE_UNIT=10000 NEWGATE_PUBLIC_API_URL=http://localhost:8800 \
+NETON_SECURITY__JWT__SECRETKEY=<随便一串> NETONAPI_QUOTA_PER_PRICE_UNIT=10000 NETONAPI_PUBLIC_API_URL=http://localhost:8800 \
   ../netonapi-backend/application/build/bin/macosArm64/debugExecutable/application.kexe
 # 管理台（next dev -p 8888；开发模式把 /admin /app /v1 … 重写到本机后端，所以不需要 Caddy）
 cd NewGate/netonapi-frontend && pnpm dev
@@ -60,7 +60,7 @@ cd NewGate/netonapi-client && pnpm dev
 ```
 
 管理员种子账号 `admin / admin123`（上线前改掉）。harness 也用 8800，本机跑着后端时用
-`NEWGATE_HARNESS_PORT=8801 ./harness/run.sh` 让它换端口。
+`NETONAPI_HARNESS_PORT=8801 ./harness/run.sh` 让它换端口。
 
 ## 启动
 
@@ -142,7 +142,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 - **毛利闸门**：售价任一项低于「官方价 × 最低毛利」时不能保存。导入、同步、校准时，写死售价的模型如果新官方价会让它亏本，
   这一行会被扣下不写（结果里列出），等运营调完售价再同步。
 - **不同等级的用户不同价**：在「计价分组」里建分组并设倍率（如 VIP 0.9），再用以下任一方式把用户放进去，优先级从高到低：
-  令牌的专属分组（令牌页「设置分组」）→ 用户例外（「用户计价例外」页）→ 会员组映射（分组里选会员组，需 `NEWGATE_MEMBER_GROUP_BILLING=true`）→ `default`。
+  令牌的专属分组（令牌页「设置分组」）→ 用户例外（「用户计价例外」页）→ 会员组映射（分组里选会员组，需 `NETONAPI_MEMBER_GROUP_BILLING=true`）→ `default`。
   渠道的 `groups` 决定哪些分组能走它，体检只核算真会发生的组合。
 - **事后看账**：概览页按分组、渠道列出收入、成本、毛利；统计期内有实收低于成本的请求时顶部标红，并给出亏损金额。
 - 定价数据非法（价格串坏、`sale_override` 不是合法 JSON、倍率配错）时请求在入口就被拒
@@ -178,8 +178,8 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 | 变量（容器内） | 含义 |
 |---|---|
-| `PAY_NOTIFY_BASE`（`NEWGATE_PAY_NOTIFY_BASE`） | 后端对外的 origin，即反向代理那个。渠道服务器要能从它打到 `{基址}/app/pay/channel-notify/{渠道码}` |
-| `PAY_RETURN_URL`（`NEWGATE_PAY_RETURN_URL`） | 用户付完跳回的控制台页面，例如 `https://console.example.com/billing` |
+| `PAY_NOTIFY_BASE`（`NETONAPI_PAY_NOTIFY_BASE`） | 后端对外的 origin，即反向代理那个。渠道服务器要能从它打到 `{基址}/app/pay/channel-notify/{渠道码}` |
+| `PAY_RETURN_URL`（`NETONAPI_PAY_RETURN_URL`） | 用户付完跳回的控制台页面，例如 `https://console.example.com/billing` |
 
 **两项留空都不会让支付失败**，但各自退化一处，互不牵连：
 
@@ -288,10 +288,11 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
 ## 上线前检查
 
+- [ ] 产品环境变量一律用 `NETONAPI_*` 前缀（2026-10-20 起，原 `NEWGATE_*`）。环境里还有任何 `NEWGATE_` 开头的变量时后端拒绝启动，并列出每个要改成的新名字
 - [ ] 三个密钥都已设置，且不是示例值
 - [ ] 数据库端口未对公网暴露（compose 默认只 `expose` 不 `ports`）
 - [ ] 网关放在 TLS 终止层之后（本服务不处理证书）
-- [ ] 前置反代时已设 `RATELIMIT_TRUSTED_PROXIES`（容器内为 `NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES`），否则限流与令牌 IP 白名单看到的都是代理自己的地址；旧的 `NEWGATE_TRUSTED_PROXIES` 已删除
+- [ ] 前置反代时已设 `RATELIMIT_TRUSTED_PROXIES`（容器内为 `NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES`），否则限流与令牌 IP 白名单看到的都是代理自己的地址
 - [ ] 验证码全站日上限按短信预算设置（`NETON_SECURITY__VERIFICATION__DAILY_LIMIT_GLOBAL`，默认 1000 条/天/通道；0 = 不限，被刷时账单没有上限）
 - [ ] 数据库每天备份并同步到另一台机器或对象存储，且**做过一次恢复演练**（见「备份与恢复」）
 - [ ] 告警已接通：`netonapi-watch.timer` 在跑、webhook 收到过测试消息，另有外部拨测打 `/health`（见「可观测性」）
@@ -312,7 +313,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
       并用沙箱渠道把「下单 → 付款 → 到账」走通过一次
 - [ ] 定期查看管理台「结算待处理」：这些记录仍占用用户预留额度，需人工裁定
 - [ ] 生产已设 `ADMIN_SITE` / `CONSOLE_SITE` 域名并叠加 `deploy/docker-compose.prod.yml`；别把 `8800` 直连口暴露到公网
-- [ ] 已设 `PUBLIC_API_URL`（容器内 `NEWGATE_PUBLIC_API_URL`），否则控制台的接入说明只能显示占位符
+- [ ] 已设 `PUBLIC_API_URL`（容器内 `NETONAPI_PUBLIC_API_URL`），否则控制台的接入说明只能显示占位符
 - [ ] 控制台已开放**自助注册**（`/register`，无需邀请码）：不想开放注册就在反代层挡掉该路径，或要求邀请码
 
 ## 前端镜像与边缘（Caddy）
@@ -379,12 +380,12 @@ Caddy 与控制台在 compose 默认网络里固定为 `172.28.0.10` / `172.28.0
 
 - `GET /metrics`：Prometheus 文本格式，数字从库里现算（与概览页同口径）：按状态的请求总数与近 5 分钟数、
   收入/成本累计（μUSD）、每条渠道的状态与最近测速、待人工复核与待重放的结算数。默认匿名；设
-  `NEWGATE_METRICS_TOKEN` 后要求 `Authorization: Bearer <token>`。生产请设 token 或在反代层只放行监控网段。
+  `NETONAPI_METRICS_TOKEN` 后要求 `Authorization: Bearer <token>`。生产请设 token 或在反代层只放行监控网段。
 - 定时任务（后台「定时任务」页可停用/改 cron）：
   - `gateway-channel-probe`（`*/5 * * * *`）：用渠道自己的 Key 打一条 `max_tokens=1` 的请求，结果写在渠道行
     （管理台渠道表「测速」列、概览渠道表、`/metrics` 都能看到）。每条渠道每 5 分钟消耗一次最小请求。
-  - `gateway-price-sync`（每天 03:10）：从 `NEWGATE_PRICE_SYNC_URL` 拉价目表导入（格式与管理台批量导入一致），
-    `NEWGATE_PRICE_SYNC_OVERWRITE=false` 则只补新模型。管理台「模型定价 → 同步价源」可立即拉一次。
+  - `gateway-price-sync`（每天 03:10）：从 `NETONAPI_PRICE_SYNC_URL` 拉价目表导入（格式与管理台批量导入一致），
+    `NETONAPI_PRICE_SYNC_OVERWRITE=false` 则只补新模型。管理台「模型定价 → 同步价源」可立即拉一次。
 
 **告警**：没有 Prometheus 时用 `deploy/monitor/netonapi-watch.sh`（systemd 定时器每分钟跑），出事向
 `WATCH_ALERT_WEBHOOK` 发 `{"text": "..."}`：`/health` 不是 200、有结算进入人工复核、启用中的渠道测速全部失败、
@@ -396,7 +397,7 @@ install -m 644 deploy/monitor/netonapi-watch.{service,timer} /etc/systemd/system
 cat > /etc/netonapi/watch.env <<'ENV'
 NETONAPI_URL=http://127.0.0.1:8800
 WATCH_ALERT_WEBHOOK=https://...
-# NETONAPI_METRICS_TOKEN=...      与 NEWGATE_METRICS_TOKEN 相同
+# NETONAPI_METRICS_TOKEN=...      与 NETONAPI_METRICS_TOKEN 相同
 # BACKUP_DIR=/data/backups/netonapi
 ENV
 systemctl daemon-reload && systemctl enable --now netonapi-watch.timer
@@ -431,7 +432,6 @@ systemctl daemon-reload && systemctl enable --now netonapi-watch.timer
 
   格式：逗号分隔的精确 IP（不支持 CIDR）。`X-Real-IP` 始终不采信。**空 = 谁都不信**，这是刻意的默认。
   多级代理要把每一跳都列进去，包括用户控制台（它的服务端代理替浏览器调后端）；只列最近一跳会让剥链提前停下。
-  旧的 `NEWGATE_TRUSTED_PROXIES` 已删除，仍设着后端拒绝启动，升级时从环境里去掉。
 - 为什么不能直接采信 `X-Forwarded-For`：它由客户端自由填写，直连网关时攻击者写什么就是什么；
   经反代时反代通常把真实对端**追加到链尾**，所以剥链必须从右往左、停在第一个不可信地址，
   客户端塞在链首的白名单 IP 一律不算数。
@@ -466,7 +466,7 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
 ```
 
 环境变量写法：`NETON_EGRESS__ALLOWED_NETWORKS=10.20.0.0/16`（compose 里对应 `EGRESS_ALLOWED_*`，见 `.env.example`）。
-任一放行项非空时启动日志打 WARN `egress.allowlist.enabled`。旧的 `NEWGATE_ALLOW_PRIVATE_UPSTREAM` 已删除——它一刀关掉全部校验，
+任一放行项非空时启动日志打 WARN `egress.allowlist.enabled`。旧的 `NETONAPI_ALLOW_PRIVATE_UPSTREAM` 已删除——它一刀关掉全部校验，
 现在只能按网段 / 主机精确放行。
 
 仍建议的部署侧措施：给网关容器只允许出公网 443/80 的网络策略，云上开 IMDSv2 并用安全组挡元数据服务。它们是纵深防御，

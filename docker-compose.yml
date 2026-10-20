@@ -72,21 +72,20 @@ services:
       NETON_REDIS__PORT: "6379"
       NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
       # 未设置则渠道 Key 以明文入库——数据库一旦泄露，你采购的所有上游 Key 都会泄露
-      NEWGATE_CHANNEL_KEY_ENC_KEY: ${CHANNEL_KEY_ENC_KEY:-}
+      NETONAPI_CHANNEL_KEY_ENC_KEY: ${CHANNEL_KEY_ENC_KEY:-}
       # 运维出站策略（application.conf [egress]）：渠道 / 短信 / 邮件 / 支付这些后台可改的出站地址默认只连公网 80/443。
       # 自托管上游在内网时按网段或主机精确放行（见 DEPLOY.md「上游地址与 SSRF」）；留空 = 只连公网。
       NETON_EGRESS__ALLOWED_PORTS: ${EGRESS_ALLOWED_PORTS:-80,443}
       NETON_EGRESS__ALLOWED_HOSTS: ${EGRESS_ALLOWED_HOSTS:-}
       NETON_EGRESS__ALLOWED_NETWORKS: ${EGRESS_ALLOWED_NETWORKS:-}
       # 双轨计价：售价 = sale_override 或官方价 × 加价率（收入）；成本 = 官方价 × 渠道折扣
-      NEWGATE_SALE_MARKUP: ${SALE_MARKUP:-1}
+      NETONAPI_SALE_MARKUP: ${SALE_MARKUP:-1}
       # 发布闸门：售价低于「官方成本 × 此倍率」的定价不得保存
-      NEWGATE_MIN_MARGIN: ${MIN_MARGIN:-1}
+      NETONAPI_MIN_MARGIN: ${MIN_MARGIN:-1}
       # 可信代理：后端只对这些对端采信 X-Forwarded-For，从右往左剥掉可信跳得到真实客户端。
       # 路由限流、管理台白名单、网关 Key 的 IP 白名单、审计 IP 都用这一个结果。
       # 默认信 caddy（172.28.0.10）与控制台（172.28.0.11，它的服务端代理替浏览器调后端）。
       # 不设时所有请求都算成代理发来的：登录限流全站共用一个计数，白名单要么全过要么全挡。
-      # 旧的 NEWGATE_TRUSTED_PROXIES 已废弃，设了后端拒绝启动。
       NETON_ROUTING__RATELIMIT__TRUSTED_PROXIES: ${RATELIMIT_TRUSTED_PROXIES:-172.28.0.10,172.28.0.11}
       # 管理员 MFA（TOTP）密钥的加密主密钥，base64 编码后的 32 字节：openssl rand -base64 32。
       # 不设就不能给管理员开启 MFA —— 开了的人会因「MFA is not configured」登不进来。
@@ -104,16 +103,16 @@ services:
       # 这是有意的 —— 静默按 1:1 发放等于白送钱且不留痕迹，所以账务宁可拒绝也不猜汇率。
       # 这里故意留空而不填一个数：没有普适默认值（取决于你按什么币种定价），
       # 而 compose 里写死的默认值会与代码默认值漂移，迟早坑一个人。
-      NEWGATE_QUOTA_PER_PRICE_UNIT: ${QUOTA_PER_PRICE_UNIT:-}
+      NETONAPI_QUOTA_PER_PRICE_UNIT: ${QUOTA_PER_PRICE_UNIT:-}
       # 按会员分组计价的开关。空/false = 所有用户按同一套组倍率计价。
       # 开着却没绑 MemberGroupPort 会**启动失败**（NetonAPI 已绑，见 Main.kt）——
       # 那是故意的：绑了不生效会被当成解析器的 bug 去查。
-      NEWGATE_MEMBER_GROUP_BILLING: ${MEMBER_GROUP_BILLING:-}
+      NETONAPI_MEMBER_GROUP_BILLING: ${MEMBER_GROUP_BILLING:-}
       # 邀请奖励（μUSD）。空或 0 = 该角色不发奖 —— 默认不发，因为发钱的路径不该因为一次
       # 升级就自己打开。非法值（1e3 / -5 / 带单位的串）不会被静默当成 0：该角色不发奖并记 ERROR。
       # 生效值在启动日志里：grep "invite reward attached"。
-      NEWGATE_INVITE_REWARD_INVITER: ${INVITE_REWARD_INVITER:-}
-      NEWGATE_INVITE_REWARD_INVITEE: ${INVITE_REWARD_INVITEE:-}
+      NETONAPI_INVITE_REWARD_INVITER: ${INVITE_REWARD_INVITER:-}
+      NETONAPI_INVITE_REWARD_INVITEE: ${INVITE_REWARD_INVITEE:-}
       # 支付回调地址（要收真钱就得设，两项都必须是**公网可访问**的绝对地址）。
       # NOTIFY_BASE = 后端对外的 origin，渠道服务器要能从它打到
       #   {NOTIFY_BASE}/app/pay/channel-notify/{渠道码}
@@ -125,16 +124,16 @@ services:
       # ⚠️ 没设 NOTIFY_BASE 就别在后台停用 pay-order-reconcile：两条到账路径全断 = 钱到账了额度永远不发。
       # ⚠️ 别填容器内部地址（http://localhost:8800 或 http://netonapi:8800）：本地跑得通，
       # 上线后一律回调失败 —— 而失败发生在渠道那一侧，你这边只看到订单一直是待支付。
-      NEWGATE_PUBLIC_API_URL: ${PUBLIC_API_URL:-}
-      NEWGATE_PRICE_SYNC_URL: ${PRICE_SYNC_URL:-}
-      NEWGATE_METRICS_TOKEN: ${METRICS_TOKEN:-}
-      NEWGATE_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
-      NEWGATE_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
-      # 有意**不**在这里暴露 NEWGATE_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
+      NETONAPI_PUBLIC_API_URL: ${PUBLIC_API_URL:-}
+      NETONAPI_PRICE_SYNC_URL: ${PRICE_SYNC_URL:-}
+      NETONAPI_METRICS_TOKEN: ${METRICS_TOKEN:-}
+      NETONAPI_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
+      NETONAPI_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
+      # 有意**不**在这里暴露 NETONAPI_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
       # （代码里标着「仅测试环境」）。不写进 compose 不是访问控制 —— 变量照样生效 ——
       # 而是不把「白送钱」放进官方支持的部署面。真要在沙箱里开，自己往 environment 里加一行。
     ports:
-      - "${NEWGATE_PORT:-8800}:8800"
+      - "${NETONAPI_PORT:-8800}:8800"
 
   # ── 管理台（Next.js）。浏览器直连后端 + cookie 认证 ⇒ 必须与后端同源，由 caddy 按路径分流 ──
   front:

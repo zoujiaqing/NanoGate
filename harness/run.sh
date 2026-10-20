@@ -12,15 +12,15 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BACKEND_DIR="$ROOT/netonapi-backend"
-# 构建目标可覆盖：本机默认 macosArm64，CI（Linux）传 NEWGATE_TARGET=linuxX64
-TARGET="${NEWGATE_TARGET:-macosArm64}"
-LINK_TASK="${NEWGATE_LINK_TASK:-:application:linkDebugExecutable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
+# 构建目标可覆盖：本机默认 macosArm64，CI（Linux）传 NETONAPI_TARGET=linuxX64
+TARGET="${NETONAPI_TARGET:-macosArm64}"
+LINK_TASK="${NETONAPI_LINK_TASK:-:application:linkDebugExecutable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
 APP="$BACKEND_DIR/application/build/bin/$TARGET/debugExecutable/application.kexe"
 LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="netonapi_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
-PORT="${NEWGATE_HARNESS_PORT:-8800}"
+PORT="${NETONAPI_HARNESS_PORT:-8800}"
 AUTH="Authorization: Bearer $TOKEN_PLAINTEXT"; CT="Content-Type: application/json"; U="http://localhost:$PORT"
 PGUSER="${PGUSER:-$(whoami)}"; PGPASS="${PGPASS:-privchat}"; PGHOST="${PGHOST:-localhost}"; PGPORT="${PGPORT:-5432}"
 # PGPORT 必须一起 export：createdb/dropdb/psql 与应用的 DSN 都靠它找库。写死 5432 等于假定
@@ -107,9 +107,9 @@ DB_VARIANT=postgres
 # 根构建的 gradle.properties 传不到被 includeBuild 的框架 settings 里。openssl 发布后删掉。
 NETON_BUILD_FLAGS=(-Pnetonstream.local.openssl=true)
 link_app() { ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
-# NEWGATE_SKIP_LINK=1：产物已由外部构建好（例如多个项目共用框架 composite build、需经构建锁串行时），跳过这一步。
-if [ "${NEWGATE_SKIP_LINK:-0}" = "1" ]; then
-  [ -x "$APP" ] || { echo "NEWGATE_SKIP_LINK=1 但 $APP 不存在"; exit 1; }
+# NETONAPI_SKIP_LINK=1：产物已由外部构建好（例如多个项目共用框架 composite build、需经构建锁串行时），跳过这一步。
+if [ "${NETONAPI_SKIP_LINK:-0}" = "1" ]; then
+  [ -x "$APP" ] || { echo "NETONAPI_SKIP_LINK=1 但 $APP 不存在"; exit 1; }
 else
   link_app || { echo "build failed"; exit 1; }
 fi
@@ -119,7 +119,7 @@ createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 ls -dt "$LOGS"/work-* 2>/dev/null | tail -n +3 | xargs rm -rf 2>/dev/null
 WORK="$LOGS/work-$$"; mkdir -p "$WORK/config" "$WORK/logs"
 cp "$BACKEND_DIR/application/config/"*.conf "$WORK/config/"
-# 端口可由 NEWGATE_HARNESS_PORT 覆盖：本机跑着演示实例时不用停它
+# 端口可由 NETONAPI_HARNESS_PORT 覆盖：本机跑着演示实例时不用停它
 sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f "$WORK/config/application.conf.bak"
 # 没有短信/邮件通道时，验证码服务默认直接报错（不再假装发送成功）；harness 打开 simulate：
 # 码只写进隔离 Redis 不发送，场景从 Redis 读码（键见 sms_code_of）。
@@ -146,7 +146,7 @@ EOF
 # 关持久化（--save '' --appendonly no）+ 数据目录放在 work 里，进程记进 PIDS 由 cleanup 收尾。
 # 没装 redis-server 不让整个 harness 失败：网关会退化成进程内计数（单实例语义不变），
 # 只有真正依赖 Redis 的 S24 显式跳过。
-REDIS_PORT="${NEWGATE_REDIS_PORT:-6399}"; REDIS_DB=15; REDIS_OK=0
+REDIS_PORT="${NETONAPI_REDIS_PORT:-6399}"; REDIS_DB=15; REDIS_OK=0
 mkdir -p "$WORK/redis"
 cat > "$WORK/config/redis.conf" <<EOF
 host = "127.0.0.1"
@@ -210,10 +210,19 @@ stop_app() {
   for i in $(seq 1 20); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null || return 0; sleep 0.5; done
   echo "  ⚠️  端口 $PORT 仍被占用，重启网关可能失败" >&2
 }
+# 环境变量前缀已统一为 NETONAPI_：环境里还留着 NEWGATE_* 时必须拒绝启动（列出要改的名字），
+# 不能带着被忽略的配置跑起来。守卫在 main 最前面，所以这里直接跑二进制、看退出码即可，不会去占端口。
+legacy_out=$( cd "$WORK" && env NEWGATE_LEGACY_PROBE=1 "$APP" 2>&1 ); legacy_rc=$?
 echo "[boot] starting gateway…"
 boot_app
 
 CID() { q "SELECT id FROM gateway_channels WHERE name='$1'"; }
+
+# ══ S0 旧环境变量前缀：NEWGATE_* 一律拒绝启动 ══
+echo "[S0] 旧环境变量前缀"
+[ "$legacy_rc" = "78" ] && echo "$legacy_out" | grep -q 'NEWGATE_LEGACY_PROBE → NETONAPI_LEGACY_PROBE' \
+  && pass "环境里有 NEWGATE_* 时拒绝启动（退出码 78），并提示改成 NETONAPI_*" \
+  || fail "旧前缀守卫: 退出码=${legacy_rc}(期望78) 输出=$(echo "$legacy_out" | tail -c 200)"
 
 # ══ S1 并发账务四项不变量 ══
 echo "[S1] 并发结算四项不变量"
@@ -670,12 +679,12 @@ nhi=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='m-gate'")
   || fail "毛利闸门错: 低价=${low}(落库${nlow}) 合法=${hi}(落库${nhi})"
 
 # ══ S22 全局加价率 + 毛利下限（env 运营开关）══
-# 重启网关带 NEWGATE_SALE_MARKUP=2.0 / NEWGATE_MIN_MARGIN=1.5：
+# 重启网关带 NETONAPI_SALE_MARKUP=2.0 / NETONAPI_MIN_MARGIN=1.5：
 #  - 无 saleOverride 的模型售价 = 官方价 × 2 → 收入翻倍（官方 2.5/10 → 售价 5/20 → charged 15000），
 #    而成本仍按官方价轨（7500）——加价率只动收入轨，不污染成本核算；
 #  - 发布底线抬到官方 × 1.5（官方 2.5 → 售价底线 3.75）。
 echo "[S22] 全局加价率 / 毛利下限"
-stop_app; boot_app NEWGATE_SALE_MARKUP=2.0 NEWGATE_MIN_MARGIN=1.5
+stop_app; boot_app NETONAPI_SALE_MARKUP=2.0 NETONAPI_MIN_MARGIN=1.5
 seed_reset
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-mk','openai_compatible','http://127.0.0.1:9906','default','m-mk',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-mk'),'k',1,0,0,0,0);
@@ -1062,7 +1071,7 @@ ratioNow=$(q "SELECT ratio FROM gateway_groups WHERE id=$VIP26")
 
 
 echo "[S30] 充值入口：汇率没配就拒绝，不静默按 1:1 发额度"
-# 此时是清洁启动（S23 起就没带 env），NEWGATE_QUOTA_PER_PRICE_UNIT 未设。
+# 此时是清洁启动（S23 起就没带 env），NETONAPI_QUOTA_PER_PRICE_UNIT 未设。
 # 静默 1:1 的后果是「充 100 得 100 μUSD」—— 数字太小看不出问题，而换成 1:1000 的部署
 # 就是白送一千倍额度，且台账上一切正常。所以必须拒绝，而且原因要能查到。
 # 框架对未分类异常一律回 500 + "Internal Server Error"（message 不进信封，见
@@ -1085,7 +1094,7 @@ bal0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 sleep 1   # 错误日志是 logScope.launch 异步写的，不等就会读到旧值
 nlog1=$(q "SELECT COUNT(*) FROM infra_api_error_logs")
 errmsg=$(q "SELECT COALESCE(exception_message,'') FROM infra_api_error_logs ORDER BY id DESC LIMIT 1")
-[ "$nlog1" -gt "$nlog0" ] && echo "$errmsg" | grep -q 'NEWGATE_QUOTA_PER_PRICE_UNIT' \
+[ "$nlog1" -gt "$nlog0" ] && echo "$errmsg" | grep -q 'NETONAPI_QUOTA_PER_PRICE_UNIT' \
   && pass "拒绝的原因落库可查：infra_api_error_logs ${nlog0}->${nlog1} 行，exception_message 指名了缺的环变量" \
   || fail "拒绝原因不可查: 错误日志 ${nlog0}->${nlog1} 行（若为 0 行则 ErrorLogWriter 未落库）最新一条='${errmsg}'"
 # channelCode 必填：payment 没有「默认渠道」这回事（PayOrderLogic.resolveRoute 收到 null 直接判不可用），
@@ -1101,7 +1110,7 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 # 其后的兑换码场景（S36+）复用同一次启动与同一个 admin JWT。
 # 重启后重取 JWT（与 :582 / :617 / :700 同一惯例）。后面没有场景了，所以末尾不需要
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
-stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 
 echo "[S31] 在途改会员组映射：按下单时冻结的快照计价"
@@ -1582,8 +1591,8 @@ dskip42=$((skip42b - skip42a))
 echo "[S43] 配置额度后：两个角色各恰好一条台账，余额按配置动"
 # 保留上一次 boot 的两个计费 env：本批不再中继，但少传一个就等于顺手改了全局计价，
 # 万一后面还要加场景就会踩到一个谁也说不清的差异。
-stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
-  NEWGATE_INVITE_REWARD_INVITER=50000 NEWGATE_INVITE_REWARD_INVITEE=20000
+stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_UNIT=1000 \
+  NETONAPI_INVITE_REWARD_INVITER=50000 NETONAPI_INVITE_REWARD_INVITEE=20000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk43=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
 atok43=no; printf '%s' "$atk43" | grep -q "inviter=50000 invitee=20000" && atok43=yes
@@ -1635,8 +1644,8 @@ dskip44=$((skip44b - skip44a))
 echo "[S45] 额度配置非法：该角色不发奖但必须响，且不连累另一个角色"
 # `1e3` 是个很可能的笔误（想写 1000）。把它静默读成「不奖励」的后果是：运营以为活动已上线、
 # 客服按活动口径答复用户，而账上什么都没有 —— 那比不发奖励糟得多。所以非法必须与 0 严格区分。
-stop_app; boot_app NEWGATE_MEMBER_GROUP_BILLING=true NEWGATE_QUOTA_PER_PRICE_UNIT=1000 \
-  NEWGATE_INVITE_REWARD_INVITER=1e3 NEWGATE_INVITE_REWARD_INVITEE=20000
+stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_UNIT=1000 \
+  NETONAPI_INVITE_REWARD_INVITER=1e3 NETONAPI_INVITE_REWARD_INVITEE=20000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk45=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
 atok45=no; printf '%s' "$atk45" | grep -q "inviter=INVALID invitee=20000" && atok45=yes
@@ -1753,7 +1762,7 @@ echo "[S48] 用户级计价例外：管理端能写、写了真的改变计价�
 # 所以核心断言不是「接口返回 200」，而是**倍率真的生效**：先量一次基线，配例外后再量一次，
 # 断言后者恰好是前者的 ratio 倍。用比值而不是写死金额：金额取决于模型价与 token 数，
 # 写死期望值会把「定价变了」误报成「例外没生效」（S27 已经因为 normalize 剔尾零踩过一次）。
-stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 # 会员组计费开关**不开**：开着的话第 3 层会参与解析，而 account_users(1) 的会员组是 S26 留下的
 # 未映射组，基线那一发会变成 403 而不是按 default 计价。关掉它，比较才是干净的两层：例外 vs default。
@@ -2348,7 +2357,7 @@ post54e=$(row54 90542)
 #     张表；失败行缺归因，这张表就只能按组统计成功量，「某个组是不是在集中撞某个上游」问不出来
 # 两块表都断言（usage_logs 与 settlements）：finalize 的日志维度全部取自结算行，worker 重放时
 # 可能已是另一个进程，所以归因必须先固化在 settlements 上 —— 只断言 usage_logs 会漏掉「重放丢归因」。
-# 不覆盖 MEMBER_GROUP 那层：它要 NEWGATE_MEMBER_GROUP_BILLING 开关加会员组映射（其解析行为 S26
+# 不覆盖 MEMBER_GROUP 那层：它要 NETONAPI_MEMBER_GROUP_BILLING 开关加会员组映射（其解析行为 S26
 # 已覆盖），而本场景要证的是「source 落库了、且跟着优先级走」，三层足够。
 # ════════════════════════════════════════════════════════════════════
 echo "[S55] 计费归因落库：DEFAULT / USER_OVERRIDE / TOKEN_OVERRIDE 三层 + 失败请求也带归因"
@@ -2486,7 +2495,7 @@ print(json.dumps({"appId": "2021000000000056", "privateKey": sys.argv[1], "alipa
 # 所以跑真 alipay 必须把它关掉。currentValue() 每次查表、无缓存 → 改完立即生效，末尾还原成 'true'。
 # 副作用可控：S56 是最后一段，而关着它只会让 sandbox_* 一律「不可用的支付通道」，对账任务也因同一个
 # 判据不会去查前面场景留下的沙箱单 —— 全程不发一个外网请求（WAP 下单本身就是页面接口）。
-stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BASE56" NEWGATE_PAY_RETURN_URL="$RET56"
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PAY_NOTIFY_BASE="$BASE56" NETONAPI_PAY_RETURN_URL="$RET56"
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at)
      VALUES ('payment','payment.mock.enabled','false','模拟支付模式',0,0)
@@ -2500,7 +2509,7 @@ pl56=$(jf56 payload)
 nu56=$(pq56 "$pl56" notify_url); ru56=$(pq56 "$pl56" return_url); bc56=$(pq56 "$pl56" biz_content)
 ENU56="$BASE56/app/pay/channel-notify/alipay56"
 qa56=no; printf '%s' "$bc56" | grep -q "\"quit_url\":\"$RET56\"" && qa56=yes
-la56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); la56l=$(lvl56 "$la56")
+la56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); la56l=$(lvl56 "$la56")
 
 # ── 块 A：配了基址 → 两个地址逐字进 payload ──
 [ "$rc56" = "200" ] && [ "$nu56" = "$ENU56" ] && [ "$ru56" = "$RET56" ] && [ "$qa56" = "yes" ] && [ "$la56l" = "INFO" ] \
@@ -2524,7 +2533,7 @@ hc56=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U$pb56/nop
   || fail "块B 发出去的地址打不回来: 剥基址后的路径='${pb56}'(期望 /app/pay/channel-notify/alipay56；空串说明块A 的 notify_url 不以配置的基址开头) 打回本机=${hb56}(期望200；404 说明注册的路由与发出去的地址各说各话 —— 那正是本条缺陷) 对照多挂一段=${hc56}(期望404；非404 说明有兜底路由在应答，那么「打回本机不是 404」就不证明任何事) 回执='${ab56}'"
 
 # ── 块 C：没配 → 两个参数都不出现，但下单照样成功（留空是退化，不是失败）──
-stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcC56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
@@ -2534,8 +2543,8 @@ plC56=$(jf56 payload)
 ali56=no; printf '%s' "$plC56" | grep -q "openapi.alipay.com" && ali56=yes
 nnC56=no; printf '%s' "$plC56" | grep -q "notify_url=" && nnC56=yes
 nrC56=no; printf '%s' "$plC56" | grep -q "return_url=" && nrC56=yes
-lcC56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); lcC56l=$(lvl56 "$lcC56")
-lrC56=$(lg56 NEWGATE_PAY_RETURN_URL); lrC56l=$(lvl56 "$lrC56")
+lcC56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); lcC56l=$(lvl56 "$lcC56")
+lrC56=$(lg56 NETONAPI_PAY_RETURN_URL); lrC56l=$(lvl56 "$lrC56")
 # 两行各说各的后果：return_url 没配与「渠道会不会回调」无关。共用一句文案的话其中一行会说谎，
 # 而运维读到那行会去查一条没坏的路 —— 所以两行都要断：说了自己的、没借对方的。
 own56=no; printf '%s' "$lcC56" | grep -q "pay-order-reconcile" && own56=yes
@@ -2552,15 +2561,15 @@ lie56=no; printf '%s' "$lrC56" | grep -q "pay-order-reconcile" && lie56=yes
 
 # ── 块 D：写错（漏 scheme）→ 按未配置处理 + ERROR，且只影响那一个变量 ──
 BAD56="pay.netonapi.test"
-stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BAD56" NEWGATE_PAY_RETURN_URL="$RET56"
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PAY_NOTIFY_BASE="$BAD56" NETONAPI_PAY_RETURN_URL="$RET56"
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plD56=$(jf56 payload)
 ndD56=no; printf '%s' "$plD56" | grep -q "notify_url=" && ndD56=yes
 rdD56=no; printf '%s' "$plD56" | grep -q "return_url=" && rdD56=yes
-ldD56=$(lg56 NEWGATE_PAY_NOTIFY_BASE); ldD56l=$(lvl56 "$ldD56")
-lrD56=$(lg56 NEWGATE_PAY_RETURN_URL); lrD56l=$(lvl56 "$lrD56")
+ldD56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); ldD56l=$(lvl56 "$ldD56")
+lrD56=$(lg56 NETONAPI_PAY_RETURN_URL); lrD56l=$(lvl56 "$lrD56")
 [ "$rcD56" = "200" ] && [ "$ndD56" = "no" ] && [ "$rdD56" = "yes" ] && [ "$ldD56l" = "ERROR" ] && [ "$lrD56l" = "INFO" ] \
   && printf '%s' "$ldD56" | grep -q "$BAD56" \
   && pass "块D 写错不静默、也不连累另一半：notify 基址漏 scheme('${BAD56}') → 启动日志 ${ldD56l} 且点名了原值，payload 里 notify_url 出现=${ndD56}（按未配置处理，不把非法地址发给渠道）；return_url 出现=${rdD56}、它那行仍是 ${lrD56l} —— 两个变量各判各的；下单=${rcD56}（没被拖累）" \
@@ -2586,23 +2595,23 @@ else
 
   # E1：停用对账任务 + 不配基址 → 两条都断，ERROR 点名是哪两条
   q "UPDATE infra_jobs SET status=0 WHERE handler_name='$JOB56';" >/dev/null
-  n1e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+  n1e56=$(ln56); stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
   e1e56=$(new56 "$n1e56" | grep "两条到账路径" | tail -1)
   e1l56=$(lvl56 "$e1e56")
   # 同一次启动还该有那行 WARN（未配置本身仍然要说）—— ERROR 是**加**上去的，不是替换掉它
-  w1e56=$(new56 "$n1e56" | grep NEWGATE_PAY_NOTIFY_BASE | grep -v "两条到账路径" | tail -1)
+  w1e56=$(new56 "$n1e56" | grep NETONAPI_PAY_NOTIFY_BASE | grep -v "两条到账路径" | tail -1)
   w1l56=$(lvl56 "$w1e56")
 
   # E2 对照：任务仍停用，但配上基址 → 渠道能回调，还剩一条路
-  n2e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BASE56"
+  n2e56=$(ln56); stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PAY_NOTIFY_BASE="$BASE56"
   e2e56=$(new56 "$n2e56" | grep -c "两条到账路径")
-  i2e56=$(lvl56 "$(new56 "$n2e56" | grep NEWGATE_PAY_NOTIFY_BASE | tail -1)")
+  i2e56=$(lvl56 "$(new56 "$n2e56" | grep NETONAPI_PAY_NOTIFY_BASE | tail -1)")
 
   # E3 对照：任务恢复启用 + 不配基址 → 就是块C 那个形状，只该有 WARN
   q "UPDATE infra_jobs SET status=1 WHERE handler_name='$JOB56';" >/dev/null
-  n3e56=$(ln56); stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000
+  n3e56=$(ln56); stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
   e3e56=$(new56 "$n3e56" | grep -c "两条到账路径")
-  w3l56=$(lvl56 "$(new56 "$n3e56" | grep NEWGATE_PAY_NOTIFY_BASE | tail -1)")
+  w3l56=$(lvl56 "$(new56 "$n3e56" | grep NETONAPI_PAY_NOTIFY_BASE | tail -1)")
 
   [ "$e1l56" = "ERROR" ] && [ "$w1l56" = "WARN" ] && [ "$e2e56" = "0" ] && [ "$i2e56" = "INFO" ] \
     && [ "$e3e56" = "0" ] && [ "$w3l56" = "WARN" ] && printf '%s' "$e1e56" | grep -q "$JOB56" \
@@ -2841,7 +2850,7 @@ rrl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||status FROM 
 # ══ S72 价源同步 + 指标 + 渠道测速落库 ══
 echo "[S72] 价源同步 / metrics / 测速"
 seed_reset; fake ok 9934; sleep 1
-stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NEWGATE_METRICS_TOKEN=mt
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NETONAPI_METRICS_TOKEN=mt
 sy=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/sync" -H "Authorization: Bearer $GJWT" -H "$CT")
 sya=$(q "SELECT input_price||'/'||output_price||'/'||default_max_output_tokens||'/'||source FROM gateway_model_prices WHERE model='sync-a'")
 echo "$sy" | grep -q '"created":2' && [ "$sya" = "1.5/6/4096/sync" ] && pass "价源同步：对象形状解析、created=2、source=sync" || fail "价源同步: $sy sync-a=$sya"
@@ -2931,7 +2940,7 @@ nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio
 echo "[S77] 邮件通道与邮箱找回密码"
 # S77/S78 验的是真实投递（厂商 HTTP 与 SMTP 握手），而 harness 全局开着验证码模拟通道（只存不发，
 # 短信与邮件一视同仁）。这两段临时以环境变量关掉模拟重启网关，S78 之后按 S72 的环境恢复。
-S72_ENV=(NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NEWGATE_METRICS_TOKEN=mt)
+S72_ENV=(NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NETONAPI_METRICS_TOKEN=mt)
 stop_app; boot_app "${S72_ENV[@]}" NETON_SECURITY__VERIFICATION__SIMULATE=false
 fake mail 9939; sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1

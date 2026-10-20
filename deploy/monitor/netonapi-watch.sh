@@ -9,7 +9,7 @@
 #
 # 环境变量（/etc/netonapi/watch.env）：
 #   NETONAPI_URL          后端地址，默认 http://127.0.0.1:8800
-#   NETONAPI_METRICS_TOKEN  设了 NEWGATE_METRICS_TOKEN 时填同一个值
+#   NETONAPI_METRICS_TOKEN  设了 NETONAPI_METRICS_TOKEN 时填同一个值
 #   WATCH_ALERT_WEBHOOK   告警地址（必填，不填只打印）
 #   BACKUP_DIR            可选，填了才检查备份新鲜度（与备份脚本同一目录）
 #   WATCH_STATE_DIR       去重状态目录，默认 /var/lib/netonapi-watch

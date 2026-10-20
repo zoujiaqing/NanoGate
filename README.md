@@ -69,7 +69,7 @@ docker compose up -d --build
 ## 验证
 
 ```bash
-./harness/run.sh                      # 需要本机 PostgreSQL 与 Redis；本机跑着后端时用 NEWGATE_HARNESS_PORT=8801
+./harness/run.sh                      # 需要本机 PostgreSQL 与 Redis；本机跑着后端时用 NETONAPI_HARNESS_PORT=8801
 cd netonapi-backend && ./gradlew :module-gateway:macosArm64Test -Pneton.database.driver=postgres
 ```
 
