@@ -30,6 +30,13 @@ def _exit():
         _inflight -= 1
 
 
+class Server(ThreadingHTTPServer):
+    # 默认监听队列只有 5：网关刚启动时没有可复用的连接，S1 的 20 个并发会同时新建连接，
+    # 队列满了 macOS 直接 RST，网关回 503 —— 那是假上游扛不住，不是网关的问题。真实上游的队列远大于此。
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -359,4 +366,4 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    Server(("127.0.0.1", PORT), H).serve_forever()
