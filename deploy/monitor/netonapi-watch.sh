@@ -3,7 +3,7 @@
 #
 # 检查项（每项独立去重：变坏时报一次，持续坏每 WATCH_REPEAT_HOURS 小时再提醒，恢复时报一次）：
 #   health        GET /health 不是 200（进程挂了或数据库不可达）
-#   settlement    有结算进入人工复核（nanogate_settlements_manual_review > 0），这些钱需要人裁定
+#   settlement    有结算进入人工复核（netonapi_settlements_manual_review > 0），这些钱需要人裁定
 #   channels      启用中的渠道最近一次测速全部失败（用户此刻的请求基本都会失败）
 #   backup        BACKUP_DIR 里最新的备份超过 26 小时（备份定时器停了或一直失败）
 #
@@ -51,13 +51,13 @@ if [ "$code" = "200" ]; then report health ok ""; else report health fail "/heal
 auth=(); [ -n "${NETONAPI_METRICS_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $NETONAPI_METRICS_TOKEN")
 metrics=$(curl -fsS --max-time 15 ${auth[@]+"${auth[@]}"} "$URL/metrics" 2>/dev/null || true)
 if [ -n "$metrics" ]; then
-  manual=$(printf '%s\n' "$metrics" | awk '$1=="nanogate_settlements_manual_review"{print $2}')
+  manual=$(printf '%s\n' "$metrics" | awk '$1=="netonapi_settlements_manual_review"{print $2}')
   if [ "${manual:-0}" -gt 0 ] 2>/dev/null; then report settlement fail "$manual 笔结算待人工复核（管理台「结算待处理」）"; else report settlement ok ""; fi
 
   # 启用中（status=1）且测过速的渠道，全部 probe_ok=0 才算全挂；一条都没测过时不判
   read -r enabled failing < <(printf '%s\n' "$metrics" | awk '
-    /^nanogate_channel_status\{/ { split($1,a,"id=\""); split(a[2],b,"\""); st[b[1]]=$2 }
-    /^nanogate_channel_probe_ok\{/ { split($1,a,"id=\""); split(a[2],b,"\""); ok[b[1]]=$2 }
+    /^netonapi_channel_status\{/ { split($1,a,"id=\""); split(a[2],b,"\""); st[b[1]]=$2 }
+    /^netonapi_channel_probe_ok\{/ { split($1,a,"id=\""); split(a[2],b,"\""); ok[b[1]]=$2 }
     END { e=0; f=0; for (id in st) if (st[id]==1 && (id in ok)) { e++; if (ok[id]==0) f++ } print e, f }')
   if [ "${enabled:-0}" -gt 0 ] && [ "$failing" = "$enabled" ]; then
     report channels fail "启用中的 $enabled 条渠道最近一次测速全部失败"

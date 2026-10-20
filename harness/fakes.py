@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NewGate 故障注入假上游。MODE 环境变量选行为；单端口。
+"""NetonAPI 故障注入假上游。MODE 环境变量选行为；单端口。
 MODE: ok | slowok | err500 | err403 | err429 | bigstream | midabort | embok | azure | tools | rerank | bedrock | vertex | audio | mail | turnstile
 """
 import json, os, time, threading, hashlib, hmac, base64, struct, zlib, datetime

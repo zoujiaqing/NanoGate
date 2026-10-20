@@ -36,9 +36,9 @@ Azure OpenAI、Anthropic、Gemini、AWS Bedrock（SigV4）、Vertex AI（服务�
 
 ```
 NewGate/                 ← 本仓：编排、harness、文档
-  newgate/               后端发行版（装配 Neton 各模块，含 Dockerfile）
-  newgate-front/         管理台（Next.js，装配 canonical 前端模块）
-  newgate-client/        用户控制台（Next.js）
+  netonapi-backend/               后端发行版（装配 Neton 各模块，含 Dockerfile）
+  netonapi-frontend/         管理台（Next.js，装配 canonical 前端模块）
+  netonapi-client/        用户控制台（Next.js）
   harness/               端到端 harness：真网关 + 假上游 + 隔离数据库，170 条断言
   docker-compose.yml     后端 + PostgreSQL + Redis + 两个前端 + Caddy 边缘
   deploy/                Caddyfile 与生产 compose 叠加
@@ -70,7 +70,7 @@ docker compose up -d --build
 
 ```bash
 ./harness/run.sh                      # 需要本机 PostgreSQL 与 Redis；本机跑着后端时用 NEWGATE_HARNESS_PORT=8801
-cd newgate && ./gradlew :module-gateway:macosArm64Test -Pneton.database.driver=postgres
+cd netonapi-backend && ./gradlew :module-gateway:macosArm64Test -Pneton.database.driver=postgres
 ```
 
 ## 许可

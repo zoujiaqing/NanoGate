@@ -1,4 +1,4 @@
-# NewGate 一键部署。用户不需要选数据库——PostgreSQL 与 Redis 都在这里。
+# NetonAPI 一键部署。用户不需要选数据库——PostgreSQL 与 Redis 都在这里。
 #
 #   1) cp .env.example .env  然后按注释填必须改的三个密钥
 #   2) docker compose up -d
@@ -12,13 +12,13 @@ services:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-newgate}
+      POSTGRES_USER: ${POSTGRES_USER:-netonapi}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-newgate}
+      POSTGRES_DB: ${POSTGRES_DB:-netonapi}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-newgate} -d ${POSTGRES_DB:-newgate}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netonapi} -d ${POSTGRES_DB:-netonapi}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -44,22 +44,22 @@ services:
   migrate:
     build:
       context: ..
-      dockerfile: newgate/Dockerfile
-    image: nanogate:latest
+      dockerfile: NewGate/netonapi-backend/Dockerfile
+    image: netonapi-backend:latest
     restart: "no"
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-newgate}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-newgate}
+      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-netonapi}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-netonapi}
       NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
     command: ["migrate", "up"]
 
-  newgate:
+  netonapi:
     build:
       context: ..
-      dockerfile: newgate/Dockerfile
-    image: nanogate:latest
+      dockerfile: NewGate/netonapi-backend/Dockerfile
+    image: netonapi-backend:latest
     restart: unless-stopped
     depends_on:
       migrate:
@@ -67,7 +67,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-newgate}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-newgate}
+      NETON_DATABASE__DEFAULT__URI: postgresql://${POSTGRES_USER:-netonapi}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-netonapi}
       NETON_REDIS__HOST: redis
       NETON_REDIS__PORT: "6379"
       NETON_SECURITY__JWT__SECRETKEY: ${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
@@ -123,7 +123,7 @@ services:
       # RETURN_URL 空 → 用户付完回不到你的页面（这一项与渠道回不回调无关）。
       # 生效值在启动日志：grep "payment.callback-url"。
       # ⚠️ 没设 NOTIFY_BASE 就别在后台停用 pay-order-reconcile：两条到账路径全断 = 钱到账了额度永远不发。
-      # ⚠️ 别填容器内部地址（http://localhost:8800 或 http://newgate:8800）：本地跑得通，
+      # ⚠️ 别填容器内部地址（http://localhost:8800 或 http://netonapi:8800）：本地跑得通，
       # 上线后一律回调失败 —— 而失败发生在渠道那一侧，你这边只看到订单一直是待支付。
       NEWGATE_PUBLIC_API_URL: ${PUBLIC_API_URL:-}
       NEWGATE_PRICE_SYNC_URL: ${PRICE_SYNC_URL:-}
@@ -140,11 +140,11 @@ services:
   front:
     build:
       context: ..
-      dockerfile: NewGate/newgate-front/Dockerfile
-    image: nanogate-front:latest
+      dockerfile: NewGate/netonapi-frontend/Dockerfile
+    image: netonapi-frontend:latest
     restart: unless-stopped
     depends_on:
-      newgate:
+      netonapi:
         condition: service_healthy
     expose: ["3000"]
 
@@ -152,14 +152,14 @@ services:
   console:
     build:
       context: ..
-      dockerfile: NewGate/newgate-client/Dockerfile
-    image: nanogate-console:latest
+      dockerfile: NewGate/netonapi-client/Dockerfile
+    image: netonapi-client:latest
     restart: unless-stopped
     depends_on:
-      newgate:
+      netonapi:
         condition: service_healthy
     environment:
-      NETON_BACKEND_URL: http://newgate:8800
+      NETON_BACKEND_URL: http://netonapi:8800
     expose: ["3000"]
     # 固定 IP：它的服务端代理透传 X-Forwarded-For，后端要把它列为可信代理
     networks:

@@ -4,20 +4,20 @@
 # 注意：这是「每次隔离一个临时 database」，不是「每次拉起隔离 PostgreSQL 实例」；库位置由
 #   PGUSER/PGPASS/PGHOST/PGPORT 指定（默认本机 5432），其余端口是写死的：应用 8800、
 #   fake 9920–9991、隔离 Redis 6399。CI 跑的是同一个脚本（postgres 用 service 容器，见
-#   newgate/.github/workflows/backend-ci.yml）：一次性 runner 上写死端口不会撞，但本机并行跑
+#   netonapi-backend/.github/workflows/backend-ci.yml）：一次性 runner 上写死端口不会撞，但本机并行跑
 #   多份 harness 会（动态端口仍在 SPEC.md 末「待办」段）。
 #   Redis 是「每次拉起一个独立实例」：开发机上 6379 往往有别的项目在用，绝不能往里写 harness 的键。
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-NEWGATE="$ROOT/newgate"
+BACKEND_DIR="$ROOT/netonapi-backend"
 # 构建目标可覆盖：本机默认 macosArm64，CI（Linux）传 NEWGATE_TARGET=linuxX64
 TARGET="${NEWGATE_TARGET:-macosArm64}"
 LINK_TASK="${NEWGATE_LINK_TASK:-:application:linkDebugExecutable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
-APP="$NEWGATE/application/build/bin/$TARGET/debugExecutable/application.kexe"
+APP="$BACKEND_DIR/application/build/bin/$TARGET/debugExecutable/application.kexe"
 LOGS="$HERE/logs"; mkdir -p "$LOGS"
-DB="newgate_harness_$$"
+DB="netonapi_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
 TOKEN_HASH="$(python3 -c "import hashlib;print(hashlib.sha256('$TOKEN_PLAINTEXT'.encode()).hexdigest())")"
 PORT="${NEWGATE_HARNESS_PORT:-8800}"
@@ -106,7 +106,7 @@ DB_VARIANT=postgres
 # openssl 4.0.2-3 还没发布，要用本地 openssl-kotlin 源码顶上。这个开关只能走命令行：
 # 根构建的 gradle.properties 传不到被 includeBuild 的框架 settings 里。openssl 发布后删掉。
 NETON_BUILD_FLAGS=(-Pnetonstream.local.openssl=true)
-link_app() { ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
+link_app() { ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
 # NEWGATE_SKIP_LINK=1：产物已由外部构建好（例如多个项目共用框架 composite build、需经构建锁串行时），跳过这一步。
 if [ "${NEWGATE_SKIP_LINK:-0}" = "1" ]; then
   [ -x "$APP" ] || { echo "NEWGATE_SKIP_LINK=1 但 $APP 不存在"; exit 1; }
@@ -118,7 +118,7 @@ createdb -U "$PGUSER" "$DB" || { echo "createdb failed"; exit 1; }
 # 只保留最近 2 次运行的 work 目录，避免长期跑 harness 占满磁盘
 ls -dt "$LOGS"/work-* 2>/dev/null | tail -n +3 | xargs rm -rf 2>/dev/null
 WORK="$LOGS/work-$$"; mkdir -p "$WORK/config" "$WORK/logs"
-cp "$NEWGATE/application/config/"*.conf "$WORK/config/"
+cp "$BACKEND_DIR/application/config/"*.conf "$WORK/config/"
 # 端口可由 NEWGATE_HARNESS_PORT 覆盖：本机跑着演示实例时不用停它
 sed -i.bak "s/^port = .*/port = $PORT/" "$WORK/config/application.conf" && rm -f "$WORK/config/application.conf.bak"
 # 没有短信/邮件通道时，验证码服务默认直接报错（不再假装发送成功）；harness 打开 simulate：
@@ -175,7 +175,7 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
   if grep -q 'NETON-DB-VARIANT' "$LOGS/migrate.log"; then
     echo "  ⚠️  链进二进制的 sqlx4k variant 不是 ${DB_VARIANT}（多半是共享 Neton/neton 的兄弟项目刚用" >&2
     echo "     -Pneton.database.driver=sqlite 跑过测试）：--rerun-tasks 重编重链一次…" >&2
-    ( cd "$NEWGATE" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ) \
+    ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ) \
       || { echo "rebuild failed"; exit 1; }
     if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
       echo "  ⚠️  自愈后仍不匹配：有别的构建正在并发改写那份共享 klib，等它跑完再重跑 harness" >&2
@@ -1852,7 +1852,7 @@ rm -f "$GB"
 #    而列默认值是 0 —— 漏写这一位，菜单既不进侧栏也不进路由表，且不报任何错；
 #    根目录被跳时整棵子树跟着不可达）。
 echo "[S49] 权限→菜单→页面 接线完整性"
-NETON="$NEWGATE/../../Neton"
+NETON="$BACKEND_DIR/../../Neton"
 GWSRC="$NETON/neton-application-module-gateway/src/commonMain/kotlin"
 GWMANIFEST="$NETON/neton-application-front-gateway/src/manifest.ts"
 A1=/tmp/s49-annot-$$; A2=/tmp/s49-seeded-$$; A3=/tmp/s49-comp-$$; A4=/tmp/s49-keys-$$
@@ -2104,7 +2104,7 @@ case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
 # ══ S52 用户控制台接线完整性：装配了的页面必须有侧栏入口，icon 名必须真的存在 ══
 # C 端与 B 端是两套毫不相干的接线，所以 S49 那三道断言对用户控制台一条都不适用：管理台的侧栏
 # 来自数据库（system_menus → buildNav），用户侧的侧栏来自一个静态数组
-# （newgate-client/apps/console/src/config/console.nav.ts），与库、与 RBAC、与权限全无关系
+# （netonapi-client/apps/console/src/config/console.nav.ts），与库、与 RBAC、与权限全无关系
 # —— layout 给 AppShell 传的是 roles={[]} permissions={[]}，每个登录用户看到的都一样。
 # 这个数组此前就是空的：`export const consoleNav: NavItem[] = [];`。后果是 console 装配的 5 个
 # 页面路由全在、组件全能渲染、typecheck 全绿，而用户登录后侧栏一片空白，进入任何一页的唯一
@@ -2122,7 +2122,7 @@ case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
 # modules.generated.ts：生成物要跑 pnpm 才有，manifest 是源码、永远在。cs 模块存在于仓库但没进
 # console 的依赖，所以不计入 —— 「装配了什么」由 app 说了算，不由模块自己说了算。
 echo "[S52] 用户控制台接线完整性：页面有入口、入口有页面、icon 名存在"
-CONSOLE52="$ROOT/newgate-client/apps/console"
+CONSOLE52="$ROOT/netonapi-client/apps/console"
 NAV52="$CONSOLE52/src/config/console.nav.ts"
 SHELL52="$CONSOLE52/src/components/app-shell.tsx"
 B1=/tmp/s52-mods-$$; B2=/tmp/s52-pages-$$; B3=/tmp/s52-nav-$$; B4=/tmp/s52-icons-$$; B5=/tmp/s52-iconmap-$$
@@ -2476,7 +2476,7 @@ PRIV56=$(rk56 PRIVATE_KEY); PUB56=$(rk56 PUBLIC_KEY)
 if [ -z "$PRIV56" ] || [ -z "$PUB56" ]; then
   echo "  ⚠️  取不到 alipay 测试密钥（$KEYS56 不在？priv=${#PRIV56}B pub=${#PUB56}B）：S56 四块整段跳过" >&2
 else
-BASE56="https://pay.nanogate.test"; RET56="https://console.nanogate.test/billing"
+BASE56="https://pay.netonapi.test"; RET56="https://console.netonapi.test/billing"
 # config 用 json.dumps 组装：私钥是 1.6KB base64，手拼进 SQL 迟早漏一个转义。
 CFG56=$(python3 -c '
 import json, sys
@@ -2551,7 +2551,7 @@ lie56=no; printf '%s' "$lrC56" | grep -q "pay-order-reconcile" && lie56=yes
   || fail "块C 未配置时的行为不对: 下单=${rcC56}(期望200，留空不该让下单失败) payload 仍是 alipay 跳转地址=${ali56}(期望yes；no 说明 prepay 本身挂了，那么「没有 notify_url」是假象) notify_url 出现=${nnC56}(期望no) return_url 出现=${nrC56}(期望no) 两行级别='${lcC56l}'/'${lrC56l}'(期望WARN/WARN；空说明这行日志压根没写，运营就无从知道回调没配) notify行提 job id=${own56}(期望yes) notify行写成了类名=${cls56}(期望no；yes 说明日志点了个后台任务页上搜不到的名字 —— 那一列是 @Job.id) return行提回不来=${back56}(期望yes) return行借了对账任务=${lie56}(期望no；yes 说明两行又共用了同一句文案 —— return_url 没配并不影响渠道回调，那句话会把人送去查一条没坏的路) notify行='${lcC56:0:170}' return行='${lrC56:0:170}'"
 
 # ── 块 D：写错（漏 scheme）→ 按未配置处理 + ERROR，且只影响那一个变量 ──
-BAD56="pay.nanogate.test"
+BAD56="pay.netonapi.test"
 stop_app; boot_app NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PAY_NOTIFY_BASE="$BAD56" NEWGATE_PAY_RETURN_URL="$RET56"
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
@@ -2618,7 +2618,7 @@ fi
 
 # ══ S57 健康端点：匿名可读，DB 可达即 200（容器 HEALTHCHECK / compose depends_on / 反代健康检查都靠它）══
 echo "[S57] /health"
-hc=$(curl -s --max-time 5 -o /tmp/nanogate-health.json -w "%{http_code}" "$U/health"); hb=$(cat /tmp/nanogate-health.json 2>/dev/null)
+hc=$(curl -s --max-time 5 -o /tmp/netonapi-health.json -w "%{http_code}" "$U/health"); hb=$(cat /tmp/netonapi-health.json 2>/dev/null)
 [ "$hc" = "200" ] && echo "$hb" | grep -q '"status":"ok"' \
   && pass "/health 匿名 200 且 status=ok" \
   || fail "/health 错: HTTP=${hc} body=${hb}"
@@ -2647,7 +2647,7 @@ seed_reset; export AZURE_DEPLOYMENT=dep-1 AZURE_KEY=sk-azure; fake azure 9959; s
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,api_version,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-az','azure_openai','http://127.0.0.1:9959','default','gpt-a','{\"gpt-a\":\"dep-1\"}','2024-06-01',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-az'),'sk-azure',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('gpt-a','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
-ac=$(curl -s --max-time 15 -o /tmp/nanogate-az.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-a","messages":[]}'); ab=$(cat /tmp/nanogate-az.json)
+ac=$(curl -s --max-time 15 -o /tmp/netonapi-az.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-a","messages":[]}'); ab=$(cat /tmp/netonapi-az.json)
 [ "$ac" = "200" ] && echo "$ab" | grep -q '"model":"gpt-a"' \
   && pass "Azure 形状正确（200，model 改回 gpt-a）" || fail "Azure 请求形状错: HTTP=$ac body=$ab"
 unset AZURE_DEPLOYMENT AZURE_KEY
@@ -2658,10 +2658,10 @@ seed_reset; fake err403 9961; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-403','openai_compatible','http://127.0.0.1:9961','default','m-x',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-403'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
-xc=$(curl -s --max-time 15 -o /tmp/nanogate-x.json -w "%{http_code}" -X POST "$U/v1/messages" -H "$AUTH" -H "$CT" -d '{"model":"m-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'); xb=$(cat /tmp/nanogate-x.json)
+xc=$(curl -s --max-time 15 -o /tmp/netonapi-x.json -w "%{http_code}" -X POST "$U/v1/messages" -H "$AUTH" -H "$CT" -d '{"model":"m-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'); xb=$(cat /tmp/netonapi-x.json)
 [ "$xc" = "403" ] && echo "$xb" | grep -q '"type":"error"' && echo "$xb" | grep -q 'forbidden' \
   && pass "Anthropic 入口收到 Anthropic 形状的 403（含上游原话）" || fail "跨协议错误体: HTTP=$xc body=$xb"
-oc=$(curl -s --max-time 15 -o /tmp/nanogate-o.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-x","messages":[]}'); ob=$(cat /tmp/nanogate-o.json)
+oc=$(curl -s --max-time 15 -o /tmp/netonapi-o.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-x","messages":[]}'); ob=$(cat /tmp/netonapi-o.json)
 [ "$oc" = "403" ] && [ "$ob" = '{"error": "forbidden"}' ] \
   && pass "同协议 403 仍原样透传" || fail "同协议透传变了: HTTP=$oc body=$ob"
 
@@ -2733,7 +2733,7 @@ seed_reset; fake ok 9966; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-rs','openai_compatible','http://127.0.0.1:9966','default','m-rs','{\"m-rs\":\"up-rs\"}',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rs'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rs','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
-rsc=$(curl -s --max-time 15 -o /tmp/nanogate-rs.json -w "%{http_code}" -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","max_output_tokens":50}'); rsb=$(cat /tmp/nanogate-rs.json)
+rsc=$(curl -s --max-time 15 -o /tmp/netonapi-rs.json -w "%{http_code}" -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","max_output_tokens":50}'); rsb=$(cat /tmp/netonapi-rs.json)
 [ "$rsc" = "200" ] && echo "$rsb" | grep -q '"object": "response"' && echo "$rsb" | grep -q '"model":"m-rs"' && ! echo "$rsb" | grep -q 'up-rs' \
   && pass "非流式 200、响应 model 改回 m-rs" || fail "非流式: HTTP=$rsc body=$rsb"
 rs1=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||charged||'/'||upstream_model FROM gateway_usage_logs WHERE request_model='m-rs' ORDER BY id LIMIT 1" "1000/500/7500/up-rs")
@@ -2752,17 +2752,17 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,p
    ('c-noimg','openai_compatible','http://127.0.0.1:9967','default','m-img2','chat',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-img'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-noimg'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-img','0','0','0','0',20000,'manual',0,0,0),('m-img2','0','0','0','0',20000,'manual',0,0,0);" >/dev/null
-imc=$(curl -s --max-time 15 -o /tmp/nanogate-img.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img","prompt":"a cat","n":1,"size":"1024x1024"}'); imb=$(cat /tmp/nanogate-img.json)
+imc=$(curl -s --max-time 15 -o /tmp/netonapi-img.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img","prompt":"a cat","n":1,"size":"1024x1024"}'); imb=$(cat /tmp/netonapi-img.json)
 [ "$imc" = "200" ] && echo "$imb" | grep -q '"url": "http://127.0.0.1/x.png"' \
   && pass "图片生成 200 透传" || fail "图片生成: HTTP=$imc body=$imb"
 iml=$(wait_rows "SELECT charged||'/'||prompt_tokens||'/'||status FROM gateway_usage_logs WHERE request_model='m-img' LIMIT 1" "20000/0/ok")
 [ "$iml" = "20000/0/ok" ] && pass "按次计价入账 20000 μUSD（无 usage 也不算 0）" || fail "图片 usage_log: $iml"
-imn=$(curl -s --max-time 15 -o /tmp/nanogate-img2.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img2","prompt":"a cat"}')
-[ "$imn" = "404" ] && grep -q 'model_not_found' /tmp/nanogate-img2.json && pass "没声明 images 能力的渠道不参与 → 404 model_not_found" || fail "能力缺失: HTTP=$imn body=$(cat /tmp/nanogate-img2.json)"
+imn=$(curl -s --max-time 15 -o /tmp/netonapi-img2.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img2","prompt":"a cat"}')
+[ "$imn" = "404" ] && grep -q 'model_not_found' /tmp/netonapi-img2.json && pass "没声明 images 能力的渠道不参与 → 404 model_not_found" || fail "能力缺失: HTTP=$imn body=$(cat /tmp/netonapi-img2.json)"
 
 # ══ S67 公开接入信息：匿名可读，端点清单齐全 ══
 echo "[S67] /app/gateway/public-info"
-pic=$(curl -s --max-time 5 -o /tmp/nanogate-pi.json -w "%{http_code}" "$U/app/gateway/public-info"); pib=$(cat /tmp/nanogate-pi.json)
+pic=$(curl -s --max-time 5 -o /tmp/netonapi-pi.json -w "%{http_code}" "$U/app/gateway/public-info"); pib=$(cat /tmp/netonapi-pi.json)
 [ "$pic" = "200" ] && echo "$pib" | grep -q '/v1/chat/completions' && echo "$pib" | grep -q '/v1/images/generations' && echo "$pib" | grep -q '/v1/messages' \
   && pass "public-info 匿名 200 且列出各协议端点" || fail "public-info: HTTP=$pic body=$pib"
 
@@ -2776,11 +2776,11 @@ s68tok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authori
 S68ID=$(echo "$s68tok" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null)
 q "UPDATE gateway_tokens SET rpm_limit=7, group_override='default' WHERE id=$S68ID" >/dev/null
 s68future=$(( $(date +%s) * 1000 + 86400000 ))
-up=$(curl -s --max-time 10 -o /tmp/nanogate-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
+up=$(curl -s --max-time 10 -o /tmp/netonapi-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"s68-renamed\",\"quotaBudget\":5000000,\"expiresAt\":$s68future,\"allowedModels\":\"m-st\",\"allowedIps\":\"\"}")
 row=$(q "SELECT name||'/'||quota_budget||'/'||allowed_models||'/'||rpm_limit||'/'||COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$S68ID")
 [ "$up" = "200" ] && [ "$row" = "s68-renamed/5000000/m-st/7/default" ] \
-  && pass "自助更新：名称/预算/模型范围改了，rpm_limit=7 与 group_override 原样" || fail "自助更新: HTTP=$up row=$row body=$(cat /tmp/nanogate-s68.json)"
+  && pass "自助更新：名称/预算/模型范围改了，rpm_limit=7 与 group_override 原样" || fail "自助更新: HTTP=$up row=$row body=$(cat /tmp/netonapi-s68.json)"
 inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"x\",\"rpmLimit\":9999}")
 rl=$(q "SELECT rpm_limit FROM gateway_tokens WHERE id=$S68ID")
@@ -2796,11 +2796,11 @@ stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=
 
 # ══ S69 控制台自助注册：用户名密码模式必须开着（NetonAPI 在 Main.kt 绑定了 MemberAuthPolicy）══
 echo "[S69] 用户名密码注册"
-rg=$(curl -s --max-time 30 -o /tmp/nanogate-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
-  -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/nanogate-reg.json)
-lg=$(curl -s --max-time 30 -o /tmp/nanogate-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
-[ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/nanogate-lg.json \
-  && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/nanogate-lg.json)"
+rg=$(curl -s --max-time 30 -o /tmp/netonapi-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
+  -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/netonapi-reg.json)
+lg=$(curl -s --max-time 30 -o /tmp/netonapi-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
+[ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/netonapi-lg.json \
+  && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/netonapi-lg.json)"
 
 # ══ S70 跨协议保真：Anthropic 入口（Claude Code 形状）打 OpenAI 上游的工具调用、thinking、缓存用量、多轮回填 ══
 echo "[S70] Anthropic 入口 ↔ OpenAI 上游：工具调用与 thinking"
@@ -2833,8 +2833,8 @@ seed_reset; fake rerank 9933; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-rr','openai_compatible','http://127.0.0.1:9933','default','m-rr','chat,rerank',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rr'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rr','1','0','0','0',1,'manual',0,0,0);" >/dev/null
-rrc=$(curl -s --max-time 15 -o /tmp/nanogate-rr.json -w "%{http_code}" -X POST "$U/v1/rerank" -H "$AUTH" -H "$CT" -d '{"model":"m-rr","query":"q","documents":["a","b","c"]}')
-[ "$rrc" = "200" ] && grep -q '"relevance_score"' /tmp/nanogate-rr.json && pass "rerank 200 透传" || fail "rerank: HTTP=$rrc $(head -c 200 /tmp/nanogate-rr.json)"
+rrc=$(curl -s --max-time 15 -o /tmp/netonapi-rr.json -w "%{http_code}" -X POST "$U/v1/rerank" -H "$AUTH" -H "$CT" -d '{"model":"m-rr","query":"q","documents":["a","b","c"]}')
+[ "$rrc" = "200" ] && grep -q '"relevance_score"' /tmp/netonapi-rr.json && pass "rerank 200 透传" || fail "rerank: HTTP=$rrc $(head -c 200 /tmp/netonapi-rr.json)"
 rrl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||status FROM gateway_usage_logs WHERE request_model='m-rr' LIMIT 1" "77/0/ok")
 [ "$rrl" = "77/0/ok" ] && pass "total_tokens=77 计为输入、状态 ok" || fail "rerank usage_log: $rrl"
 
@@ -2853,7 +2853,7 @@ prow=$(q "SELECT last_probe_ok||'/'||(last_probe_ms IS NOT NULL)||'/'||(last_pro
 [ "$prow" = "1/true/true" ] && pass "探测结果落到渠道行（ok/ms/at）" || fail "测速落库: $prow"
 m401=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$U/metrics")
 mb=$(curl -s --max-time 5 "$U/metrics" -H "Authorization: Bearer mt")
-[ "$m401" = "401" ] && echo "$mb" | grep -q '^nanogate_channel_probe_ok{channel="c-pr"' && echo "$mb" | grep -q '^nanogate_settlements_manual_review ' \
+[ "$m401" = "401" ] && echo "$mb" | grep -q '^netonapi_channel_probe_ok{channel="c-pr"' && echo "$mb" | grep -q '^netonapi_settlements_manual_review ' \
   && pass "/metrics 带 token 才可读，含渠道测速与结算指标" || fail "metrics: noauth=$m401 body=$(echo "$mb" | head -c 300)"
 
 # ══ S73 真实 Claude Code CLI（装了才跑）：完整两轮工具调用经网关打 OpenAI 上游 ══
@@ -2880,8 +2880,8 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('claude-br','3','15','0','0',4096,'manual',0,0,0);" >/dev/null
 # 假上游的 region 来自主机名；本机是 127.0.0.1，所以给渠道一个可推 region 的 Base URL 做不到 —— 走厂商参数
 q "UPDATE gateway_channels SET provider_config='{\"region\":\"us-east-1\"}' WHERE name='c-br'" >/dev/null
-brc=$(curl -s --max-time 15 -o /tmp/nanogate-br.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
-[ "$brc" = "200" ] && grep -q '"from bedrock"' /tmp/nanogate-br.json && pass "Bedrock 非流式：SigV4 通过校验、body 形状正确" || fail "Bedrock 非流式: HTTP=$brc $(head -c 400 /tmp/nanogate-br.json)"
+brc=$(curl -s --max-time 15 -o /tmp/netonapi-br.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+[ "$brc" = "200" ] && grep -q '"from bedrock"' /tmp/netonapi-br.json && pass "Bedrock 非流式：SigV4 通过校验、body 形状正确" || fail "Bedrock 非流式: HTTP=$brc $(head -c 400 /tmp/netonapi-br.json)"
 brs=$(curl -sN --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}')
 brev=$(echo "$brs" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' ')
 [ "$brev" = "message_start content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] && echo "$brs" | grep -q 'bedrock' \
@@ -2899,10 +2899,10 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,
    ('c-vg','vertex_gemini','http://127.0.0.1:9937','default','gemini-vg','{\"gemini-vg\":\"gemini-2.5-pro\"}','{\"project\":\"proj-x\",\"location\":\"us-east5\"}',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-va'),'vtx-token',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-vg'),'vtx-token',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('claude-va','3','15','0','0',4096,'manual',0,0,0),('gemini-vg','1','5','0','0',4096,'manual',0,0,0);" >/dev/null
-vac=$(curl -s --max-time 15 -o /tmp/nanogate-va.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-va","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
-[ "$vac" = "200" ] && grep -q '"from vertex"' /tmp/nanogate-va.json && pass "Vertex Anthropic：Bearer + rawPredict 路径 + anthropic_version" || fail "Vertex Anthropic: HTTP=$vac $(head -c 300 /tmp/nanogate-va.json)"
-vgc=$(curl -s --max-time 15 -o /tmp/nanogate-vg.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gemini-vg","messages":[{"role":"user","content":"hi"}]}')
-[ "$vgc" = "200" ] && grep -q '"from vertex gemini"' /tmp/nanogate-vg.json && pass "Vertex Gemini：OpenAI 入口跨协议到 generateContent" || fail "Vertex Gemini: HTTP=$vgc $(head -c 300 /tmp/nanogate-vg.json)"
+vac=$(curl -s --max-time 15 -o /tmp/netonapi-va.json -w "%{http_code}" -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-va","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+[ "$vac" = "200" ] && grep -q '"from vertex"' /tmp/netonapi-va.json && pass "Vertex Anthropic：Bearer + rawPredict 路径 + anthropic_version" || fail "Vertex Anthropic: HTTP=$vac $(head -c 300 /tmp/netonapi-va.json)"
+vgc=$(curl -s --max-time 15 -o /tmp/netonapi-vg.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gemini-vg","messages":[{"role":"user","content":"hi"}]}')
+[ "$vgc" = "200" ] && grep -q '"from vertex gemini"' /tmp/netonapi-vg.json && pass "Vertex Gemini：OpenAI 入口跨协议到 generateContent" || fail "Vertex Gemini: HTTP=$vgc $(head -c 300 /tmp/netonapi-vg.json)"
 
 # ══ S76 音频：TTS 二进制原样回 + 按输入字符计费；转写 multipart 原样透传、model 字段改写、text 响应类型保真 ══
 echo "[S76] /v1/audio/*"
@@ -2910,18 +2910,18 @@ seed_reset; fake audio 9938; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,capabilities,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-au','openai_compatible','http://127.0.0.1:9938','default','tts-1,stt-1','{\"stt-1\":\"whisper-up\"}','chat,audio',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-au'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('tts-1','15','0','0','0',NULL,'manual',0,0,0),('stt-1','0','0','0','0',6000,'manual',0,0,0);" >/dev/null
-spc=$(curl -s --max-time 15 -o /tmp/nanogate-tts.bin -w "%{http_code} %{content_type}" -X POST "$U/v1/audio/speech" -H "$AUTH" -H "$CT" -d '{"model":"tts-1","input":"hello world","voice":"alloy"}')
-spsz=$(wc -c < /tmp/nanogate-tts.bin | tr -d ' '); sphead=$(head -c 8 /tmp/nanogate-tts.bin)
+spc=$(curl -s --max-time 15 -o /tmp/netonapi-tts.bin -w "%{http_code} %{content_type}" -X POST "$U/v1/audio/speech" -H "$AUTH" -H "$CT" -d '{"model":"tts-1","input":"hello world","voice":"alloy"}')
+spsz=$(wc -c < /tmp/netonapi-tts.bin | tr -d ' '); sphead=$(head -c 8 /tmp/netonapi-tts.bin)
 [ "$spc" = "200 audio/mpeg" ] && [ "$sphead" = "ID3AUDIO" ] && [ "$spsz" = "1043" ] \
   && pass "TTS：二进制 1043 字节与 audio/mpeg 原样回（不经文本解码）" || fail "TTS: $spc size=$spsz head=$sphead"
 spl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||charged||'/'||status FROM gateway_usage_logs WHERE request_model='tts-1' LIMIT 1" "11/0/165/ok")
 [ "$spl" = "11/0/165/ok" ] && pass "TTS 按 11 个输入字符计费（15 USD/百万字符 → 165 μUSD）、状态 ok" || fail "TTS usage_log: $spl"
-head -c 3000 /dev/urandom > /tmp/nanogate-in.wav
-trc=$(curl -s --max-time 15 -o /tmp/nanogate-tr.json -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -F model=stt-1 -F language=zh -F file=@/tmp/nanogate-in.wav)
-[ "$trc" = "200" ] && grep -q '"transcript of nanogate-in.wav (3000 bytes)"' /tmp/nanogate-tr.json && grep -q '"model": "whisper-up"' /tmp/nanogate-tr.json && grep -q '"language": "zh"' /tmp/nanogate-tr.json \
-  && pass "转写：文件字节完整到达、model 改写成 whisper-up、其它字段不动" || fail "转写: HTTP=$trc $(head -c 300 /tmp/nanogate-tr.json)"
-trt=$(curl -s --max-time 15 -w " %{content_type}" -X POST "$U/v1/audio/translations" -H "$AUTH" -F model=stt-1 -F response_format=text -F file=@/tmp/nanogate-in.wav)
-[ "$trt" = "transcript of nanogate-in.wav text/plain; charset=utf-8" ] && pass "response_format=text 时按上游的 text/plain 回" || fail "text 响应: '$trt'"
+head -c 3000 /dev/urandom > /tmp/netonapi-in.wav
+trc=$(curl -s --max-time 15 -o /tmp/netonapi-tr.json -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -F model=stt-1 -F language=zh -F file=@/tmp/netonapi-in.wav)
+[ "$trc" = "200" ] && grep -q '"transcript of netonapi-in.wav (3000 bytes)"' /tmp/netonapi-tr.json && grep -q '"model": "whisper-up"' /tmp/netonapi-tr.json && grep -q '"language": "zh"' /tmp/netonapi-tr.json \
+  && pass "转写：文件字节完整到达、model 改写成 whisper-up、其它字段不动" || fail "转写: HTTP=$trc $(head -c 300 /tmp/netonapi-tr.json)"
+trt=$(curl -s --max-time 15 -w " %{content_type}" -X POST "$U/v1/audio/translations" -H "$AUTH" -F model=stt-1 -F response_format=text -F file=@/tmp/netonapi-in.wav)
+[ "$trt" = "transcript of netonapi-in.wav text/plain; charset=utf-8" ] && pass "response_format=text 时按上游的 text/plain 回" || fail "text 响应: '$trt'"
 trl=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='stt-1' AND charged=6000 AND status='ok'" 2)
 [ "$trl" = "2" ] && pass "两次转写都按次计 6000 μUSD 且 ok" || fail "转写计费行=$trl"
 nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio/transcriptions" -H "$AUTH" -H "$CT" -d '{"model":"stt-1"}')
@@ -2935,20 +2935,20 @@ S72_ENV=(NEWGATE_QUOTA_PER_PRICE_UNIT=1000 NEWGATE_PRICE_SYNC_URL=http://127.0.0
 stop_app; boot_app "${S72_ENV[@]}" NETON_SECURITY__VERIFICATION__SIMULATE=false
 fake mail 9939; sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
-mac=$(curl -s --max-time 10 -o /tmp/nanogate-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
-  -d '{"mail":"noreply@nanogate.test","fromName":"NetonAPI","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
-[ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/nanogate-mac.json)"
+mac=$(curl -s --max-time 10 -o /tmp/netonapi-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"mail":"noreply@netonapi.test","fromName":"NetonAPI","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
+[ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/netonapi-mac.json)"
 rg=$(curl -s --max-time 30 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
 S77T=$(echo "$rg" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['accessToken'])" 2>/dev/null)
-sc=$(curl -s --max-time 10 -o /tmp/nanogate-sec.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"S77@Example.com","scene":"bind_email"}')
+sc=$(curl -s --max-time 10 -o /tmp/netonapi-sec.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"S77@Example.com","scene":"bind_email"}')
 lm=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail")
 code=$(echo "$lm" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
 lmv=$(echo "$lm" | python3 -c "import sys,json;d=json.load(sys.stdin);b=d['body'];print(d['auth'],d['path'],b['from'],b['to'][0],b['subject'])" 2>/dev/null)
-[ "$sc" = "200" ] && [ -n "$code" ] && [ "$lmv" = "Bearer mail-key /send noreply@nanogate.test s77@example.com 验证码" ] \
+[ "$sc" = "200" ] && [ -n "$code" ] && [ "$lmv" = "Bearer mail-key /send noreply@netonapi.test s77@example.com 验证码" ] \
   && pass "发码：厂商收到 Bearer 鉴权、发件人、小写归一的收件人与主题，正文含 6 位码" || fail "发码: HTTP=$sc code='$code' mail='$lmv' $(echo "$lm" | head -c 200)"
-bd=$(curl -s --max-time 10 -o /tmp/nanogate-bd.json -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
+bd=$(curl -s --max-time 10 -o /tmp/netonapi-bd.json -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
 em=$(q "SELECT email FROM account_users WHERE username='s77user'")
-[ "$bd" = "200" ] && [ "$em" = "s77@example.com" ] && pass "绑定邮箱落库" || fail "绑定邮箱: HTTP=$bd email=$em $(head -c 200 /tmp/nanogate-bd.json)"
+[ "$bd" = "200" ] && [ "$em" = "s77@example.com" ] && pass "绑定邮箱落库" || fail "绑定邮箱: HTTP=$bd email=$em $(head -c 200 /tmp/netonapi-bd.json)"
 wrong=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code\"}")
 [ "$wrong" = "400" ] && pass "验证码一次性：重放被拒" || fail "验证码重放: HTTP=$wrong"
 curl -s --max-time 5 -X POST "http://127.0.0.1:9939/reset" -H "$CT" -d '{}' >/dev/null
@@ -2960,10 +2960,10 @@ lm2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "impor
 rkdel "*vc:cooldown:*"
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"s77@example.com","scene":"reset_password"}'
 code2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
-rp=$(curl -s --max-time 10 -o /tmp/nanogate-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
+rp=$(curl -s --max-time 10 -o /tmp/netonapi-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
 lg=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
 old=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
-[ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/nanogate-rp.json)"
+[ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/netonapi-rp.json)"
 # 重置密码作废该账号的全部会话（spec identity-realm）：旧令牌必须 401；S78 继续用这个账号，按新密码重新登录。
 stale77=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/user/get" -H "Authorization: Bearer $S77T")
 S77T=$(curl -s --max-time 30 -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
@@ -2973,20 +2973,20 @@ ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com
 
 # ══ S78 SMTP 发信：假 SMTP 服务器走完整握手；AUTH LOGIN、MIME 头、RFC 2047 主题、base64 正文、验证码可用 ══
 echo "[S78] SMTP 发信"
-rm -f /tmp/nanogate-smtp.json
-PORT=2526 DUMP=/tmp/nanogate-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)
+rm -f /tmp/netonapi-smtp.json
+PORT=2526 DUMP=/tmp/netonapi-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)
 sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
-smc=$(curl -s --max-time 10 -o /tmp/nanogate-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
-  -d '{"mail":"robot@nanogate.test","fromName":"NetonAPI 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@nanogate.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
-[ "$smc" = "200" ] && pass "SMTP 邮箱账号创建" || fail "SMTP 账号: HTTP=$smc $(head -c 200 /tmp/nanogate-smc.json)"
-sc8=$(curl -s --max-time 30 -o /tmp/nanogate-sec8.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"s78@example.com","scene":"bind_email"}')
+smc=$(curl -s --max-time 10 -o /tmp/netonapi-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"mail":"robot@netonapi.test","fromName":"NetonAPI 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@netonapi.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
+[ "$smc" = "200" ] && pass "SMTP 邮箱账号创建" || fail "SMTP 账号: HTTP=$smc $(head -c 200 /tmp/netonapi-smc.json)"
+sc8=$(curl -s --max-time 30 -o /tmp/netonapi-sec8.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"s78@example.com","scene":"bind_email"}')
 smv=$(python3 -c "
-import json;d=json.load(open('/tmp/nanogate-smtp.json'))
+import json;d=json.load(open('/tmp/netonapi-smtp.json'))
 print(d['user'],d['password'],d['from'],d['rcpts'][0],d['subject'],d['content_type'],d['has_date'],d['has_message_id'],'NetonAPI' in d['from_header'])" 2>/dev/null)
-code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/tmp/nanogate-smtp.json'))['body']).group(0))" 2>/dev/null)
-[ "$sc8" = "200" ] && [ "$smv" = "robot@nanogate.test smtp-pw robot@nanogate.test s78@example.com 验证码 text/plain True True True" ] && [ -n "$code8" ] \
-  && pass "SMTP：AUTH LOGIN 凭据、信封、RFC 2047 中文主题与发件人名、Date/Message-ID、base64 正文含验证码" || fail "SMTP 发信: HTTP=$sc8 parsed='$smv' code='$code8' $(head -c 300 /tmp/nanogate-sec8.json)"
+code8=$(python3 -c "import json,re;print(re.search(r'\\d{6}', json.load(open('/tmp/netonapi-smtp.json'))['body']).group(0))" 2>/dev/null)
+[ "$sc8" = "200" ] && [ "$smv" = "robot@netonapi.test smtp-pw robot@netonapi.test s78@example.com 验证码 text/plain True True True" ] && [ -n "$code8" ] \
+  && pass "SMTP：AUTH LOGIN 凭据、信封、RFC 2047 中文主题与发件人名、Date/Message-ID、base64 正文含验证码" || fail "SMTP 发信: HTTP=$sc8 parsed='$smv' code='$code8' $(head -c 300 /tmp/netonapi-sec8.json)"
 bd8=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/bind-email" -H "Authorization: Bearer $S77T" -H "$CT" -d "{\"email\":\"s78@example.com\",\"code\":\"$code8\"}")
 em8=$(q "SELECT email FROM account_users WHERE username='s77user'")
 [ "$bd8" = "200" ] && [ "$em8" = "s78@example.com" ] && pass "SMTP 发出的验证码可用于绑定" || fail "SMTP 码绑定: HTTP=$bd8 email=$em8"
@@ -3253,11 +3253,11 @@ curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" 
 IFS='|' read -r nick2 _ _ <<< "$(pget)"
 [ "$nick2" = "S83 Admin" ] && pass "昵称能改" || fail "昵称没改成: $nick2"
 curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/system/user/profile/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"nickname\":\"$nick0\"}"
-pw() { curl -s --max-time 10 -o /tmp/nanogate-pw.json -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"oldPassword\":\"$1\",\"newPassword\":\"$2\"}"; }
+pw() { curl -s --max-time 10 -o /tmp/netonapi-pw.json -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"oldPassword\":\"$1\",\"newPassword\":\"$2\"}"; }
 nopw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/system/user/profile/update-password" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"newPassword":"s83-new-pass"}')
 wrong=$(pw "not-my-password" "s83-new-pass")
-[ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "OLD_PASSWORD_INCORRECT" /tmp/nanogate-pw.json \
-  && pass "改密码：不带旧密码 400，旧密码错误 400（OLD_PASSWORD_INCORRECT）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/nanogate-pw.json)"
+[ "$nopw" = "400" ] && [ "$wrong" = "400" ] && grep -q "OLD_PASSWORD_INCORRECT" /tmp/netonapi-pw.json \
+  && pass "改密码：不带旧密码 400，旧密码错误 400（OLD_PASSWORD_INCORRECT）" || fail "改密码校验: 不带=$nopw 错误=$wrong body=$(head -c 160 /tmp/netonapi-pw.json)"
 ok1=$(pw "admin123" "s83-new-pass")
 # 改密作废该管理员的全部会话（spec identity-realm）：旧令牌必须 401，用新密码重新登录后再改回。
 stale=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/admin/system/user/profile/get" -H "Authorization: Bearer $GJWT")
@@ -3290,19 +3290,19 @@ q "DELETE FROM system_settings WHERE setting_key IN ('system.site.name','system.
 # ══ S81 支付渠道后台：充值链路的配置前提（页面此前建不出渠道，且侧栏里没有入口）══
 echo "[S81] 支付渠道后台"
 # 建渠道用的是前端表单现在的字段形状；此前表单第一项是必填的「应用 ID」，而 pay_channels 没有那一列
-pc=$(curl -s --max-time 10 -o /tmp/nanogate-pc.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+pc=$(curl -s --max-time 10 -o /tmp/netonapi-pc.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"code":"s81_alipay","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{}","feeRate":6,"status":1}')
-pcid=$(python3 -c "import json;print(json.load(open('/tmp/nanogate-pc.json')).get('data',''))" 2>/dev/null)
-[ "$pc" = "200" ] && [ -n "$pcid" ] && pass "按前端表单的形状能建出渠道（扁平模型，无 appId）" || fail "建渠道: HTTP=$pc body=$(head -c 200 /tmp/nanogate-pc.json)"
+pcid=$(python3 -c "import json;print(json.load(open('/tmp/netonapi-pc.json')).get('data',''))" 2>/dev/null)
+[ "$pc" = "200" ] && [ -n "$pcid" ] && pass "按前端表单的形状能建出渠道（扁平模型，无 appId）" || fail "建渠道: HTTP=$pc body=$(head -c 200 /tmp/netonapi-pc.json)"
 # 带 appId 必须被拒：这正是旧表单的形状，留着会让人以为还能那么填
 oldshape=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"appId":1,"code":"s81_old","config":"{}"}')
 [ "$oldshape" = "400" ] && pass "旧表单形状（带 appId）被拒 400" || fail "旧形状没被拒: HTTP=$oldshape"
 # 重复编码要给人话，不能是 500
-dup=$(curl -s --max-time 10 -o /tmp/nanogate-dup.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+dup=$(curl -s --max-time 10 -o /tmp/netonapi-dup.json -w "%{http_code}" -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"code":"s81_alipay","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{}"}')
-grep -q '"message":"PAY_CHANNEL_CODE_EXISTS"' /tmp/nanogate-dup.json && [ "$dup" = "409" ] \
-  && pass "重复编码给的是机器码 PAY_CHANNEL_CODE_EXISTS 而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/nanogate-dup.json)"
+grep -q '"message":"PAY_CHANNEL_CODE_EXISTS"' /tmp/netonapi-dup.json && [ "$dup" = "409" ] \
+  && pass "重复编码给的是机器码 PAY_CHANNEL_CODE_EXISTS 而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/netonapi-dup.json)"
 # 侧栏里要有入口，且用户端能看到这条渠道
 pcmenu=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/channel/index' AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
 pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT" | grep -c "s81_alipay")
@@ -3323,10 +3323,10 @@ MODSRC="$HERE/../../Neton"
 if [ -d "$MODSRC" ]; then
   for m in system infra account member payment platform gateway; do
     grep -rhoE '@Permission\("[^"]+"\)' "$MODSRC/neton-application-module-$m/src/commonMain/kotlin" 2>/dev/null | sed 's/@Permission("//;s/")//'
-  done | sort -u > /tmp/nanogate-backend-perms.txt
-  q "SELECT DISTINCT permission FROM system_menus WHERE permission <> '' AND status = 1" | sort -u > /tmp/nanogate-menu-perms.txt
-  dead=$(comm -13 /tmp/nanogate-backend-perms.txt /tmp/nanogate-menu-perms.txt | tr '\n' ' ')
-  [ -z "$dead" ] && pass "无死授权：$(wc -l < /tmp/nanogate-menu-perms.txt | tr -d ' ') 个启用菜单权限全部能在后端找到接口" \
+  done | sort -u > /tmp/netonapi-backend-perms.txt
+  q "SELECT DISTINCT permission FROM system_menus WHERE permission <> '' AND status = 1" | sort -u > /tmp/netonapi-menu-perms.txt
+  dead=$(comm -13 /tmp/netonapi-backend-perms.txt /tmp/netonapi-menu-perms.txt | tr '\n' ' ')
+  [ -z "$dead" ] && pass "无死授权：$(wc -l < /tmp/netonapi-menu-perms.txt | tr -d ' ') 个启用菜单权限全部能在后端找到接口" \
     || fail "死授权（菜单有、后端无，授了也调不通）: $dead"
 else
   echo "  ⚠️  找不到模块源码目录，跳过死授权检查"

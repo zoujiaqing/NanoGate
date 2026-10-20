@@ -1,13 +1,13 @@
 # NetonAPI 部署
 
 单机 Docker 部署。PostgreSQL 与 Redis 都在 compose 内，不需要另外准备数据库。
-（产品曾用名 NewGate；下文目录名 `NewGate/`、`newgate/` 为本地布局名，暂不随改名变动。）
+（产品曾用名 NewGate；外层目录名 `NewGate/` 是本地布局名，暂不随改名变动。三个子仓库目录与 GitHub 仓库同名：`netonapi-backend/`、`netonapi-frontend/`、`netonapi-client/`。）
 
 ## 依赖仓库布局
 
-镜像用 Gradle composite build，`newgate/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：
+镜像用 Gradle composite build，`netonapi-backend/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：
 本仓必须正好在那层目录的**两层深处**，框架与六个 canonical 模块必须落在同层的 `Neton/` 下。
-外层目录名（`Neton`、`NewGate`）也是契约的一部分——`newgate/Dockerfile` 的 `COPY` 源同样写死了它们。
+外层目录名（`Neton`、`NewGate`）也是契约的一部分——`netonapi-backend/Dockerfile` 的 `COPY` 源同样写死了它们。
 
 ```
 projects/
@@ -25,9 +25,9 @@ projects/
 │   ├── neton-application-front-{system,infra,account,member,payment,platform,gateway}/
 │   └── neton-application-client-{gateway,member,payment}/   # 控制台模块
 └── NewGate/                                # 本仓（含 docker-compose.yml）
-    ├── newgate/                            # 后端发行版（Dockerfile 在此）
-    ├── newgate-front/                      # 管理台
-    └── newgate-client/                     # 用户控制台
+    ├── netonapi-backend/                            # 后端发行版（Dockerfile 在此）
+    ├── netonapi-frontend/                      # 管理台
+    └── netonapi-client/                     # 用户控制台
 ```
 
 > ⚠️ 八个仓里有六个是公开的（`netonframework/neton`、`netonframework/geolite4k`、
@@ -37,7 +37,7 @@ projects/
 > 「源码可读」，不是「人人可自建」。前端同理（见各自 README）。
 
 > ⚠️ 下文 Docker 路径**尚未在实机验证过**（修正时的开发机上 Docker daemon 未运行）。
-> 两个前端镜像（`newgate-front/Dockerfile`、`newgate-client/Dockerfile`）与 Caddy 边缘同样**未实机构建过**，
+> 两个前端镜像（`netonapi-frontend/Dockerfile`、`netonapi-client/Dockerfile`）与 Caddy 边缘同样**未实机构建过**，
 > 写法照后端镜像的上下文约定推导；首次 `docker compose build` 请当作待验证项。
 > `COPY` 布局是按 `settings.gradle.kts` 的路径推导修正的，此前它既漏了三个必需仓、
 > 又把应用放在了 `../../Neton` 解不到的深度。首次 `docker compose build` 请当作待验证项，
@@ -49,14 +49,14 @@ projects/
 
 ```bash
 # 后端：编译后用一份本地配置目录起（database.conf 指向本机 PostgreSQL，redis.conf 指向本机 Redis）
-cd NewGate/newgate && ./gradlew :application:linkDebugExecutableMacosArm64 -Pneton.database.driver=postgres
-cd ../local && ../newgate/application/build/bin/macosArm64/debugExecutable/application.kexe migrate up
+cd NewGate/netonapi-backend && ./gradlew :application:linkDebugExecutableMacosArm64 -Pneton.database.driver=postgres
+cd ../local && ../netonapi-backend/application/build/bin/macosArm64/debugExecutable/application.kexe migrate up
 NETON_SECURITY__JWT__SECRETKEY=<随便一串> NEWGATE_QUOTA_PER_PRICE_UNIT=10000 NEWGATE_PUBLIC_API_URL=http://localhost:8800 \
-  ../newgate/application/build/bin/macosArm64/debugExecutable/application.kexe
+  ../netonapi-backend/application/build/bin/macosArm64/debugExecutable/application.kexe
 # 管理台（next dev -p 8888；开发模式把 /admin /app /v1 … 重写到本机后端，所以不需要 Caddy）
-cd NewGate/newgate-front && pnpm dev
+cd NewGate/netonapi-frontend && pnpm dev
 # 控制台（next dev -p 8880；apps/console/.env.development 已指向 http://localhost:8800）
-cd NewGate/newgate-client && pnpm dev
+cd NewGate/netonapi-client && pnpm dev
 ```
 
 管理员种子账号 `admin / admin123`（上线前改掉）。harness 也用 8800，本机跑着后端时用
@@ -123,7 +123,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 | 售价（收入） | 官方价 × 加价率（本模型单独设的优先，否则全站加价率），或逐项填的固定售价；再 × 用户所在分组的倍率 | 用户扣款 `charged` |
 | 成本 | **实际打给上游的模型**的官方价 × 渠道 `cost_discount`（渠道做了模型映射时按映射目标算，映射目标没定价则按请求模型） | 结算行与用量日志的 `cost`，不动用户余额 |
 
-完整规则见 [`newgate/docs/gateway-pricing-spec.md`](./newgate/docs/gateway-pricing-spec.md)。
+完整规则见 [`netonapi-backend/docs/gateway-pricing-spec.md`](./netonapi-backend/docs/gateway-pricing-spec.md)。
 
 日常调价都在管理台「AI 网关 → 模型定价」一页完成：
 
@@ -197,7 +197,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 两边都看不出原因。启动时会为这个组合打一行 ERROR 点名是哪两条；但它**只在启动时查一次**，
 运行期在后台停用不会重新检查 —— 所以停用那个任务前，先确认回调基址已经配了。
 
-⚠️ 别填容器内部地址（`http://localhost:8800`、`http://newgate:8800`）：本地跑得通，
+⚠️ 别填容器内部地址（`http://localhost:8800`、`http://netonapi:8800`）：本地跑得通，
 上线后一律回调失败，而失败发生在渠道那一侧 —— 你的日志里只会看到订单一直是待支付。
 
 漏写 `https://` 之类的非法值**不会**被静默当成没配：按未配置处理并记 ERROR。
@@ -327,7 +327,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 
 | 路径 | 去向 |
 |---|---|
-| `/admin/*` `/app/*` `/manage/*` `/platform/order*` `/v1/*` `/v1beta/*` | 后端 `newgate:8800`（SSE 关闭缓冲） |
+| `/admin/*` `/app/*` `/manage/*` `/platform/order*` `/v1/*` `/v1beta/*` | 后端 `netonapi:8800`（SSE 关闭缓冲） |
 | 其余（含管理台自己的 `/platform/api` 等页面） | 管理台 `front:3000` |
 | `CONSOLE_SITE` 整站 | 控制台 `console:3000`（它自带 `/api/backend` 服务端代理，不直连） |
 
@@ -373,7 +373,7 @@ Caddy 与控制台在 compose 默认网络里固定为 `172.28.0.10` / `172.28.0
 开放平台、会员签到 / 积分 / 等级 / 标签 / 分组、转账 / 提现 / 钱包冻结、文件管理、站内信、社交用户
 这些继承自通用脚手架的页面已停用（`system_menus.status = 0`）。**要用回它们不需要改代码**：
 在「系统管理 → 菜单管理」里把对应行改成启用即可；开放平台还需要把 `front-platform` 加回
-`newgate-front/apps/shell/front.modules.ts`。
+`netonapi-frontend/apps/shell/front.modules.ts`。
 
 ## 可观测性（最小集）
 
@@ -483,8 +483,8 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
 - 与其他 Neton 应用共用 Redis 时用 `keyPrefix` 隔开命名空间；限流键形如
   `<prefix>:ngrl:rpm:<tokenId>:<分钟窗口>`，窗口键带 120s TTL 自动消失。
   本发行版**没附带** `config/redis.conf`（框架按「文件名 = 命名空间」可选加载，缺文件就走默认值），
-  要设前缀有两条路：在 `newgate/application/config/` 下自建 `redis.conf`（根级平铺
-  `keyPrefix = "nanogate"`，**不要**写 `[redis]` 段），或直接给环境变量 `NETON_REDIS__KEYPREFIX`。
+  要设前缀有两条路：在 `netonapi-backend/application/config/` 下自建 `redis.conf`（根级平铺
+  `keyPrefix = "netonapi"`，**不要**写 `[redis]` 段），或直接给环境变量 `NETON_REDIS__KEYPREFIX`。
 - 别把网关和其他项目混在同一个 db 里再做 `flushdb`：harness 就是因此自带一个隔离实例
   （独立端口 + 独立 db + 独立 `keyPrefix` + 关持久化）。
 
@@ -495,8 +495,8 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
 - **后端在 macOS 上交叉编译**：机器太小跑不动 Kotlin/Native。装好 `messense/macos-cross-toolchains`
   的 `x86_64-unknown-linux-gnu` 后，从目标机拷一份 `/usr/lib64/libcurl.so.4` 到本地目录并建
   `libcurl.so` 软链，再
-  `./gradlew :application:linkReleaseExecutableLinuxX64 -Pnewgate.linuxX64.libDir=<该目录绝对路径>`
-  （或环境变量 `NEWGATE_LINUX_X64_LIBDIR`）。头文件仓里已 vendor，只缺链接用的 so。
+  `./gradlew :application:linkReleaseExecutableLinuxX64 -Pnetonapi.linuxX64.libDir=<该目录绝对路径>`
+  （或环境变量 `NETONAPI_LINUX_X64_LIBDIR`）。头文件仓里已 vendor，只缺链接用的 so。
 - **框架处于 WebSocket 集成阶段时**（框架 `gradle.properties` 里 `netonstream.local=true`），协议栈用
   `../../Neton` 下的兄弟目录源码，其中 tls 依赖的 openssl 4.0.2-3 尚未发布：所有 gradlew 命令都要加
   `-Pnetonstream.local.openssl=true`，改用本地 `openssl-kotlin` 源码。写进本仓 `gradle.properties` 不生效——
@@ -504,7 +504,7 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
   交叉编译 Linux 时还要加 `-PnativeTargets=macosArm64,linuxX64`：本地 openssl-kotlin 默认只编当前主机平台，
   不加则 linuxX64 解析不到 openssl。
 - **运行时依赖**：EL10 要装 `libxcrypt-compat`（二进制链的是 `libcrypt.so.1`），否则启动即
-  `libcrypt.so.1 => not found`。`ldd nanogate | grep "not found"` 应为空。
+  `libcrypt.so.1 => not found`。`ldd netonapi | grep "not found"` 应为空。
 - **前端在目标机构建**：Node 24 + pnpm 11.20，按 Dockerfile 的布局把 `Neton/` 与 `NewGate/` 两层
   放到同一父目录下 `pnpm install --frozen-lockfile && pnpm --filter … build`；4G 内存要加 swap。
   构建产物目录可整体拷走（node_modules 里没有指出仓库的软链）。用 `next start -H 127.0.0.1` 起。
@@ -522,7 +522,7 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
 
 ```bash
 git pull --rebase                       # 本仓（NewGate/，compose 与文档）
-git -C newgate pull --rebase            # 后端发行版（嵌套仓，不归上面那条管）
+git -C netonapi-backend pull --rebase            # 后端发行版（嵌套仓，不归上面那条管）
 for r in ../Neton/*/; do git -C "$r" pull --rebase; done   # 框架与各 canonical 模块
 docker compose build
 docker compose up -d

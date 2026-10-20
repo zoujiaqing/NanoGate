@@ -17,13 +17,13 @@
 {$ADMIN_SITE}
 	encode zstd gzip
 
-	# 后端路由组的挂载点（newgate/application/config/routing.conf）：
+	# 后端路由组的挂载点（netonapi-backend/application/config/routing.conf）：
 	#   admin → /admin   app → /app   manage → /manage   open → /platform   gateway → 根（/v1、/v1beta）
 	# 管理台不再装配 front-platform（开放平台与 AI 网关职责重叠），/platform 下已无前端页面，
 	# 整个前缀交给后端（它在该前缀下提供 open 路由组）。
 	@backend path /admin/* /app/* /manage/* /platform/* /v1/* /v1beta/*
 	handle @backend {
-		reverse_proxy newgate:8800 {
+		reverse_proxy netonapi:8800 {
 			header_up -X-Real-IP
 			# SSE 流式响应：禁止代理缓冲，否则整段攒完一次性吐出（DEPLOY.md「反向代理」）
 			flush_interval -1
