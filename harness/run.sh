@@ -3072,6 +3072,8 @@ ch88=${cc88% *}; co88=${cc88#* }
   && pass "渠道映射到便宜模型：体检与结算都按 m-cheap 算成本（收入 ${ch88} / 成本 ${co88}）" \
   || fail "映射成本: 体检='$c4' 收入/成本='${cc88}'（期望成本约为收入的 1/12）"
 q "DELETE FROM system_settings WHERE setting_key='gateway.pricing.markup'; DELETE FROM gateway_groups WHERE code='vip88';" >/dev/null
+# 加价率带 10 秒缓存（PricingPolicy.TTL_MILLIS）：直接改库后等它过期，后面的场景才按默认加价率 1 计价
+sleep 11
 seed_reset
 
 # ══ S89 校准官方价：价源差异看得到、只写勾选的、写了留调价记录；OpenRouter 的厂商前缀能对上 ══
@@ -3227,6 +3229,19 @@ s5=$(sy92); r5=$(row92); e5=$(q "SELECT COALESCE(cost_sync_error,'') FROM gatewa
   && pass "上游不再报价 → 保留 0.4 并标过期；上游返回 success=false → 成本不动、记下错误（${e5}）" \
   || fail "过期/报错: 下架同步='${s4}' 成本='${r4}'(期望0.4/1) 报错同步='${s5}' 成本='${r5}' 错误='${e5}'"
 rm -f "$PRICING_JSON"; unset PRICING_JSON
+seed_reset
+# 对外模型视图：两条渠道承载 m-pi，优先级高的那条反而更贵 → 体检提示（不改路由）
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,display_name,source,deleted,created_at,updated_at) VALUES ('m-pi','1','1','0','0',5000,'PI 1.0','manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-hi','openai_compatible','http://127.0.0.1:9996','default','m-pi',10,1,1,30000,90000,'0.9',0,0,0),
+     ('c-lo','openai_compatible','http://127.0.0.1:9996','default','m-pi',5,1,1,30000,90000,'0.3',0,0,0);" >/dev/null
+pi92=$(curl -s --max-time 15 "$U/admin/gateway/price/check" -H "Authorization: Bearer $GJWT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data') or {}
+r=next((x for x in d.get('rows',[]) if x['model']=='m-pi'),{})
+print(r.get('displayName'), ','.join(c['name'] for c in r.get('channels',[])), ','.join(r.get('hints',[])))" 2>/dev/null)
+[ "$pi92" = "PI 1.0 c-hi,c-lo PRIORITY_COST_INVERSION" ] \
+  && pass "对外模型视图：展示名、按优先级排列的承载渠道；优先级更高的 c-hi（折扣 0.9）比 c-lo（0.3）贵 → 提示" || fail "对外模型视图: '${pi92}'"
 seed_reset
 
 # ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
