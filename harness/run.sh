@@ -3170,6 +3170,30 @@ res=$(q "SELECT MAX(reserved_amount) FROM gateway_settlements")
 [ "${res:-0}" -ge 40000 ] && pass "预留按最贵档估上界（最大预留 ${res} μUSD ≥ 输出上限×高档输出价 40000）" || fail "分档预留: 最大预留=${res}（期望 ≥ 40000）"
 seed_reset
 
+# ══ S92 渠道真实成本：渠道成本表优先、不乘折扣；上游价目接口同步、异常变动挂起、过期提示 ══
+echo "[S92] 渠道真实成本"
+seed_reset
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-cc','10','10','0','0',5000,'manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-cc','openai_compatible','http://127.0.0.1:9996','default','m-cc',1,1,1,30000,90000,'2.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-cc'),'k',1,0,0,0,0);" >/dev/null
+CC92=$(q "SELECT id FROM gateway_channels WHERE name='c-cc'")
+cc92() { curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-cc","messages":[]}'
+  wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-cc'" "$1" 30 >/dev/null
+  q "SELECT cost FROM gateway_usage_logs WHERE request_model='m-cc' ORDER BY id DESC LIMIT 1"; }
+# 没有渠道成本行：官方 10/10 × 折扣 2.0；1000 输入 + 500 输出 → (10000 + 5000) × 2 = 30000
+c1=$(cc92 1)
+q "INSERT INTO gateway_channel_model_costs (channel_id,model,input_price,output_price,source,updated_at) VALUES ($CC92,'m-cc','0.5','0.5','manual',0)" >/dev/null
+# 有渠道成本行：0.5/0.5，不再乘折扣 → 500 + 250 = 750
+c2=$(cc92 2)
+[ "$c1" = "30000" ] && [ "$c2" = "750" ] \
+  && pass "渠道成本：没有成本行按官方价 × 折扣 2.0（${c1}），有成本行按实付价且不乘折扣（${c2}）" || fail "渠道成本: 无成本行=${c1}(期望30000) 有成本行=${c2}(期望750)"
+v92=$(curl -s --max-time 10 -o /tmp/netonapi-s92.json -w "%{http_code}" -X PUT "$U/admin/gateway/channel/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$CC92,\"name\":\"c-cc\",\"type\":\"openai_compatible\",\"baseUrl\":\"http://127.0.0.1:9996\",\"groups\":\"default\",\"models\":\"m-cc\",\"capabilities\":\"chat\",\"costSource\":\"upstream\"}")
+grep -q 'CHANNEL_PRICING_FORMAT_REQUIRED' /tmp/netonapi-s92.json && [ "$v92" = "400" ] \
+  && pass "成本来源选上游价目接口却不选格式 → 400 CHANNEL_PRICING_FORMAT_REQUIRED" || fail "上游格式校验: HTTP=${v92} $(head -c 200 /tmp/netonapi-s92.json)"
+rm -f /tmp/netonapi-s92.json
+
 # ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
 echo "[S87] 人机验证"
 # 核验地址指到本地假 siteverify（fakes.py turnstile：secret 必须是 ts-secret，凭证 ok:<action> 通过且只能用一次）
