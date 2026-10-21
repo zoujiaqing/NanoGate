@@ -69,7 +69,7 @@ q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
 rc() { redis-cli -p "$REDIS_PORT" -n "$REDIS_DB" "$@" 2>/dev/null; }
 rksum() { local k v s=0; for k in $(rc --scan --pattern "$1"); do v=$(rc get "$k"); s=$((s + ${v:-0})); done; echo "$s"; }
 rkdel() { local k; for k in $(rc --scan --pattern "$1"); do rc del "$k" >/dev/null; done; }
-seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions,gateway_settlements RESTART IDENTITY;
+seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_channel_model_costs,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions,gateway_settlements RESTART IDENTITY;
   UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
   UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
 
@@ -3193,6 +3193,41 @@ v92=$(curl -s --max-time 10 -o /tmp/netonapi-s92.json -w "%{http_code}" -X PUT "
 grep -q 'CHANNEL_PRICING_FORMAT_REQUIRED' /tmp/netonapi-s92.json && [ "$v92" = "400" ] \
   && pass "成本来源选上游价目接口却不选格式 → 400 CHANNEL_PRICING_FORMAT_REQUIRED" || fail "上游格式校验: HTTP=${v92} $(head -c 200 /tmp/netonapi-s92.json)"
 rm -f /tmp/netonapi-s92.json
+
+# 上游价目接口：假 new-api（9997）报 up-a 倍率 1 → 输入 2 美元/1M；× 上游分组倍率 0.5 × 额度单价 0.2 = 0.2
+export PRICING_JSON=/tmp/netonapi-s92-pricing.json
+echo '{"success":true,"data":[{"model_name":"up-a","quota_type":0,"model_ratio":1,"completion_ratio":1}]}' > "$PRICING_JSON"
+fake newapi_pricing 9997
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-up','10','10','0','0',5000,'manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,cost_source,upstream_pricing_format,upstream_group_ratio,upstream_credit_rate,deleted,created_at,updated_at) VALUES
+     ('c-up','openai_compatible','http://127.0.0.1:9997','default','m-up','{\"m-up\":\"up-a\"}',1,1,1,30000,90000,'1.0','upstream','newapi','0.5','0.2',0,0,0);" >/dev/null
+UP92=$(q "SELECT id FROM gateway_channels WHERE name='c-up'")
+sy92() { curl -s --max-time 20 -X POST "$U/admin/gateway/channel-cost/sync?channelId=$UP92" -H "Authorization: Bearer $GJWT" -H "$CT" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('updated'),d.get('pending'),d.get('stale'),d.get('error') or '')" 2>/dev/null; }
+row92() { q "SELECT input_price||'/'||stale FROM gateway_channel_model_costs WHERE channel_id=$UP92 AND model='m-up'"; }
+s1=$(sy92); r1=$(row92)
+[ "$s1" = "1 0 0 " ] && [ "$r1" = "0.2/0" ] \
+  && pass "上游价目接口：new-api 倍率 1 → 2 美元 × 分组倍率 0.5 × 额度单价 0.2 = 0.2，按模型映射写到对外模型 m-up" || fail "上游同步: 结果='${s1}' 成本行='${r1}'(期望0.2/0)"
+# 上游涨价 +100%：挂起，不写成本表；接受后才生效
+echo '{"success":true,"data":[{"model_name":"up-a","quota_type":0,"model_ratio":2,"completion_ratio":1}]}' > "$PRICING_JSON"
+s2=$(sy92); r2=$(row92)
+pid92=$(q "SELECT id FROM gateway_price_history WHERE channel_id=$UP92 AND status='pending' ORDER BY id DESC LIMIT 1")
+s2b=$(sy92)
+npend=$(q "SELECT COUNT(*) FROM gateway_price_history WHERE channel_id=$UP92 AND status='pending'")
+ac=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/channel-cost/pending/$pid92/accept" -H "Authorization: Bearer $GJWT" -H "$CT")
+r3=$(row92)
+[ "$s2" = "0 1 0 " ] && [ "$r2" = "0.2/0" ] && [ "$npend" = "1" ] && [ "$ac" = "200" ] && [ "$r3" = "0.4/0" ] \
+  && pass "上游涨价 100% → 挂起待确认（成本仍 0.2、重复同步不重复挂起），接受后变 0.4" \
+  || fail "异常变动挂起: 同步='${s2}' 挂起中成本='${r2}' 待确认数=${npend}(期望1，第二次同步='${s2b}') 接受=${ac} 接受后='${r3}'(期望0.4/0)"
+# 上游下架 up-a：保留旧值并标过期；上游报错：成本不动、记错误
+echo '{"success":true,"data":[]}' > "$PRICING_JSON"
+s4=$(sy92); r4=$(row92)
+echo '{"success":false,"message":"maintenance"}' > "$PRICING_JSON"
+s5=$(sy92); r5=$(row92); e5=$(q "SELECT COALESCE(cost_sync_error,'') FROM gateway_channels WHERE id=$UP92")
+[ "$s4" = "0 0 1 " ] && [ "$r4" = "0.4/1" ] && [ "${s5##* }" != "" ] && [ "$r5" = "0.4/1" ] && echo "$e5" | grep -q maintenance \
+  && pass "上游不再报价 → 保留 0.4 并标过期；上游返回 success=false → 成本不动、记下错误（${e5}）" \
+  || fail "过期/报错: 下架同步='${s4}' 成本='${r4}'(期望0.4/1) 报错同步='${s5}' 成本='${r5}' 错误='${e5}'"
+rm -f "$PRICING_JSON"; unset PRICING_JSON
+seed_reset
 
 # ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
 echo "[S87] 人机验证"

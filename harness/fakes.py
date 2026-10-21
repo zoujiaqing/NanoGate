@@ -43,6 +43,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # GET /inflight → 当前在途请求数（供 harness 轮询断连后归零）
+        if MODE == "newapi_pricing" and self.path == "/api/pricing":
+            # 假 new-api 的价目接口：返回 PRICING_JSON 指向的文件内容，场景改文件即可模拟上游改价、下架、报错
+            with open(os.environ["PRICING_JSON"]) as f:
+                body = f.read().encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body); return
         if self.path == "/last-mail":
             self._json(200, _last_mail or {}); return
         if self.path == "/last-verify":
