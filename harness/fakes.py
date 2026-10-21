@@ -55,6 +55,22 @@ class H(BaseHTTPRequestHandler):
                 "cal-b": {"input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06, "mode": "chat"},
                 "cal-new": {"input_cost_per_token": 5e-07, "output_cost_per_token": 1e-06, "mode": "chat"},
             }); return
+        if self.path == "/basellm.json":
+            # basellm/llm-metadata（new-api 官方倍率预设）形状：计费表达式；cal-odd 用了认不出的写法
+            self._json(200, {"success": True, "message": "", "data": {
+                "billing_mode": {"cal-a": "tiered_expr", "cal-b": "tiered_expr", "cal-new": "tiered_expr", "cal-odd": "tiered_expr"},
+                "billing_expr": {
+                    "cal-a": 'tier("standard", p * 3 + cr * 0.3 + c * 15)',
+                    "cal-b": 'tier("standard", p * 1 + c * 2)',
+                    "cal-new": 'tier("standard", p * 0.5 + c * 1)',
+                    "cal-odd": 'tier("standard", max(p, 1) * 2)',
+                }}}); return
+        if self.path == "/models-dev.json":
+            # models.dev 形状：同名模型 zz-reseller 报 9 美元、anthropic 报 3 美元 → 应取厂商自营的 3
+            self._json(200, {
+                "zz-reseller": {"models": {"cal-a": {"cost": {"input": 9, "output": 45}}}},
+                "anthropic": {"models": {"cal-a": {"cost": {"input": 3, "output": 15, "cache_read": 0.3}}}},
+            }); return
         if self.path == "/openrouter.json":
             # OpenRouter /api/v1/models 形状：id 带厂商前缀，价格是每 token 美元价的字符串
             self._json(200, {"data": [

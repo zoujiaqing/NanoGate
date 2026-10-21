@@ -3060,12 +3060,12 @@ seed_reset
 echo "[S89] 校准官方价"
 seed_reset
 q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at) VALUES
-     ('gateway','gateway.pricing.source_format','litellm','官方价价源格式',0,0),
-     ('gateway','gateway.pricing.source_url','http://127.0.0.1:9996/litellm.json','官方价价源地址',0,0)
+     ('gateway','gateway.pricing.source_format','basellm','官方价价源格式',0,0),
+     ('gateway','gateway.pricing.source_url','http://127.0.0.1:9996/basellm.json','官方价价源地址',0,0)
    ON CONFLICT (setting_key) DO UPDATE SET value=EXCLUDED.value;
    DELETE FROM gateway_price_history;
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES
-     ('cal-a','2.5','10','0.25','0',5000,'manual',0,0,0),('cal-b','1','2','0','0',5000,'manual',0,0,0);
+     ('cal-a','2.5','10','0.25','0',5000,'manual',0,0,0),('cal-b','1','2','0','0',5000,'manual',0,0,0),('cal-odd','1','1','0','0',5000,'manual',0,0,0);
    INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
      ('c-cal','openai_compatible','http://127.0.0.1:9996','default','cal-a,cal-b,cal-new',1,1,1,30000,90000,'1.0',0,0,0);" >/dev/null
 calp() { curl -s --max-time 20 "$U/admin/gateway/price/calibrate/preview" -H "Authorization: Bearer $GJWT" | python3 -c "
@@ -3073,8 +3073,8 @@ import sys,json
 d=json.load(sys.stdin).get('data') or {}
 print(' '.join(f\"{r['model']}:{r['status']}:{r.get('sourceInput')}:{r.get('changeBp')}:{r.get('sourceKey')}\" for r in d.get('rows',[])), d.get('error') or '')" 2>/dev/null; }
 p1=$(calp)
-[ "$p1" = "cal-a:CHANGED:3:5000:cal-a cal-b:SAME:1:0:cal-b cal-new:NEW:0.5:0:cal-new " ] \
-  && pass "LiteLLM 价源：cal-a 有变化（输出 10→15，+50%）、cal-b 一致、渠道已承载未定价的 cal-new 建议新增" \
+[ "$p1" = "cal-a:CHANGED:3:5000:cal-a cal-b:SAME:1:0:cal-b cal-odd:UNPARSABLE:None:0:None cal-new:NEW:0.5:0:cal-new " ] \
+  && pass "basellm 价源（new-api 同源计费表达式）：cal-a 有变化（输出 10→15，+50%）、cal-b 一致、cal-odd 写法认不出单独列出、渠道已承载未定价的 cal-new 建议新增" \
   || fail "校准预览: '$p1'"
 ap89=$(curl -s --max-time 20 -X POST "$U/admin/gateway/price/calibrate/apply" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"models":["cal-a","cal-new"]}' \
   | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('created'),d.get('updated'),len(d.get('errors') or []))" 2>/dev/null)
@@ -3085,6 +3085,11 @@ h89=$(q "SELECT action FROM gateway_price_history WHERE model='cal-a' ORDER BY i
 [ "$ap89" = "1 1 0" ] && [ "$pa89" = "3/15/0.3/calibrate" ] && [ "$pn89" = "0.5/1/" ] && [ "$pb89" = "manual" ] && [ "$h89" = "calibrate" ] \
   && pass "应用所选：cal-a 写成价源价（${pa89}）、cal-new 新增、没勾的 cal-b 不动，调价记录有 calibrate" \
   || fail "校准应用: 结果='$ap89'(期望 '1 1 0') cal-a='$pa89' cal-new='$pn89' cal-b.source='$pb89' 记录='$h89'"
+q "UPDATE system_settings SET value='models_dev' WHERE setting_key='gateway.pricing.source_format';
+   UPDATE system_settings SET value='http://127.0.0.1:9996/models-dev.json' WHERE setting_key='gateway.pricing.source_url';" >/dev/null
+pmd=$(calp)
+[ "$(echo "$pmd" | tr ' ' '\n' | grep '^cal-a:')" = "cal-a:SAME:3:0:cal-a" ] \
+  && pass "models.dev 价源：同名模型取厂商自营（anthropic 3 美元）而不是转售商的 9 美元" || fail "models.dev: '$pmd'"
 q "UPDATE system_settings SET value='openrouter' WHERE setting_key='gateway.pricing.source_format';
    UPDATE system_settings SET value='http://127.0.0.1:9996/openrouter.json' WHERE setting_key='gateway.pricing.source_url';" >/dev/null
 p2=$(calp)
