@@ -6,6 +6,7 @@
 #   settlement    有结算进入人工复核（netonapi_settlements_manual_review > 0），这些钱需要人裁定
 #   channels      启用中的渠道最近一次测速全部失败（用户此刻的请求基本都会失败）
 #   prices        每天的价源检查发现官方价有变化或可新增的模型，待运营确认
+#   costs         上游价目同步失败或超过 24 小时没成功的渠道（成本数据在变旧）
 #   backup        BACKUP_DIR 里最新的备份超过 26 小时（备份定时器停了或一直失败）
 #
 # 环境变量（/etc/netonapi/watch.env）：
@@ -55,6 +56,8 @@ if [ -n "$metrics" ]; then
   manual=$(printf '%s\n' "$metrics" | awk '$1=="netonapi_settlements_manual_review"{print $2}')
   if [ "${manual:-0}" -gt 0 ] 2>/dev/null; then report settlement fail "$manual 笔结算待人工复核（管理台「结算待处理」）"; else report settlement ok ""; fi
 
+  costfail=$(printf '%s\n' "$metrics" | awk '$1=="netonapi_channel_cost_sync_failing"{print $2}')
+  if [ "${costfail:-0}" -gt 0 ] 2>/dev/null; then report costs fail "$costfail 条渠道的上游价目同步失败或超过 24 小时没成功，成本数据在变旧（渠道「成本」里看原因）"; else report costs ok ""; fi
   pending=$(printf '%s\n' "$metrics" | awk '$1=="netonapi_price_pending_changes"{print $2}')
   if [ "${pending:-0}" -gt 0 ] 2>/dev/null; then report prices fail "官方价有 $pending 处变化待确认（管理台「模型定价 → 校准官方价」）"; else report prices ok ""; fi
 

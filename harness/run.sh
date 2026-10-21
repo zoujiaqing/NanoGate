@@ -3170,6 +3170,12 @@ res=$(q "SELECT MAX(reserved_amount) FROM gateway_settlements")
   || fail "分档计价: HTTP=${h1}/${h2} 低档='${low}'(期望1500/1500) 高档='${high}'(期望24000/24000)"
 # 预留按最贵档估上界：输出上限 5000 × 8 = 40000 至少要在里面
 [ "${res:-0}" -ge 40000 ] && pass "预留按最贵档估上界（最大预留 ${res} μUSD ≥ 输出上限×高档输出价 40000）" || fail "分档预留: 最大预留=${res}（期望 ≥ 40000）"
+pt91=$(curl -s --max-time 10 "$U/app/gateway/model/list" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data') or []
+m=next((x for x in d if x['model']=='m-tier'),{})
+print(','.join(f\"{t.get('maxPromptTokens')}:{t['input']}\" for t in (m.get('tiers') or [])))" 2>/dev/null)
+[ "$pt91" = "1000:1,None:4" ] && pass "公开价格接口带出分档售价（用户能看到长输入按更贵的档收费）" || fail "公开分档: '${pt91}'（期望 1000:1,None:4）"
 seed_reset
 
 # ══ S92 渠道真实成本：渠道成本表优先、不乘折扣；上游价目接口同步、异常变动挂起、过期提示 ══
@@ -3228,6 +3234,13 @@ s5=$(sy92); r5=$(row92); e5=$(q "SELECT COALESCE(cost_sync_error,'') FROM gatewa
 [ "$s4" = "0 0 1 " ] && [ "$r4" = "0.4/1" ] && [ "${s5##* }" != "" ] && [ "$r5" = "0.4/1" ] && echo "$e5" | grep -q maintenance \
   && pass "上游不再报价 → 保留 0.4 并标过期；上游返回 success=false → 成本不动、记下错误（${e5}）" \
   || fail "过期/报错: 下架同步='${s4}' 成本='${r4}'(期望0.4/1) 报错同步='${s5}' 成本='${r5}' 错误='${e5}'"
+# 价目地址也走渠道的受控出站客户端：localhost 不在出站白名单（harness 只放行 127.0.0.1 这个字面量）→ 连接被拒，成本不动
+echo '{"success":true,"data":[{"model_name":"up-a","quota_type":0,"model_ratio":3,"completion_ratio":1}]}' > "$PRICING_JSON"
+q "UPDATE gateway_channels SET upstream_pricing_url='http://localhost:9997/api/pricing' WHERE id=$UP92" >/dev/null
+s6=$(sy92); r6=$(row92)
+[ "${s6%% *}" = "0" ] && [ -n "${s6#0 0 0 }" ] && [ "$r6" = "0.4/1" ] \
+  && pass "上游价目地址经受控出站客户端：指向出站策略不允许的 localhost → 拒绝连接、成本不动（${s6#0 0 0 }）" \
+  || fail "价目地址出站策略: 同步='${s6}' 成本='${r6}'(期望0.4/1，且有错误)"
 rm -f "$PRICING_JSON"; unset PRICING_JSON
 seed_reset
 # 对外模型视图：两条渠道承载 m-pi，优先级高的那条反而更贵 → 体检提示（不改路由）
