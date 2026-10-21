@@ -2848,12 +2848,28 @@ rrl=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||status FROM 
 [ "$rrl" = "77/0/ok" ] && pass "total_tokens=77 计为输入、状态 ok" || fail "rerank usage_log: $rrl"
 
 # ══ S72 价源同步 + 指标 + 渠道测速落库 ══
-echo "[S72] 价源同步 / metrics / 测速"
+echo "[S72] 价源检查 / metrics / 测速"
 seed_reset; fake ok 9934; sleep 1
-stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NETONAPI_METRICS_TOKEN=mt
+# 旧的同步变量已删除：设着就拒绝启动（应用先停，免得第二个实例因端口占用退出而让断言失去意义）
+stop_app
+( cd "$WORK" && env NETONAPI_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json "$APP" > /tmp/netonapi-legacy-sync.log 2>&1 ) & lp=$!
+for _ in $(seq 1 40); do kill -0 $lp 2>/dev/null || break; sleep 0.5; done
+if kill -0 $lp 2>/dev/null; then pkill -P $lp 2>/dev/null; kill $lp 2>/dev/null; wait $lp 2>/dev/null; lrc=running; else wait $lp; lrc=$?; fi
+[ "$lrc" != "0" ] && [ "$lrc" != "running" ] && grep -q 'NETONAPI_PRICE_SYNC_URL removed' /tmp/netonapi-legacy-sync.log \
+  && pass "设了已删除的 NETONAPI_PRICE_SYNC_URL → 拒绝启动并提示改用后台价源配置" || fail "旧同步变量: 退出=${lrc} $(tail -c 200 /tmp/netonapi-legacy-sync.log)"
+rm -f /tmp/netonapi-legacy-sync.log
+q "INSERT INTO system_settings (category,setting_key,value,name,created_at,updated_at) VALUES
+     ('gateway','gateway.pricing.source_format','netonapi','官方价价源格式',0,0),
+     ('gateway','gateway.pricing.source_url','http://127.0.0.1:9934/prices.json','官方价价源地址',0,0)
+   ON CONFLICT (setting_key) DO UPDATE SET value=EXCLUDED.value;
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('sync-a','1','2','0','0',4096,'manual',0,0,0);" >/dev/null
+boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_METRICS_TOKEN=mt
 sy=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/sync" -H "Authorization: Bearer $GJWT" -H "$CT")
-sya=$(q "SELECT input_price||'/'||output_price||'/'||default_max_output_tokens||'/'||source FROM gateway_model_prices WHERE model='sync-a'")
-echo "$sy" | grep -q '"created":2' && [ "$sya" = "1.5/6/4096/sync" ] && pass "价源同步：对象形状解析、created=2、source=sync" || fail "价源同步: $sy sync-a=$sya"
+sya=$(q "SELECT input_price||'/'||output_price||'/'||source FROM gateway_model_prices WHERE model='sync-a'")
+syr=$(q "SELECT changed||'/'||COALESCE(error,'') FROM gateway_price_sync_runs ORDER BY id DESC LIMIT 1")
+echo "$sy" | grep -q '"status":"CHANGED"' && [ "$sya" = "1/2/manual" ] && [ "$syr" = "1/" ] \
+  && pass "价源检查只记差异、不改价：sync-a 价源 1.5/6 与库里 1/2 不同 → 检查记录 changed=1，价格表仍是 ${sya}" \
+  || fail "价源检查: 结果=$(echo "$sy" | head -c 200) 价格=${sya}(期望1/2/manual) 记录=${syr}(期望1/)"
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-pr','openai_compatible','http://127.0.0.1:9934','default','m-pr2',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-pr'),'k',1,0,0,0,0);" >/dev/null
 prid=$(q "SELECT id FROM gateway_channels WHERE name='c-pr'")
@@ -2864,6 +2880,8 @@ m401=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$U/metrics")
 mb=$(curl -s --max-time 5 "$U/metrics" -H "Authorization: Bearer mt")
 [ "$m401" = "401" ] && echo "$mb" | grep -q '^netonapi_channel_probe_ok{channel="c-pr"' && echo "$mb" | grep -q '^netonapi_settlements_manual_review ' \
   && pass "/metrics 带 token 才可读，含渠道测速与结算指标" || fail "metrics: noauth=$m401 body=$(echo "$mb" | head -c 300)"
+echo "$mb" | grep -q '^netonapi_price_pending_changes 1$' && pass "/metrics 给出待确认的官方价变动数（1）" || fail "价源待确认指标: $(echo "$mb" | grep price_pending)"
+q "DELETE FROM system_settings WHERE setting_key LIKE 'gateway.pricing.source_%';" >/dev/null
 
 # ══ S73 真实 Claude Code CLI（装了才跑）：完整两轮工具调用经网关打 OpenAI 上游 ══
 if command -v claude >/dev/null 2>&1; then
@@ -2940,7 +2958,7 @@ nomp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/v1/audio
 echo "[S77] 邮件通道与邮箱找回密码"
 # S77/S78 验的是真实投递（厂商 HTTP 与 SMTP 握手），而 harness 全局开着验证码模拟通道（只存不发，
 # 短信与邮件一视同仁）。这两段临时以环境变量关掉模拟重启网关，S78 之后按 S72 的环境恢复。
-S72_ENV=(NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PRICE_SYNC_URL=http://127.0.0.1:9934/prices.json NETONAPI_METRICS_TOKEN=mt)
+S72_ENV=(NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_METRICS_TOKEN=mt)
 stop_app; boot_app "${S72_ENV[@]}" NETON_SECURITY__VERIFICATION__SIMULATE=false
 fake mail 9939; sleep 1
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1

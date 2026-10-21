@@ -384,8 +384,10 @@ Caddy 与控制台在 compose 默认网络里固定为 `172.28.0.10` / `172.28.0
 - 定时任务（后台「定时任务」页可停用/改 cron）：
   - `gateway-channel-probe`（`*/5 * * * *`）：用渠道自己的 Key 打一条 `max_tokens=1` 的请求，结果写在渠道行
     （管理台渠道表「测速」列、概览渠道表、`/metrics` 都能看到）。每条渠道每 5 分钟消耗一次最小请求。
-  - `gateway-price-sync`（每天 03:10）：从 `NETONAPI_PRICE_SYNC_URL` 拉价目表导入（格式与管理台批量导入一致），
-    `NETONAPI_PRICE_SYNC_OVERWRITE=false` 则只补新模型。管理台「模型定价 → 同步价源」可立即拉一次。
+  - `gateway-price-sync`（每天 03:10）：按后台配置的价源（`gateway.pricing.source_*`，默认 GitHub basellm/llm-metadata）
+    比对官方价，**只记录差异、不改价**；有变化时概览提示、`/metrics` 的 `netonapi_price_pending_changes` 大于 0，
+    到「模型定价 → 校准官方价」确认后写入。管理台「检查价源」可立即查一次。旧的 `NETONAPI_PRICE_SYNC_URL` /
+    `NETONAPI_PRICE_SYNC_OVERWRITE` 已删除，设着后端拒绝启动。
 
 **告警**：没有 Prometheus 时用 `deploy/monitor/netonapi-watch.sh`（systemd 定时器每分钟跑），出事向
 `WATCH_ALERT_WEBHOOK` 发 `{"text": "..."}`：`/health` 不是 200、有结算进入人工复核、启用中的渠道测速全部失败、
