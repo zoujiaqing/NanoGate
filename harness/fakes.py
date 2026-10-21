@@ -197,10 +197,12 @@ class H(BaseHTTPRequestHandler):
             if stream:
                 self._okstream(body.get("model", "?"))
             else:
+                # 请求体里的 x_fake_prompt_tokens 覆盖输入 token 数（网关原样透传未知字段）：分档计价场景用它跨过门槛
+                pt = int(body.get("x_fake_prompt_tokens", 1000))
                 self._json(200, {
                     "id": "r1", "object": "chat.completion", "model": body.get("model", "?"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+                    "usage": {"prompt_tokens": pt, "completion_tokens": 500, "total_tokens": pt + 500},
                 })
         finally:
             _exit()

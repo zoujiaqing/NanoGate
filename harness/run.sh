@@ -3125,6 +3125,28 @@ go3=$(q "SELECT COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$
 q "DELETE FROM gateway_groups WHERE code='vip90';" >/dev/null; rm -f /tmp/ng-s90.json
 seed_reset
 
+# ══ S91 分档计价：总输入跨过门槛按高档收钱、记成本；预留按最贵档 ══
+echo "[S91] 分档计价"
+seed_reset
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,tiers,source,deleted,created_at,updated_at) VALUES
+     ('m-tier','1','2','0','0',5000,'[{\"maxPromptTokens\":1000,\"input\":\"1\",\"output\":\"2\",\"cacheRead\":\"0\",\"cacheWrite\":\"0\"},{\"maxPromptTokens\":null,\"input\":\"4\",\"output\":\"8\",\"cacheRead\":\"0\",\"cacheWrite\":\"0\"}]','manual',0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('c-tier','openai_compatible','http://127.0.0.1:9996','default','m-tier',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-tier'),'k',1,0,0,0,0);" >/dev/null
+t91() { curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d "{\"model\":\"m-tier\",\"messages\":[],\"x_fake_prompt_tokens\":$1}"; }
+h1=$(t91 500); wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-tier'" 1 30 >/dev/null
+h2=$(t91 5000); wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-tier'" 2 30 >/dev/null
+low=$(q "SELECT charged||'/'||cost FROM gateway_usage_logs WHERE request_model='m-tier' AND prompt_tokens=500")
+high=$(q "SELECT charged||'/'||cost FROM gateway_usage_logs WHERE request_model='m-tier' AND prompt_tokens=5000")
+res=$(q "SELECT MAX(reserved_amount) FROM gateway_settlements")
+# 低档：500×1 + 500×2 = 1500 μUSD；高档：5000×4 + 500×8 = 24000 μUSD（加价率 1、倍率 1、折扣 1，成本 = 收入）
+[ "$h1" = "200" ] && [ "$h2" = "200" ] && [ "$low" = "1500/1500" ] && [ "$high" = "24000/24000" ] \
+  && pass "分档计价：输入 500 按低档 1500、输入 5000 跨过 1000 门槛按高档 24000（收入与成本同档）" \
+  || fail "分档计价: HTTP=${h1}/${h2} 低档='${low}'(期望1500/1500) 高档='${high}'(期望24000/24000)"
+# 预留按最贵档估上界：输出上限 5000 × 8 = 40000 至少要在里面
+[ "${res:-0}" -ge 40000 ] && pass "预留按最贵档估上界（最大预留 ${res} μUSD ≥ 输出上限×高档输出价 40000）" || fail "分档预留: 最大预留=${res}（期望 ≥ 40000）"
+seed_reset
+
 # ══ S87 人机验证（Turnstile）：后端强制核验、凭证绑定动作、一次性、拿真实客户端 IP 去核验、缺 secret 拒绝而不是放行 ══
 echo "[S87] 人机验证"
 # 核验地址指到本地假 siteverify（fakes.py turnstile：secret 必须是 ts-secret，凭证 ok:<action> 通过且只能用一次）
