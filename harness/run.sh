@@ -826,6 +826,16 @@ elif echo "$reason" | grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" && dscacheutil -q h
 else
   fail "域名渠道被意外拒绝: ${dom} ${reason}"
 fi
+# 管理台新建表单提交的就是这一整包（含 status 与 keys 数组）：后端对未知字段直接 400，
+# 漏收一个字段 = 管理台建不了任何渠道。status=0 落库为禁用，keys 两把都入库
+ui25=$(curl -s --max-time 10 -o "/tmp/s25-ui-$$" -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $JWT" -H "$CT" \
+  -d '{"name":"s25-ui","type":"openai_compatible","baseUrl":"http://8.8.8.8/v1","keys":["sk-s25-ui-000000001","sk-s25-ui-000000002"],"groups":"default","models":"m-ui25","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":0,"remark":""}')
+uibody=$(cat "/tmp/s25-ui-$$" 2>/dev/null); rm -f "/tmp/s25-ui-$$"
+uist=$(q "SELECT status FROM gateway_channels WHERE name='s25-ui'")
+uikeys=$(q "SELECT COUNT(*) FROM gateway_channel_keys k JOIN gateway_channels c ON c.id=k.channel_id WHERE c.name='s25-ui'")
+[ "$ui25" = "200" ] && [ "$uist" = "0" ] && [ "$uikeys" = "2" ] \
+  && pass "管理台新建表单整包可落库：status=0 建成禁用、两把初始 Key 入库" \
+  || fail "管理台新建渠道: http=${ui25} 状态=${uist}(期望0) Key=${uikeys}(期望2) ${uibody}"
 
 # ══ S25b 请求时强制（写库绕过写入时校验的渠道）══
 # 写入时校验只是快速反馈；真正的强制点是请求时的受控出站客户端。这里直接往库里插指向回环别名与云元数据的渠道
