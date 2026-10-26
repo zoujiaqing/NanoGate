@@ -296,6 +296,11 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
 for i in 1 2 3 4 5; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-403","messages":[]}'; done
 s403=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID c403)")
 [ "$s403" = "2" ] && pass "403 连续失败 → Key 自动禁用(status=2)" || fail "403 未禁用 Key(status=$s403)"
+# 上游明确拒绝（4xx）= 没产生用量：预留必须当场释放，不能挂在 UPSTREAM_STARTED 等 TTL 转人工、锁着用户的余额
+open403=$(wait_rows "SELECT COUNT(*) FROM gateway_settlements WHERE request_model='m-403' AND status<>'RELEASED'" 0)
+rel403=$(q "SELECT COUNT(*) FROM gateway_settlements WHERE request_model='m-403' AND status='RELEASED'")
+[ "$open403" = "0" ] && [ "${rel403:-0}" -ge 1 ] && pass "上游 4xx 的请求当场释放预留（${rel403} 单全部 RELEASED）" \
+  || fail "上游 4xx 预留未释放: 未释放=${open403}(期望0) 已释放=${rel403} $(q "SELECT status||':'||count(*) FROM gateway_settlements WHERE request_model='m-403' GROUP BY status" | tr '\n' ' ')"
 for i in 1 2 3 4 5 6 7; do curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-429","messages":[]}'; done
 s429=$(q "SELECT status FROM gateway_channel_keys WHERE channel_id=$(CID c429)")
 [ "$s429" = "1" ] && pass "429 限流 → Key 保持可用(status=1)" || fail "429 误禁用 Key(status=$s429)"

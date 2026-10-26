@@ -299,9 +299,86 @@ if st_a is not None:
     check(st_a["last"].get("/v1beta/models/gemini-2.5-flash:streamGenerateContent", {}).get("headers", {}).get("x-goog-api-key") == "sk-mock-a"
           or "gemini" in json.dumps(st_a["hits"]), "Gemini 渠道收到请求")
 
+# ════════════════════════ 第二阶段：更多路径 ════════════════════════
+print("[more] Responses、跨协议、停用 Key、限速、余额不足、并发")
+import threading
+
+s, _, b = http("POST", f"{API}/v1/responses", {"model": "gpt-4o-mini", "input": "hi"}, OAI)
+out = json.dumps(b.get("output") if isinstance(b, dict) else b)
+check(s == 200 and "mock-a" in out, "Responses 接口 /v1/responses", f"{s} {str(b)[:200]}")
+time.sleep(2)
+rl = ok_data(app("GET", "/gateway/usage/log/page?pageNo=1&pageSize=1"), "logs")["list"][0]
+want = micro(SALE["gpt-4o-mini"][0], 1200) + micro(SALE["gpt-4o-mini"][1], 300)
+check(rl["requestModel"] == "gpt-4o-mini" and (rl["promptTokens"], rl["completionTokens"]) == (1200, 300) and abs(rl["charged"] - want) <= 1,
+      "Responses 调用按 input/output tokens 正确计费", f"{rl.get('promptTokens')}/{rl.get('completionTokens')} charged={rl.get('charged')} want={want}")
+s, _, b = http("POST", f"{API}/v1/messages", {"model": "gemini-2.5-flash", "max_tokens": 128, "messages": [{"role": "user", "content": "hi"}]}, ANT)
+check(s == 200 and "mock-a" in json.dumps(b.get("content") if isinstance(b, dict) else b), "跨协议：用 Anthropic 格式调 Gemini", f"{s} {str(b)[:200]}")
+
+main_id = next(t["id"] for t in ok_data(app("GET", "/gateway/token/list"), "token list") if t.get("name") == "e2e-main")
+app("PUT", f"/gateway/token/update-status?id={main_id}&status=0")
+s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, OAI)
+check(s in (401, 403), "停用的 Key → 拒绝", f"{s} {str(b)[:120]}")
+app("PUT", f"/gateway/token/update-status?id={main_id}&status=1")
+s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, OAI)
+check(s == 200, "重新启用后恢复调用", f"{s} {str(b)[:120]}")
+
+# 运营给用户建一个每分钟 2 次的 Key：第 3 次被拒
+uid = next(u["id"] for u in admin("GET", f"/account/user/page?pageNo=1&pageSize=5&username={os.environ['MEMBER_USER']}")["list"] if u.get("username") == os.environ["MEMBER_USER"])
+rkey = admin("POST", "/gateway/token/create", {"userId": uid, "name": "e2e-rpm", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": "", "groupOverride": None, "rpmLimit": 2, "tpmLimit": None, "concurrencyLimit": None})
+rkey = rkey.get("key") if isinstance(rkey, dict) else rkey
+codes = [http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": f"Bearer {rkey}"})[0] for _ in range(3)]
+check(codes[:2] == [200, 200] and codes[2] == 429, "运营设的每分钟 2 次限速：第 3 次 429", f"{codes}")
+
+# 零余额用户：注册（已存在就登录）、建 Key、调用 → 402
+poor_user, poor_pw = "e2epoor", "e2e-poor-pass-9"  # 用户名只允许字母数字下划线
+r = http("POST", f"{ADMIN}/app/auth/register", {"mode": "USERNAME_PASSWORD", "username": poor_user, "password": poor_pw, "nickname": "e2e poor"})
+ptok = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": poor_user, "password": poor_pw}), "poor login")["accessToken"]
+pbal = ok_data(app("GET", "/gateway/usage/balance", tok=ptok), "poor balance")
+pk = ok_data(app("POST", "/gateway/token/create", {"name": "e2e-poor", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}, tok=ptok), "poor token")
+pk = pk.get("key") if isinstance(pk, dict) else pk
+s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": f"Bearer {pk}"})
+check(pbal["available"] <= 0 and s == 402, "余额不足 → 402，不调上游", f"balance={pbal} http={s} {str(b)[:120]}")
+pbal2 = ok_data(app("GET", "/gateway/usage/balance", tok=ptok), "poor balance")
+check(pbal2 == pbal, "余额不足的请求不扣费、不留预留", f"{pbal} → {pbal2}")
+for t in ok_data(app("GET", "/gateway/token/list", tok=ptok), "poor tokens") or []:
+    app("DELETE", f"/gateway/token/delete/{t['id']}", tok=ptok)
+
+# 并发 20 个请求：全部成功，扣费与余额对得上
+time.sleep(2)
+before = ok_data(app("GET", "/gateway/usage/balance"), "balance")
+top_id = ok_data(app("GET", "/gateway/usage/log/page?pageNo=1&pageSize=1"), "logs")["list"][0]["id"]
+res = []
+def one():
+    res.append(http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 300, "messages": [{"role": "user", "content": "hi"}]}, OAI)[0])
+ths = [threading.Thread(target=one) for _ in range(20)]
+[t.start() for t in ths]; [t.join() for t in ths]
+check(res.count(200) == 20, "并发 20 个请求全部成功", f"{sorted(res)}")
+time.sleep(4)
+new_logs = [l for l in ok_data(app("GET", "/gateway/usage/log/page?pageNo=1&pageSize=50"), "logs")["list"] if l["id"] > top_id]
+after = ok_data(app("GET", "/gateway/usage/balance"), "balance")
+spent = sum(l["charged"] for l in new_logs)
+each = micro(SALE["gpt-4o-mini"][0], 1200) + micro(SALE["gpt-4o-mini"][1], 300)
+check(len(new_logs) == 20 and all(l["charged"] == each for l in new_logs), f"并发 20 条日志、每条扣 {each} μUSD", f"{len(new_logs)} {[l['charged'] for l in new_logs][:5]}")
+check(before["balance"] - after["balance"] == spent and after["reserved"] == 0, "并发后余额减少 = 扣费合计，预留归零", f"{before} → {after} spent={spent}")
+
+# 上游拒绝请求（4xx）：错误原样转给用户，不扣费、预留当场释放
+b0 = ok_data(app("GET", "/gateway/usage/balance"), "balance")
+codes = [http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "stream": st_, "metadata": {"mock_status": "400"},
+                                                       "messages": [{"role": "user", "content": "hi"}]}, OAI)[0] for st_ in (False, True)]
+time.sleep(2)
+b1 = ok_data(app("GET", "/gateway/usage/balance"), "balance")
+check(codes == [400, 400], "上游返回 400：用户收到 400（非流式与流式）", f"{codes}")
+check(b1 == b0 and b1["reserved"] == 0, "上游 4xx 不扣费、预留当场释放", f"{b0} → {b1}")
+
+stuck = admin("GET", "/gateway/settlement/manual-review")
+check(not stuck, "没有卡在人工复核的结算单", f"{len(stuck)}")
+
 for t in ok_data(app("GET", "/gateway/token/list"), "token list") or []:
     if str(t.get("name", "")).startswith("e2e-"):
         app("DELETE", f"/gateway/token/delete/{t['id']}")
+for t in admin("GET", f"/gateway/token/list-by-user/{uid}") or []:
+    if str(t.get("name", "")).startswith("e2e-"):
+        admin("DELETE", f"/gateway/token/delete/{t['id']}")
 
 passed = sum(1 for ok, _, _ in RESULTS if ok)
 print(f"═══ 结果：{passed} passed, {len(RESULTS) - passed} failed ═══")

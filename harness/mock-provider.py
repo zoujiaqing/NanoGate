@@ -117,13 +117,19 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         body = self._body()
         self._record(u.path, body)
-        if u.path in ("/v1/chat/completions", "/v1/embeddings"):
+        if u.path in ("/v1/chat/completions", "/v1/embeddings", "/v1/responses"):
             key = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
             if not self._key_ok(key):
                 self._send(401, {"error": {"message": "invalid api key", "type": "invalid_request_error"}}); return
             if FAIL:
                 self._send(500, {"error": {"message": f"{NAME} is down", "type": "server_error"}}); return
-            return self._openai_embeddings(body) if u.path.endswith("embeddings") else self._openai_chat(body)
+            # 演练上游拒绝请求：metadata.mock_status 指定一个 4xx（OpenAI 的 metadata 字段，网关原样透传）
+            forced = str((body.get("metadata") or {}).get("mock_status") or "")
+            if forced.isdigit() and 400 <= int(forced) < 500:
+                self._send(int(forced), {"error": {"message": f"{NAME} rejected the request", "type": "invalid_request_error"}}); return
+            if u.path.endswith("embeddings"):
+                return self._openai_embeddings(body)
+            return self._openai_responses(body) if u.path.endswith("responses") else self._openai_chat(body)
         if u.path == "/v1/messages":
             if not self._key_ok(self.headers.get("x-api-key", "")):
                 self._send(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}); return
@@ -164,6 +170,17 @@ class H(BaseHTTPRequestHandler):
         if (body.get("stream_options") or {}).get("include_usage"):
             self._sse({**base, "choices": [], "usage": usage})
         self._sse("[DONE]")
+
+    def _openai_responses(self, body):
+        """OpenAI Responses API（非流式）：output 里一条 assistant 消息，usage 用 input_tokens / output_tokens。"""
+        model = body.get("model", "")
+        pin, pout, pcache = usage_of(model)
+        self._send(200, {"id": f"resp_{NAME}_{int(time.time() * 1000)}", "object": "response", "created_at": int(time.time()),
+                         "status": "completed", "model": model,
+                         "output": [{"type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": reply_text(model), "annotations": []}]}],
+                         "usage": {"input_tokens": pin, "input_tokens_details": {"cached_tokens": pcache},
+                                   "output_tokens": pout, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": pin + pout}})
 
     def _openai_embeddings(self, body):
         model = body.get("model", "")
