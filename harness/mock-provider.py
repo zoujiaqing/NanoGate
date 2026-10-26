@@ -106,10 +106,17 @@ class H(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
             return
         if u.path == "/v1/models":
-            auth = self.headers.get("Authorization", "")
-            if not self._key_ok(auth.removeprefix("Bearer ").strip()):
+            # OpenAI 用 Authorization: Bearer，Anthropic 用 x-api-key（同一路径，两家都这么列模型）
+            key = self.headers.get("x-api-key") or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            if not self._key_ok(key):
                 self._send(401, {"error": {"message": "invalid api key", "type": "invalid_request_error"}}); return
             self._send(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": NAME} for m in USAGE]})
+            return
+        if u.path == "/v1beta/models":
+            key = self.headers.get("x-goog-api-key") or parse_qs(u.query).get("key", [""])[0]
+            if not self._key_ok(key):
+                self._send(401, {"error": {"code": 401, "message": "API key not valid", "status": "UNAUTHENTICATED"}}); return
+            self._send(200, {"models": [{"name": f"models/{m}", "displayName": m} for m in USAGE if m.startswith("gemini")]})
             return
         self._send(404, {"error": {"message": "not found"}})
 

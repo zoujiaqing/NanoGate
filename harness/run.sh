@@ -220,7 +220,7 @@ CID() { q "SELECT id FROM gateway_channels WHERE name='$1'"; }
 
 # ══ S0 旧环境变量前缀：NEWGATE_* 一律拒绝启动 ══
 echo "[S0] 旧环境变量前缀"
-[ "$legacy_rc" = "78" ] && echo "$legacy_out" | grep -q 'NEWGATE_LEGACY_PROBE → NETONAPI_LEGACY_PROBE' \
+[ "$legacy_rc" = "78" ] && grep -q 'NEWGATE_LEGACY_PROBE → NETONAPI_LEGACY_PROBE' <<< "$legacy_out" \
   && pass "环境里有 NEWGATE_* 时拒绝启动（退出码 78），并提示改成 NETONAPI_*" \
   || fail "旧前缀守卫: 退出码=${legacy_rc}(期望78) 输出=$(echo "$legacy_out" | tail -c 200)"
 
@@ -372,7 +372,7 @@ else
   duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO gateway_quota_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
   cnt=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$ref'")
   b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-  { echo "$duperr" | grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref"; } && rejected=1 || rejected=0
+  { grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref" <<< "$duperr"; } && rejected=1 || rejected=0
   [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
     && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
     || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
@@ -816,7 +816,7 @@ port=$(mkch "http://8.8.8.8:8080/v1" port); portbody=$(cat "/tmp/s25-port-$$" 2>
 pub=$(mkch "http://8.8.8.8/v1" pub)
 nbad=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name IN ('s25-meta','s25-loop','s25-port')")
 npub=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s25-pub'")
-[ "$meta" = "400" ] && [ "$loop" = "400" ] && [ "$port" = "400" ] && echo "$portbody" | grep -q UPSTREAM_URL_PORT_FORBIDDEN \
+[ "$meta" = "400" ] && [ "$loop" = "400" ] && [ "$port" = "400" ] && grep -q UPSTREAM_URL_PORT_FORBIDDEN <<< "$portbody" \
   && [ "$nbad" = "0" ] && [ "$pub" = "200" ] && [ "$npub" = "1" ] \
   && pass "SSRF：云元数据 169.254.169.254、[::1]、非放行端口 8080 被拒(400/未落库)、公网字面量正常创建(200/落库=${npub})" \
   || fail "SSRF 校验错: 元数据=${meta}(期望400) ipv6回环=${loop}(期望400) 端口=${port}(期望400 PORT_FORBIDDEN) 未落库=${nbad}(期望0) 公网=${pub}(期望200/落库${npub})"
@@ -824,9 +824,9 @@ dom=$(mkch "https://api.openai.com/v1" dom); reason=$(cat "/tmp/s25-dom-$$" 2>/d
 rm -f "/tmp/s25-"*"-$$"
 if [ "$dom" = "200" ]; then
   pass "域名渠道经 DNS 复查后放行（api.openai.com）"
-elif echo "$reason" | grep -q "UPSTREAM_URL_UNRESOLVABLE"; then
+elif grep -q "UPSTREAM_URL_UNRESOLVABLE" <<< "$reason"; then
   echo "  ⚠️  本机解析不出 api.openai.com → 按 fail-closed 拒绝（DNS 不可用时的预期行为，不计失败）" >&2
-elif echo "$reason" | grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" && dscacheutil -q host -a name api.openai.com 2>/dev/null | grep -Eq 'ip_address: 198\.(18|19)\.'; then
+elif grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" <<< "$reason" && dscacheutil -q host -a name api.openai.com 2>/dev/null | grep -Eq 'ip_address: 198\.(18|19)\.'; then
   echo "  ⚠️  本机 DNS 是 fake-IP 模式（api.openai.com → 198.18.0.0/15）→ 按非公网地址拒绝（预期行为，不计失败）" >&2
 else
   fail "域名渠道被意外拒绝: ${dom} ${reason}"
@@ -864,11 +864,24 @@ kf=$(q "SELECT COALESCE(SUM(fail_count),0) FROM gateway_channel_keys k JOIN gate
 probe=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-meta)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 palias=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-alias)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 refused=$(grep -c "relay target refused" "$WORK/logs/all.log")
-[ "$blocked" = "503" ] && echo "$bbody" | grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" && [ "$okc" = "200" ] && [ "$kf" = "0" ] \
-  && echo "$probe" | grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' && echo "$palias" | grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' \
+[ "$blocked" = "503" ] && grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" <<< "$bbody" && [ "$okc" = "200" ] && [ "$kf" = "0" ] \
+  && grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' <<< "$probe" && grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' <<< "$palias" \
   && [ "$refused" -ge 2 ] \
   && pass "请求时拒绝 localhost 别名与 169.254.169.254（503、Key 不计失败、探测 errorCode=UPSTREAM_URL_PRIVATE_ADDRESS）；放行的 127.0.0.1 照常 200" \
   || fail "请求时出站校验错: 拦截=${blocked}(期望503) body=${bbody:0:200} 放行=${okc}(期望200) Key失败=${kf}(期望0) 探测=${probe:0:200} 别名探测=${palias:0:200} 日志拒绝条数=${refused}"
+# 运营在管理台建渠道的真实写法：Base URL 照 OpenAI SDK 带 /v1、代理等可选项留空（表单提交 ""）。
+# 曾经 ""代理被当成非法代理地址、/v1 又被拼成 /v1/v1，这样的渠道拉模型与转发全部失败（2026-10-27 线上）
+GJ25=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+cv1=$(curl -s --max-time 10 -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $GJ25" -H "$CT" \
+  -d '{"name":"s25-v1","type":"openai_compatible","baseUrl":"http://127.0.0.1:9976/v1","keys":["k-v1"],"groups":"default","models":"m-v1","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":1,"remark":""}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('data') or '')" 2>/dev/null)
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-v1','1','1','0','0',100,'manual',0,0,0);" >/dev/null
+pv1=$(q "SELECT COALESCE(proxy_url,'<null>') FROM gateway_channels WHERE name='s25-v1'")
+rv1=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-v1","messages":[]}')
+mv1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/models/$cv1" -H "Authorization: Bearer $GJ25" -H "$CT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['ok'],d.get('error') or '')" 2>/dev/null)
+[ -n "$cv1" ] && [ "$pv1" = "<null>" ] && [ "$rv1" = "200" ] && [ "${mv1%% *}" = "True" ] \
+  && pass "管理台写法的渠道（Base URL 带 /v1、代理留空）：代理存为空、转发 200、拉模型成功" \
+  || fail "管理台写法的渠道: id=${cv1} 代理=${pv1}(期望<null>) 转发=${rv1}(期望200) 拉模型='${mv1}'"
 
 # ════════════════════════════════════════════════════════════════════
 # S26–S34：计费组身份（gateway V002）与充值闭环（gateway V003）
@@ -1109,7 +1122,7 @@ bal0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 sleep 1   # 错误日志是 logScope.launch 异步写的，不等就会读到旧值
 nlog1=$(q "SELECT COUNT(*) FROM infra_api_error_logs")
 errmsg=$(q "SELECT COALESCE(exception_message,'') FROM infra_api_error_logs ORDER BY id DESC LIMIT 1")
-[ "$nlog1" -gt "$nlog0" ] && echo "$errmsg" | grep -q 'NETONAPI_QUOTA_PER_PRICE_UNIT' \
+[ "$nlog1" -gt "$nlog0" ] && grep -q 'NETONAPI_QUOTA_PER_PRICE_UNIT' <<< "$errmsg" \
   && pass "拒绝的原因落库可查：infra_api_error_logs ${nlog0}->${nlog1} 行，exception_message 指名了缺的环变量" \
   || fail "拒绝原因不可查: 错误日志 ${nlog0}->${nlog1} 行（若为 0 行则 ErrorLogWriter 未落库）最新一条='${errmsg}'"
 # channelCode 必填：payment 没有「默认渠道」这回事（PayOrderLogic.resolveRoute 收到 null 直接判不可用），
@@ -1583,7 +1596,7 @@ echo "[S42] 邀请奖励未配置额度：链路已装配，但一分不发"
 #    的变异照样绿：attach 是 onStart 里无条件跑的，它根本不知道注册表有没有 bind 进 member。
 # all.log 跨重启累积，故 attach 取最后一条 = 当前这次 boot 的配置；skip 用前后计数差归因。
 atk42=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
-atok42=no; printf '%s' "$atk42" | grep -q "inviter=0 invitee=0" && atok42=yes
+atok42=no; grep -q "inviter=0 invitee=0" <<< "$atk42" && atok42=yes
 skip42a=$(grep -c "invite reward skipped" "$WORK/logs/all.log" 2>/dev/null)
 read -r a42 ta42 <<<"$(sms_register '+8615000042001')"
 c42=$(invite_code_of "$ta42")
@@ -1610,7 +1623,7 @@ stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_U
   NETONAPI_INVITE_REWARD_INVITER=50000 NETONAPI_INVITE_REWARD_INVITEE=20000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk43=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
-atok43=no; printf '%s' "$atk43" | grep -q "inviter=50000 invitee=20000" && atok43=yes
+atok43=no; grep -q "inviter=50000 invitee=20000" <<< "$atk43" && atok43=yes
 read -r a43 ta43 <<<"$(sms_register '+8615000043001')"
 c43=$(invite_code_of "$ta43")
 read -r b43 tb43 <<<"$(sms_register '+8615000043002' "$c43")"
@@ -1663,7 +1676,7 @@ stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_U
   NETONAPI_INVITE_REWARD_INVITER=1e3 NETONAPI_INVITE_REWARD_INVITEE=20000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
 atk45=$(grep "invite reward attached" "$WORK/logs/all.log" 2>/dev/null | tail -1)
-atok45=no; printf '%s' "$atk45" | grep -q "inviter=INVALID invitee=20000" && atok45=yes
+atok45=no; grep -q "inviter=INVALID invitee=20000" <<< "$atk45" && atok45=yes
 mis45a=$(grep -c "invite reward MISCONFIGURED role=inviter" "$WORK/logs/all.log" 2>/dev/null)
 read -r a45 ta45 <<<"$(sms_register '+8615000045001')"
 c45=$(invite_code_of "$ta45")
@@ -1756,9 +1769,9 @@ sleep 1
 bal47b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
 nled47b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
 ngrp47b=$(q "SELECT COUNT(*) FROM gateway_groups")
-k1=no; printf '%s' "$b1" | grep -q '"message":"PERMISSION_DENIED"' && k1=yes
-k2=no; printf '%s' "$b2" | grep -q '"message":"PERMISSION_DENIED"' && k2=yes
-k3=no; printf '%s' "$b3" | grep -q '"message":"PERMISSION_DENIED"' && k3=yes
+k1=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b1" && k1=yes
+k2=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b2" && k2=yes
+k3=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b3" && k3=yes
 [ "$h1" = "403" ] && [ "$h2" = "403" ] && [ "$h3" = "403" ] \
   && [ "$k1" = "yes" ] && [ "$k2" = "yes" ] && [ "$k3" = "yes" ] \
   && [ "$bal47b" = "$bal47a" ] && [ "$nled47b" = "$nled47a" ] && [ "$ngrp47b" = "$ngrp47a" ] \
@@ -1858,7 +1871,7 @@ ac2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/gateway/group
 ac3=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/app/gateway/group-override/delete/1" -H "Authorization: Bearer $UJWT")
 leak48=$(q "SELECT COUNT(*) FROM gateway_group_overrides")
 [ "$del" = "200" ] && [ "$gone48" = "0" ] && [ "$del2" = "404" ] \
-  && printf '%s' "$nfbody" | grep -q '"data":null' \
+  && grep -q '"data":null' <<< "$nfbody" \
   && [ "$ac1" = "404" ] && [ "$ac2" = "404" ] && [ "$ac3" = "404" ] && [ "$leak48" = "0" ] \
   && pass "撤销是硬删且 app 组不暴露：delete=${del} 且行已消失(${gone48})、再删=${del2}（404 而非 500）、get 回 ${nfbody}；app 组下 create/list/delete 均 ${ac1}/${ac2}/${ac3}（路由不存在，不是 403），全表剩 ${leak48} 行" \
   || fail "撤销/暴露不对: delete=${del}(期望200) 删后行数=${gone48}(期望0) 再删=${del2}(期望404) get回显='${nfbody:0:80}'(期望 data:null) app组 create=${ac1} list=${ac2} delete=${ac3}（均期望404）全表行数=${leak48}(期望0)"
@@ -2523,7 +2536,7 @@ rc56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/
 pl56=$(jf56 payload)
 nu56=$(pq56 "$pl56" notify_url); ru56=$(pq56 "$pl56" return_url); bc56=$(pq56 "$pl56" biz_content)
 ENU56="$BASE56/app/pay/channel-notify/alipay56"
-qa56=no; printf '%s' "$bc56" | grep -q "\"quit_url\":\"$RET56\"" && qa56=yes
+qa56=no; grep -q "\"quit_url\":\"$RET56\"" <<< "$bc56" && qa56=yes
 la56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); la56l=$(lvl56 "$la56")
 
 # ── 块 A：配了基址 → 两个地址逐字进 payload ──
@@ -2555,19 +2568,19 @@ rcC56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway
 plC56=$(jf56 payload)
 # 两面都断言：既要「没有回调参数」，也要「payload 仍是那条真 alipay 跳转地址」。
 # 只断言前者的话，一个把整个 prepay 弄挂的实现（payload 空）同样能过 —— 与块A 的正反配对同一个道理。
-ali56=no; printf '%s' "$plC56" | grep -q "openapi.alipay.com" && ali56=yes
-nnC56=no; printf '%s' "$plC56" | grep -q "notify_url=" && nnC56=yes
-nrC56=no; printf '%s' "$plC56" | grep -q "return_url=" && nrC56=yes
+ali56=no; grep -q "openapi.alipay.com" <<< "$plC56" && ali56=yes
+nnC56=no; grep -q "notify_url=" <<< "$plC56" && nnC56=yes
+nrC56=no; grep -q "return_url=" <<< "$plC56" && nrC56=yes
 lcC56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); lcC56l=$(lvl56 "$lcC56")
 lrC56=$(lg56 NETONAPI_PAY_RETURN_URL); lrC56l=$(lvl56 "$lrC56")
 # 两行各说各的后果：return_url 没配与「渠道会不会回调」无关。共用一句文案的话其中一行会说谎，
 # 而运维读到那行会去查一条没坏的路 —— 所以两行都要断：说了自己的、没借对方的。
-own56=no; printf '%s' "$lcC56" | grep -q "pay-order-reconcile" && own56=yes
+own56=no; grep -q "pay-order-reconcile" <<< "$lcC56" && own56=yes
 # 日志里那个名字必须是后台任务页上真能搜到的那一个（handler 列 = @Job.id）。
 # 写类名 PayOrderReconcileJob 的话运维搜不到 —— 所以这里反向钉一条：不许出现类名。
-cls56=no; printf '%s' "$lcC56" | grep -q "PayOrderReconcileJob" && cls56=yes
-back56=no; printf '%s' "$lrC56" | grep -q "回不来" && back56=yes
-lie56=no; printf '%s' "$lrC56" | grep -q "pay-order-reconcile" && lie56=yes
+cls56=no; grep -q "PayOrderReconcileJob" <<< "$lcC56" && cls56=yes
+back56=no; grep -q "回不来" <<< "$lrC56" && back56=yes
+lie56=no; grep -q "pay-order-reconcile" <<< "$lrC56" && lie56=yes
 [ "$rcC56" = "200" ] && [ "$ali56" = "yes" ] && [ "$nnC56" = "no" ] && [ "$nrC56" = "no" ] \
   && [ "$lcC56l" = "WARN" ] && [ "$lrC56l" = "WARN" ] && [ "$own56" = "yes" ] && [ "$cls56" = "no" ] \
   && [ "$back56" = "yes" ] && [ "$lie56" = "no" ] \
@@ -2581,12 +2594,12 @@ stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_PAY_NOTIFY_BASE="
 rcD56=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"alipay56"}')
 plD56=$(jf56 payload)
-ndD56=no; printf '%s' "$plD56" | grep -q "notify_url=" && ndD56=yes
-rdD56=no; printf '%s' "$plD56" | grep -q "return_url=" && rdD56=yes
+ndD56=no; grep -q "notify_url=" <<< "$plD56" && ndD56=yes
+rdD56=no; grep -q "return_url=" <<< "$plD56" && rdD56=yes
 ldD56=$(lg56 NETONAPI_PAY_NOTIFY_BASE); ldD56l=$(lvl56 "$ldD56")
 lrD56=$(lg56 NETONAPI_PAY_RETURN_URL); lrD56l=$(lvl56 "$lrD56")
 [ "$rcD56" = "200" ] && [ "$ndD56" = "no" ] && [ "$rdD56" = "yes" ] && [ "$ldD56l" = "ERROR" ] && [ "$lrD56l" = "INFO" ] \
-  && printf '%s' "$ldD56" | grep -q "$BAD56" \
+  && grep -q "$BAD56" <<< "$ldD56" \
   && pass "块D 写错不静默、也不连累另一半：notify 基址漏 scheme('${BAD56}') → 启动日志 ${ldD56l} 且点名了原值，payload 里 notify_url 出现=${ndD56}（按未配置处理，不把非法地址发给渠道）；return_url 出现=${rdD56}、它那行仍是 ${lrD56l} —— 两个变量各判各的；下单=${rcD56}（没被拖累）" \
   || fail "块D 非法配置的处置不对: 下单=${rcD56}(期望200；400/500 说明非法地址被原样发给了渠道，那是连单都下不了) notify_url 出现=${ndD56}(期望no) return_url 出现=${rdD56}(期望yes，一个变量写错不该连累另一个) notify 行级别='${ldD56l}'(期望ERROR；WARN 说明非法值被当成「没配」，两者后果不同) return 行级别='${lrD56l}'(期望INFO) notify 行点名原值=$(printf '%s' "$ldD56" | grep -c "$BAD56")(期望1) 行内容 '${ldD56:0:160}'"
 
@@ -2629,7 +2642,7 @@ else
   w3l56=$(lvl56 "$(new56 "$n3e56" | grep NETONAPI_PAY_NOTIFY_BASE | tail -1)")
 
   [ "$e1l56" = "ERROR" ] && [ "$w1l56" = "WARN" ] && [ "$e2e56" = "0" ] && [ "$i2e56" = "INFO" ] \
-    && [ "$e3e56" = "0" ] && [ "$w3l56" = "WARN" ] && printf '%s' "$e1e56" | grep -q "$JOB56" \
+    && [ "$e3e56" = "0" ] && [ "$w3l56" = "WARN" ] && grep -q "$JOB56" <<< "$e1e56" \
     && pass "块E 两条到账路径同时断就响、且只在那时响：停用 $JOB56 + 不配基址 → 新增 ${e1l56} 行点名两条都断（且含 job id=$(printf '%s' "$e1e56" | grep -c "$JOB56")），那行 WARN 也仍在(${w1l56})；对照①任务仍停用但配了基址 → 新增那类 ERROR=${e2e56} 条、基址行是 ${i2e56}；对照②任务启用且不配基址 → 新增那类 ERROR=${e3e56} 条、基址行是 ${w3l56}" \
     || fail "块E 组合检查不对: E1(停用+没配) ERROR 行级别='${e1l56}'(期望ERROR；空说明这个「钱到账了额度永远不发」的组合压根没人说 —— 用户只会投诉付了钱没额度) E1 同次启动的 WARN 行级别='${w1l56}'(期望WARN；ERROR 该是加上去的，不是把未配置那行替换掉) E1 行点名 job id=$(printf '%s' "$e1e56" | grep -c "$JOB56")(期望≥1；后台任务页那一列是 @Job.id，写类名就搜不到) E2(停用+配了基址) 新增该类 ERROR=${e2e56}(期望0；非0 说明它是无条件报的，那么这行 ERROR 不携带任何信息) E2 基址行级别='${i2e56}'(期望INFO) E3(启用+没配) 新增该类 ERROR=${e3e56}(期望0) E3 基址行级别='${w3l56}'(期望WARN) E1 行内容='${e1e56:0:200}'"
 fi
@@ -2643,7 +2656,7 @@ fi
 # ══ S57 健康端点：匿名可读，DB 可达即 200（容器 HEALTHCHECK / compose depends_on / 反代健康检查都靠它）══
 echo "[S57] /health"
 hc=$(curl -s --max-time 5 -o /tmp/netonapi-health.json -w "%{http_code}" "$U/health"); hb=$(cat /tmp/netonapi-health.json 2>/dev/null)
-[ "$hc" = "200" ] && echo "$hb" | grep -q '"status":"ok"' \
+[ "$hc" = "200" ] && grep -q '"status":"ok"' <<< "$hb" \
   && pass "/health 匿名 200 且 status=ok" \
   || fail "/health 错: HTTP=${hc} body=${hb}"
 
@@ -2656,11 +2669,11 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-map'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('gpt-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 mb=$(curl -s --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-x","messages":[]}')
-echo "$mb" | grep -q '"model":"gpt-x"' && ! echo "$mb" | grep -q 'up-x' \
+grep -q '"model":"gpt-x"' <<< "$mb" && ! grep -q 'up-x' <<< "$mb" \
   && pass "非流式响应 model 改回 gpt-x" || fail "非流式响应 model 未改回: $mb"
 ms=$(curl -sN --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-x","stream":true,"messages":[]}')
 mc=$(echo "$ms" | grep -c '"model":"gpt-x"')
-[ "$mc" -ge 3 ] && ! echo "$ms" | grep -q 'up-x' \
+[ "$mc" -ge 3 ] && ! grep -q 'up-x' <<< "$ms" \
   && pass "流式每块 model 改回 gpt-x（$mc 块）" || fail "流式 model 未改回: chunks=$mc body=$(echo "$ms" | head -c 300)"
 um=$(wait_rows "SELECT upstream_model FROM gateway_usage_logs WHERE request_model='gpt-x' ORDER BY id LIMIT 1" up-x)
 [ "$um" = "up-x" ] && pass "usage_log.upstream_model 仍记上游名 up-x" || fail "usage_log.upstream_model=$um"
@@ -2672,7 +2685,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-az'),'sk-azure',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('gpt-a','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 ac=$(curl -s --max-time 15 -o /tmp/netonapi-az.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"gpt-a","messages":[]}'); ab=$(cat /tmp/netonapi-az.json)
-[ "$ac" = "200" ] && echo "$ab" | grep -q '"model":"gpt-a"' \
+[ "$ac" = "200" ] && grep -q '"model":"gpt-a"' <<< "$ab" \
   && pass "Azure 形状正确（200，model 改回 gpt-a）" || fail "Azure 请求形状错: HTTP=$ac body=$ab"
 unset AZURE_DEPLOYMENT AZURE_KEY
 
@@ -2683,7 +2696,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-403'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 xc=$(curl -s --max-time 15 -o /tmp/netonapi-x.json -w "%{http_code}" -X POST "$U/v1/messages" -H "$AUTH" -H "$CT" -d '{"model":"m-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'); xb=$(cat /tmp/netonapi-x.json)
-[ "$xc" = "403" ] && echo "$xb" | grep -q '"type":"error"' && echo "$xb" | grep -q 'forbidden' \
+[ "$xc" = "403" ] && grep -q '"type":"error"' <<< "$xb" && grep -q 'forbidden' <<< "$xb" \
   && pass "Anthropic 入口收到 Anthropic 形状的 403（含上游原话）" || fail "跨协议错误体: HTTP=$xc body=$xb"
 oc=$(curl -s --max-time 15 -o /tmp/netonapi-o.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-x","messages":[]}'); ob=$(cat /tmp/netonapi-o.json)
 [ "$oc" = "403" ] && [ "$ob" = '{"error": "forbidden"}' ] \
@@ -2698,10 +2711,10 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-p1'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-p2'),'k',1,0,0,0,0);" >/dev/null
 p1=$(q "SELECT id FROM gateway_channels WHERE name='c-p1'"); p2=$(q "SELECT id FROM gateway_channels WHERE name='c-p2'")
 pb1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$p1" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}')
-echo "$pb1" | grep -q '"ok":true' && echo "$pb1" | grep -q '"status":200' \
+grep -q '"ok":true' <<< "$pb1" && grep -q '"status":200' <<< "$pb1" \
   && pass "健康渠道探测 ok/200" || fail "健康渠道探测: $pb1"
 pb2=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$p2" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"model":"m-p"}')
-echo "$pb2" | grep -q '"ok":false' && echo "$pb2" | grep -q '"status":403' && echo "$pb2" | grep -q 'forbidden' \
+grep -q '"ok":false' <<< "$pb2" && grep -q '"status":403' <<< "$pb2" && grep -q 'forbidden' <<< "$pb2" \
   && pass "403 渠道探测 ok=false 且带上游原话" || fail "403 渠道探测: $pb2"
 pf=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$p2"); pl=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 [ "$pf" = "0" ] && [ "$pl" = "0" ] && pass "探测不动 Key 失败计数、不写 usage_log" || fail "探测有副作用: fail_count=$pf usage_logs=$pl"
@@ -2713,7 +2726,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-ls'),'k-ls',1,0,0,0,0);" >/dev/null
 ls_id=$(q "SELECT id FROM gateway_channels WHERE name='c-ls'")
 lsb=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/models/$ls_id" -H "Authorization: Bearer $GJWT" -H "$CT")
-echo "$lsb" | grep -q '"ok":true' && echo "$lsb" | grep -q '"models":\["m-list-a","m-list-b"\]' \
+grep -q '"ok":true' <<< "$lsb" && grep -q '"models":\["m-list-a","m-list-b"\]' <<< "$lsb" \
   && pass "上游模型清单 ok 且排序去重" || fail "上游模型清单: $lsb"
 
 # ══ S63 定价批量导入：整批校验、按 model upsert、overwrite=false 跳过已有 ══
@@ -2722,17 +2735,17 @@ seed_reset
 imp1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"items":[{"model":"imp-a","inputPrice":"1","outputPrice":"2"},{"model":"imp-b","inputPrice":"3","outputPrice":"4"},{"model":"imp-a","inputPrice":"9","outputPrice":"9"}]}')
 ia=$(q "SELECT input_price||'/'||output_price||'/'||source FROM gateway_model_prices WHERE model='imp-a'"); ic=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model LIKE 'imp-%'")
-echo "$imp1" | grep -q '"created":2' && [ "$ic" = "2" ] && [ "$ia" = "1/2/import" ] \
+grep -q '"created":2' <<< "$imp1" && [ "$ic" = "2" ] && [ "$ia" = "1/2/import" ] \
   && pass "首次导入 created=2（同批重复 model 只取第一条）" || fail "首次导入: resp=$imp1 rows=$ic imp-a=$ia"
 imp2=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"overwrite":false,"items":[{"model":"imp-a","inputPrice":"5","outputPrice":"6"},{"model":"imp-c","inputPrice":"7","outputPrice":"8"}]}')
 ia2=$(q "SELECT input_price FROM gateway_model_prices WHERE model='imp-a'")
-echo "$imp2" | grep -q '"created":1' && echo "$imp2" | grep -q '"skipped":1' && [ "$ia2" = "1" ] \
+grep -q '"created":1' <<< "$imp2" && grep -q '"skipped":1' <<< "$imp2" && [ "$ia2" = "1" ] \
   && pass "overwrite=false：新增 1、跳过 1、旧价不动" || fail "不覆盖导入: resp=$imp2 imp-a=$ia2"
 imp3=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"items":[{"model":"imp-d","inputPrice":"1","outputPrice":"2"},{"model":"imp-e","inputPrice":"bad","outputPrice":"2"}]}')
 id_rows=$(q "SELECT COUNT(*) FROM gateway_model_prices WHERE model='imp-d'")
-echo "$imp3" | grep -q '"errors":\["#2 imp-e' && [ "$id_rows" = "0" ] \
+grep -q '"errors":\["#2 imp-e' <<< "$imp3" && [ "$id_rows" = "0" ] \
   && pass "有一条不合法则整批不写，错误带行号" || fail "整批校验: resp=$imp3 imp-d rows=$id_rows"
 
 # ══ S64 管理台概览：从用量日志现算的汇总与上面 S1 一样的口径 ══
@@ -2758,12 +2771,12 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rs'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rs','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 rsc=$(curl -s --max-time 15 -o /tmp/netonapi-rs.json -w "%{http_code}" -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","max_output_tokens":50}'); rsb=$(cat /tmp/netonapi-rs.json)
-[ "$rsc" = "200" ] && echo "$rsb" | grep -q '"object": "response"' && echo "$rsb" | grep -q '"model":"m-rs"' && ! echo "$rsb" | grep -q 'up-rs' \
+[ "$rsc" = "200" ] && grep -q '"object": "response"' <<< "$rsb" && grep -q '"model":"m-rs"' <<< "$rsb" && ! grep -q 'up-rs' <<< "$rsb" \
   && pass "非流式 200、响应 model 改回 m-rs" || fail "非流式: HTTP=$rsc body=$rsb"
 rs1=$(wait_rows "SELECT prompt_tokens||'/'||completion_tokens||'/'||charged||'/'||upstream_model FROM gateway_usage_logs WHERE request_model='m-rs' ORDER BY id LIMIT 1" "1000/500/7500/up-rs")
 [ "$rs1" = "1000/500/7500/up-rs" ] && pass "usage 按 input_/output_tokens 入账（1000/500 → charged 7500）" || fail "非流式 usage_log: $rs1"
 rss=$(curl -sN --max-time 15 -X POST "$U/v1/responses" -H "$AUTH" -H "$CT" -d '{"model":"m-rs","input":"hi","stream":true,"max_output_tokens":50}')
-echo "$rss" | grep -q 'response.completed' && [ "$(echo "$rss" | grep -c '"model":"m-rs"')" -ge 2 ] && ! echo "$rss" | grep -q 'up-rs' \
+grep -q 'response.completed' <<< "$rss" && [ "$(echo "$rss" | grep -c '"model":"m-rs"')" -ge 2 ] && ! grep -q 'up-rs' <<< "$rss" \
   && pass "流式透传到 response.completed，事件里的 model 改回 m-rs" || fail "流式: $(echo "$rss" | head -c 400)"
 rs2=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1 AND prompt_tokens=1000 AND completion_tokens=500 AND charged=7500" 1)
 [ "$rs2" = "1" ] && pass "流式 usage 取自 response.completed 并入账" || fail "流式 usage_log 行数=$rs2 $(q "SELECT status,error_code,prompt_tokens,completion_tokens FROM gateway_usage_logs WHERE request_model='m-rs' AND stream=1")"
@@ -2777,7 +2790,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,capabilities,p
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-img'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-noimg'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,source,deleted,created_at,updated_at) VALUES ('m-img','0','0','0','0',20000,'manual',0,0,0),('m-img2','0','0','0','0',20000,'manual',0,0,0);" >/dev/null
 imc=$(curl -s --max-time 15 -o /tmp/netonapi-img.json -w "%{http_code}" -X POST "$U/v1/images/generations" -H "$AUTH" -H "$CT" -d '{"model":"m-img","prompt":"a cat","n":1,"size":"1024x1024"}'); imb=$(cat /tmp/netonapi-img.json)
-[ "$imc" = "200" ] && echo "$imb" | grep -q '"url": "http://127.0.0.1/x.png"' \
+[ "$imc" = "200" ] && grep -q '"url": "http://127.0.0.1/x.png"' <<< "$imb" \
   && pass "图片生成 200 透传" || fail "图片生成: HTTP=$imc body=$imb"
 iml=$(wait_rows "SELECT charged||'/'||prompt_tokens||'/'||status FROM gateway_usage_logs WHERE request_model='m-img' LIMIT 1" "20000/0/ok")
 [ "$iml" = "20000/0/ok" ] && pass "按次计价入账 20000 μUSD（无 usage 也不算 0）" || fail "图片 usage_log: $iml"
@@ -2787,7 +2800,7 @@ imn=$(curl -s --max-time 15 -o /tmp/netonapi-img2.json -w "%{http_code}" -X POST
 # ══ S67 公开接入信息：匿名可读，端点清单齐全 ══
 echo "[S67] /app/gateway/public-info"
 pic=$(curl -s --max-time 5 -o /tmp/netonapi-pi.json -w "%{http_code}" "$U/app/gateway/public-info"); pib=$(cat /tmp/netonapi-pi.json)
-[ "$pic" = "200" ] && echo "$pib" | grep -q '/v1/chat/completions' && echo "$pib" | grep -q '/v1/images/generations' && echo "$pib" | grep -q '/v1/messages' \
+[ "$pic" = "200" ] && grep -q '/v1/chat/completions' <<< "$pib" && grep -q '/v1/images/generations' <<< "$pib" && grep -q '/v1/messages' <<< "$pib" \
   && pass "public-info 匿名 200 且列出各协议端点" || fail "public-info: HTTP=$pic body=$pib"
 
 # ══ S68 用户自助：改 Key 的名称/预算/有效期/模型范围，改不了运营设定的限速与计价组；用量汇总口径与日志一致 ══
@@ -2827,7 +2840,7 @@ echo "[S69] 用户名密码注册"
 rg=$(curl -s --max-time 30 -o /tmp/netonapi-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
   -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/netonapi-reg.json)
 lg=$(curl -s --max-time 30 -o /tmp/netonapi-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
-[ "$rg" = "200" ] && echo "$rgb" | grep -q '"code":0' && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/netonapi-lg.json \
+[ "$rg" = "200" ] && grep -q '"code":0' <<< "$rgb" && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/netonapi-lg.json \
   && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/netonapi-lg.json)"
 
 # ══ S70 跨协议保真：Anthropic 入口（Claude Code 形状）打 OpenAI 上游的工具调用、thinking、缓存用量、多轮回填 ══
@@ -2845,12 +2858,12 @@ print(d['stop_reason'], b[0]['type'], b[1]['type'], b[1]['name'], b[1]['input'][
 [ "$a1v" = "tool_use thinking tool_use read_file a.txt call_1 60 40" ] && pass "非流式：thinking 块 + tool_use 块、stop_reason=tool_use、缓存用量拆分（60 + 40）" || fail "非流式跨协议: '$a1v' body=$(echo "$a1" | head -c 300)"
 REQ2='{"model":"m-tl","max_tokens":100,"tools":[{"name":"read_file","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"read a.txt"},{"role":"assistant","content":[{"type":"thinking","thinking":"need tool","signature":""},{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"text","text":"here"},{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"FILE-BODY"}]}]}]}'
 a2=$(curl -s --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d "$REQ2")
-echo "$a2" | grep -q 'FILE-BODY' && echo "$a2" | grep -q '"stop_reason":"end_turn"' \
+grep -q 'FILE-BODY' <<< "$a2" && grep -q '"stop_reason":"end_turn"' <<< "$a2" \
   && pass "第二轮：tool_result 回填成 OpenAI tool 消息并排在文本前，上游读到了结果" || fail "第二轮回填: $(echo "$a2" | head -c 300)"
 a3=$(curl -sN --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d "$(echo "$REQ1" | sed 's/"max_tokens":100/"max_tokens":100,"stream":true/')")
 a3ev=$(echo "$a3" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' ')
 [ "$a3ev" = "message_start content_block_start content_block_delta content_block_delta content_block_delta content_block_stop content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] \
-  && echo "$a3" | grep -q '"thinking_delta"' && echo "$a3" | grep -q '"partial_json"' && echo "$a3" | grep -q '"stop_reason":"tool_use"' && echo "$a3" | grep -q '"cache_read_input_tokens":40' \
+  && grep -q '"thinking_delta"' <<< "$a3" && grep -q '"partial_json"' <<< "$a3" && grep -q '"stop_reason":"tool_use"' <<< "$a3" && grep -q '"cache_read_input_tokens":40' <<< "$a3" \
   && pass "流式：thinking 块 → tool_use 块顺序正确、块先关后开、message_delta 带缓存用量" || fail "流式事件序列: '$a3ev' $(echo "$a3" | head -c 400)"
 tl=$(wait_rows "SELECT prompt_tokens||'/'||cache_read_tokens||'/'||completion_tokens FROM gateway_usage_logs WHERE request_model='m-tl' ORDER BY id LIMIT 1" "100/40/20")
 [ "$tl" = "100/40/20" ] && pass "计费仍按上游原生 usage（100 prompt 含 40 缓存）" || fail "跨协议计费: $tl"
@@ -2886,7 +2899,7 @@ boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000 NETONAPI_METRICS_TOKEN=mt
 sy=$(curl -s --max-time 15 -X POST "$U/admin/gateway/price/sync" -H "Authorization: Bearer $GJWT" -H "$CT")
 sya=$(q "SELECT input_price||'/'||output_price||'/'||source FROM gateway_model_prices WHERE model='sync-a'")
 syr=$(q "SELECT changed||'/'||COALESCE(error,'') FROM gateway_price_sync_runs ORDER BY id DESC LIMIT 1")
-echo "$sy" | grep -q '"status":"CHANGED"' && [ "$sya" = "1/2/manual" ] && [ "$syr" = "1/" ] \
+grep -q '"status":"CHANGED"' <<< "$sy" && [ "$sya" = "1/2/manual" ] && [ "$syr" = "1/" ] \
   && pass "价源检查只记差异、不改价：sync-a 价源 1.5/6 与库里 1/2 不同 → 检查记录 changed=1，价格表仍是 ${sya}" \
   || fail "价源检查: 结果=$(echo "$sy" | head -c 200) 价格=${sya}(期望1/2/manual) 记录=${syr}(期望1/)"
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-pr','openai_compatible','http://127.0.0.1:9934','default','m-pr2',1,1,1,30000,90000,'1.0',0,0,0);
@@ -2897,9 +2910,9 @@ prow=$(q "SELECT last_probe_ok||'/'||(last_probe_ms IS NOT NULL)||'/'||(last_pro
 [ "$prow" = "1/true/true" ] && pass "探测结果落到渠道行（ok/ms/at）" || fail "测速落库: $prow"
 m401=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$U/metrics")
 mb=$(curl -s --max-time 5 "$U/metrics" -H "Authorization: Bearer mt")
-[ "$m401" = "401" ] && echo "$mb" | grep -q '^netonapi_channel_probe_ok{channel="c-pr"' && echo "$mb" | grep -q '^netonapi_settlements_manual_review ' \
+[ "$m401" = "401" ] && grep -q '^netonapi_channel_probe_ok{channel="c-pr"' <<< "$mb" && grep -q '^netonapi_settlements_manual_review ' <<< "$mb" \
   && pass "/metrics 带 token 才可读，含渠道测速与结算指标" || fail "metrics: noauth=$m401 body=$(echo "$mb" | head -c 300)"
-echo "$mb" | grep -q '^netonapi_price_pending_changes 1$' && pass "/metrics 给出待确认的官方价变动数（1）" || fail "价源待确认指标: $(echo "$mb" | grep price_pending)"
+grep -q '^netonapi_price_pending_changes 1$' <<< "$mb" && pass "/metrics 给出待确认的官方价变动数（1）" || fail "价源待确认指标: $(echo "$mb" | grep price_pending)"
 q "DELETE FROM system_settings WHERE setting_key LIKE 'gateway.pricing.source_%';" >/dev/null
 
 # ══ S73 真实 Claude Code CLI（装了才跑）：完整两轮工具调用经网关打 OpenAI 上游 ══
@@ -2930,10 +2943,10 @@ brc=$(curl -s --max-time 15 -o /tmp/netonapi-br.json -w "%{http_code}" -X POST "
 [ "$brc" = "200" ] && grep -q '"from bedrock"' /tmp/netonapi-br.json && pass "Bedrock 非流式：SigV4 通过校验、body 形状正确" || fail "Bedrock 非流式: HTTP=$brc $(head -c 400 /tmp/netonapi-br.json)"
 brs=$(curl -sN --max-time 15 -X POST "$U/v1/messages" -H "x-api-key: $TOKEN_PLAINTEXT" -H "$CT" -d '{"model":"claude-br","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}')
 brev=$(echo "$brs" | grep -oE "^event: [a-z_]+" | sed 's/event: //' | tr '\n' ' ')
-[ "$brev" = "message_start content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] && echo "$brs" | grep -q 'bedrock' \
+[ "$brev" = "message_start content_block_start content_block_delta content_block_delta content_block_stop message_delta message_stop " ] && grep -q 'bedrock' <<< "$brs" \
   && pass "Bedrock 流式：event-stream 二进制帧还原成 Anthropic SSE（跨包切帧）" || fail "Bedrock 流式: '$brev' $(echo "$brs" | head -c 300)"
 bro=$(curl -s --max-time 15 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"claude-br","messages":[{"role":"user","content":"hi"}]}')
-echo "$bro" | grep -q '"content":"from bedrock"' && pass "OpenAI 入口 → Bedrock 跨协议" || fail "OpenAI→Bedrock: $(echo "$bro" | head -c 300)"
+grep -q '"content":"from bedrock"' <<< "$bro" && pass "OpenAI 入口 → Bedrock 跨协议" || fail "OpenAI→Bedrock: $(echo "$bro" | head -c 300)"
 brl=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='claude-br' AND status='ok' AND prompt_tokens=11 AND completion_tokens=4" 3)
 [ "$brl" = "3" ] && pass "三次都按 Anthropic usage 计费（11/4）" || fail "Bedrock 计费行=$brl"
 
@@ -3021,7 +3034,8 @@ ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com
 echo "[S78] SMTP 发信"
 rm -f /tmp/netonapi-smtp.json
 PORT=2526 DUMP=/tmp/netonapi-smtp.json python3 "$HERE/smtp_fake.py" >/dev/null 2>&1 & PIDS+=($!)
-sleep 1
+# 等端口真的在听再往下走：固定 sleep 1 偶尔不够（Python 启动慢的机器上后端连过去被拒，整段 S78 连带失败）
+for _ in $(seq 1 40); do nc -z 127.0.0.1 2526 2>/dev/null && break; sleep 0.25; done
 q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 smc=$(curl -s --max-time 10 -o /tmp/netonapi-smc.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"mail":"robot@netonapi.test","fromName":"NetonAPI 通知","vendor":"smtp","host":"127.0.0.1","port":2526,"username":"robot@netonapi.test","password":"smtp-pw","sslEnable":false,"starttlsEnable":false,"status":1}')
@@ -3250,7 +3264,7 @@ echo '{"success":true,"data":[]}' > "$PRICING_JSON"
 s4=$(sy92); r4=$(row92)
 echo '{"success":false,"message":"maintenance"}' > "$PRICING_JSON"
 s5=$(sy92); r5=$(row92); e5=$(q "SELECT COALESCE(cost_sync_error,'') FROM gateway_channels WHERE id=$UP92")
-[ "$s4" = "0 0 1 " ] && [ "$r4" = "0.4/1" ] && [ "${s5##* }" != "" ] && [ "$r5" = "0.4/1" ] && echo "$e5" | grep -q maintenance \
+[ "$s4" = "0 0 1 " ] && [ "$r4" = "0.4/1" ] && [ "${s5##* }" != "" ] && [ "$r5" = "0.4/1" ] && grep -q maintenance <<< "$e5" \
   && pass "上游不再报价 → 保留 0.4 并标过期；上游返回 success=false → 成本不动、记下错误（${e5}）" \
   || fail "过期/报错: 下架同步='${s4}' 成本='${r4}'(期望0.4/1) 报错同步='${s5}' 成本='${r5}' 错误='${e5}'"
 # 价目地址也走渠道的受控出站客户端：localhost 不在出站白名单（harness 只放行 127.0.0.1 这个字面量）→ 连接被拒，成本不动

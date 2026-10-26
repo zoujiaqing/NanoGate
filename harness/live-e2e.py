@@ -119,16 +119,25 @@ for ch in existing:
         admin("DELETE", f"/gateway/channel/delete/{ch['id']}")
 
 CHANNELS = [
-    # 优先级高的先用：备份线路（mock-b，永远 500）排在前面，演练失败后切到 mock-a
-    ("e2e-openai-flaky", "openai_compatible", "http://127.0.0.1:19002", "gpt-4o-mini,gpt-4.1,text-embedding-3-small", "chat,embeddings", 10, "sk-mock-b"),
-    ("e2e-openai", "openai_compatible", "http://127.0.0.1:19001", "gpt-4o-mini,gpt-4.1,text-embedding-3-small", "chat,embeddings", 5, "sk-mock-a"),
+    # 优先级高的先用：备份线路（mock-b，永远 500）排在前面，演练失败后切到 mock-a。
+    # Base URL 按运营在管理台的常见写法带版本段（/v1、/v1beta），网关要能兼容
+    ("e2e-openai-flaky", "openai_compatible", "http://127.0.0.1:19002/v1", "gpt-4o-mini,gpt-4.1,text-embedding-3-small", "chat,embeddings", 10, "sk-mock-b"),
+    ("e2e-openai", "openai_compatible", "http://127.0.0.1:19001/v1", "gpt-4o-mini,gpt-4.1,text-embedding-3-small", "chat,embeddings", 5, "sk-mock-a"),
     ("e2e-anthropic", "anthropic", "http://127.0.0.1:19001", "claude-sonnet-4", "chat", 5, "sk-mock-a"),
-    ("e2e-gemini", "gemini", "http://127.0.0.1:19001", "gemini-2.5-flash", "chat", 5, "sk-mock-a"),
+    ("e2e-gemini", "gemini", "http://127.0.0.1:19001/v1beta", "gemini-2.5-flash", "chat", 5, "sk-mock-a"),
 ]
+CH_IDS = {}
 for name, typ, url, models, caps, prio, key in CHANNELS:
-    admin("POST", "/gateway/channel/create", {"name": name, "type": typ, "baseUrl": url, "models": models, "capabilities": caps,
-                                               "priority": prio, "weight": 1, "costDiscount": "0.6", "keys": [key], "status": 1})
-check(True, "建渠道：OpenAI 兼容 ×2（一条故障）、Anthropic、Gemini")
+    # 与管理台新建表单提交的同一整包：没填的可选项是空串
+    CH_IDS[name] = admin("POST", "/gateway/channel/create", {
+        "name": name, "type": typ, "baseUrl": url, "models": models, "capabilities": caps, "priority": prio, "weight": 1,
+        "costSource": "official", "costDiscount": "0.6", "keys": [key], "status": 1, "groups": "default",
+        "modelMapping": "", "paramOverride": "", "proxyUrl": "", "apiVersion": "", "providerConfig": "",
+        "upstreamPricingFormat": "", "upstreamPricingUrl": "", "upstreamGroupRatio": "1", "upstreamCreditRate": "1", "remark": ""})
+check(True, "建渠道（管理台写法）：OpenAI 兼容 ×2（一条故障）、Anthropic、Gemini")
+for name in ("e2e-openai", "e2e-anthropic", "e2e-gemini"):
+    r = admin("POST", f"/gateway/channel/models/{CH_IDS[name]}", {})
+    check(r.get("ok") and r.get("models"), f"拉取模型：{name}", f"{r}")
 
 prices = {p["model"]: p for p in admin("GET", "/gateway/price/list")}
 for model, (pin, pout) in PRICES.items():
