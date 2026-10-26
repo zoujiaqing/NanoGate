@@ -183,7 +183,7 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 | 变量（容器内） | 含义 |
 |---|---|
 | `PAY_NOTIFY_BASE`（`NETONAPI_PAY_NOTIFY_BASE`） | 后端对外的 origin，即反向代理那个。渠道服务器要能从它打到 `{基址}/app/pay/channel-notify/{渠道码}` |
-| `PAY_RETURN_URL`（`NETONAPI_PAY_RETURN_URL`） | 用户付完跳回的控制台页面，例如 `https://console.example.com/billing` |
+| `PAY_RETURN_URL`（`NETONAPI_PAY_RETURN_URL`） | 用户付完跳回的控制台页面，例如 `https://example.com/console/payment/billing`（控制台在 `/console` 下） |
 
 **两项留空都不会让支付失败**，但各自退化一处，互不牵连：
 
