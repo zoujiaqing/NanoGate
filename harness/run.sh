@@ -2812,6 +2812,10 @@ stn=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-
 st=$(curl -s --max-time 10 "$U/app/gateway/usage/stats?days=7" -H "Authorization: Bearer $UJWT")
 stv=$(echo "$st" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];m=[x for x in d['byModel'] if x['model']=='m-st'][0];print(d['today']['requests'],m['requests'],m['charged'],d['byToken'][0]['requests'])" 2>/dev/null)
 [ "$stn" = "2" ] && [ "$stv" = "2 2 15000 2" ] && pass "用量汇总：今日 2 次、模型 m-st 2 次/15000、按 Key 2 次" || fail "用量汇总: logs=$stn stats='$stv' body=$(echo "$st" | head -c 300)"
+# 用户自己的调用日志：有扣费，但不能带出内部成本价、渠道与上游实际模型（那些只给运营看）
+lgp=$(curl -s --max-time 10 "$U/app/gateway/usage/log/page?pageNo=1&pageSize=5" -H "Authorization: Bearer $UJWT")
+lgv=$(echo "$lgp" | python3 -c "import sys,json;l=json.load(sys.stdin)['data']['list'][0];print('charged' in l, sorted(k for k in ('cost','channelId','upstreamModel','groupSource') if k in l))" 2>/dev/null)
+[ "$lgv" = "True []" ] && pass "用户调用日志带扣费、不暴露成本价 / 渠道 / 上游模型" || fail "用户日志字段: '$lgv' body=$(echo "$lgp" | head -c 300)"
 
 # ══ S69 控制台自助注册：用户名密码模式必须开着（NetonAPI 在 Main.kt 绑定了 MemberAuthPolicy）══
 echo "[S69] 用户名密码注册"
