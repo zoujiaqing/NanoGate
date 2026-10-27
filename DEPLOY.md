@@ -163,7 +163,9 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 每 1 单位 `pay_orders.price`（法币最小单位，如「分」）发多少 μUSD 额度（1 USD = 1000000 μUSD）。
 
-**不设的后果是充值功能整个不可用**：用户每次下单都拿到 `500 quota recharge is not configured`。
+**不设的后果是在线充值不开通**：充值页只提示「暂未开通在线充值，请联系客户经理为您充值」，直接调接口会拿到
+`503 RECHARGE_UNAVAILABLE`，后端日志记一行 `recharge rejected: online top-up is not configured (set NETONAPI_QUOTA_PER_PRICE_UNIT)`。
+兑换码与管理员发放额度不受影响。
 这是有意的设计 —— 静默按 1:1 发放等于白送钱，而且不会留下任何日志痕迹，所以账务宁可拒绝也不猜汇率。
 没有普适默认值：它取决于你按什么币种定价、以及你想让「1 元」对应多少额度。
 
@@ -304,7 +306,7 @@ OpenAI 形状的错误原样塞给 Anthropic SDK）。
 - [ ] 网关容器的出网已收敛（云元数据服务与内网不可达）——写入时 SSRF 校验挡不住 DNS 重绑定
 - [ ] 为令牌设置 RPM / TPM / 并发上限——不限意味着单个用户就能打爆你的上游配额与成本
 - [ ] 模型定价已配置：**未配定价的模型会被拒绝**（宁可拒绝也不免费放行）
-- [ ] 要收钱就设 `QUOTA_PER_PRICE_UNIT`：**不设则充值功能整个不可用**（用户每次下单都拿到 500）
+- [ ] 要收钱就设 `QUOTA_PER_PRICE_UNIT`：**不设则在线充值不开通**（充值页提示联系客户经理，下单 503 `RECHARGE_UNAVAILABLE`）
 - [ ] 要收真钱就设 `PAY_NOTIFY_BASE` / `PAY_RETURN_URL`（**公网**绝对地址，不是容器内部地址）：
       不设则渠道不回调，到账慢十来分钟、且用户付完回不到你的页面；启动日志 `grep "payment.callback-url"` 能确认生效值
 - [ ] 没设 `PAY_NOTIFY_BASE` 的话，**别停用**后台的 `pay-order-reconcile` 任务：两条到账路径全断 = 钱到账了额度永远不发

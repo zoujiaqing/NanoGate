@@ -1098,7 +1098,7 @@ ratioNow=$(q "SELECT ratio FROM gateway_groups WHERE id=$VIP26")
   || fail "提组入口有洞: /app/gateway/group/update=${appgrp}(期望404) /admin 无凭据=${noauth}(期望401) ratio=${ratioBefore}->${ratioNow}(期望不变)"
 
 
-echo "[S30] 充值入口：汇率没配就拒绝，不静默按 1:1 发额度"
+echo "[S30] 充值入口：汇率没配就拒绝（在线充值未开通），不静默按 1:1 发额度"
 # 此时是清洁启动（S23 起就没带 env），NETONAPI_QUOTA_PER_PRICE_UNIT 未设。
 # 静默 1:1 的后果是「充 100 得 100 μUSD」—— 数字太小看不出问题，而换成 1:1000 的部署
 # 就是白送一千倍额度，且台账上一切正常。所以必须拒绝，而且原因要能查到。
@@ -1107,7 +1107,6 @@ echo "[S30] 充值入口：汇率没配就拒绝，不静默按 1:1 发额度"
 # DbErrorLogWriter）—— 这里连它一起断言：光拒绝不够，运维得能查出是哪个环变量没配。
 nrc0=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 ntx0=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
-nlog0=$(q "SELECT COUNT(*) FROM infra_api_error_logs")
 # 余额用「请求前后不变」而不是绝对值：走到这里 S26(c)/S27 已经真扣过费（共 37500），
 # 写 100000000 等于把前面场景的花费误报成「充值入口漏了额度」。
 balBefore=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -1116,15 +1115,15 @@ r1=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/re
 nrc1=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 ntx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
 bal0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-[ "$r1" = "500" ] && [ "$nrc1" = "$nrc0" ] && [ "$ntx1" = "$ntx0" ] && [ "$bal0" = "$balBefore" ] \
-  && pass "汇率未配 → 500、零意图单(${nrc1})、零发放(${ntx1})、余额未动(${balBefore}->${bal0})" \
-  || fail "缺汇率没有干净拒绝: HTTP=${r1}(期望500) 意图单=${nrc0}->${nrc1} 台账=${ntx0}->${ntx1} 余额=${balBefore}->${bal0}(期望不变) body=$(head -c 160 "$GB")"
-sleep 1   # 错误日志是 logScope.launch 异步写的，不等就会读到旧值
-nlog1=$(q "SELECT COUNT(*) FROM infra_api_error_logs")
-errmsg=$(q "SELECT COALESCE(exception_message,'') FROM infra_api_error_logs ORDER BY id DESC LIMIT 1")
-[ "$nlog1" -gt "$nlog0" ] && grep -q 'NETONAPI_QUOTA_PER_PRICE_UNIT' <<< "$errmsg" \
-  && pass "拒绝的原因落库可查：infra_api_error_logs ${nlog0}->${nlog1} 行，exception_message 指名了缺的环变量" \
-  || fail "拒绝原因不可查: 错误日志 ${nlog0}->${nlog1} 行（若为 0 行则 ErrorLogWriter 未落库）最新一条='${errmsg}'"
+# 没配汇率 = 在线充值未开通：503 + RECHARGE_UNAVAILABLE（控制台据此提示联系客户经理），不是 500
+[ "$r1" = "503" ] && grep -q 'RECHARGE_UNAVAILABLE' "$GB" && [ "$nrc1" = "$nrc0" ] && [ "$ntx1" = "$ntx0" ] && [ "$bal0" = "$balBefore" ] \
+  && pass "汇率未配 → 503 RECHARGE_UNAVAILABLE、零意图单(${nrc1})、零发放(${ntx1})、余额未动(${balBefore}->${bal0})" \
+  || fail "缺汇率没有干净拒绝: HTTP=${r1}(期望503) 意图单=${nrc0}->${nrc1} 台账=${ntx0}->${ntx1} 余额=${balBefore}->${bal0}(期望不变) body=$(head -c 160 "$GB")"
+# 运维查得到原因：后端日志点名缺的环境变量；充值页读的开通状态也是「未开通」
+op30=$(curl -s --max-time 10 "$U/app/gateway/recharge/options" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['online'],d['quotaPerPriceUnit'])" 2>/dev/null)
+grep -q 'recharge rejected: online top-up is not configured (set NETONAPI_QUOTA_PER_PRICE_UNIT)' "$WORK/logs/all.log" && [ "$op30" = "False None" ] \
+  && pass "拒绝原因可查（日志点名 NETONAPI_QUOTA_PER_PRICE_UNIT），充值开通状态 online=false" \
+  || fail "拒绝原因 / 开通状态: 日志$(grep -c 'online top-up is not configured' "$WORK/logs/all.log")条 options='${op30}'(期望 False None)"
 # channelCode 必填：payment 没有「默认渠道」这回事（PayOrderLogic.resolveRoute 收到 null 直接判不可用），
 # 留空只会在下单那步才 400，白白在钱据表里留一张开完就关的单 —— 对账时那是纯噪声。
 r2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
@@ -1140,6 +1139,8 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
 stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
+op31=$(curl -s --max-time 10 "$U/app/gateway/recharge/options" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['online'],d['quotaPerPriceUnit'],d['mock'])" 2>/dev/null)
+[ "$op31" = "True 1000 False" ] && pass "配了汇率：充值开通状态 online=true、汇率 1000、模拟充值关闭" || fail "充值开通状态: '${op31}'(期望 True 1000 False)"
 
 echo "[S31] 在途改会员组映射：按下单时冻结的快照计价"
 # 装配层的 MemberGroupPort 是 `MemberTable.get(userId)?.groupId` —— 每次解析都活读 DB，没缓存。
