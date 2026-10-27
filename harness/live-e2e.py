@@ -349,8 +349,13 @@ check(codes[:2] == [200, 200] and codes[2] == 429, "运营设的每分钟 2 次�
 # 零余额用户：注册（已存在就登录）、建 Key、调用 → 402
 poor_user, poor_pw = "e2epoor", "e2e-poor-pass-9"  # 用户名只允许字母数字下划线
 r = http("POST", f"{ADMIN}/app/auth/register", {"mode": "USERNAME_PASSWORD", "username": poor_user, "password": poor_pw, "nickname": "e2e poor"})
-ptok = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": poor_user, "password": poor_pw}), "poor login")["accessToken"]
+plogin = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": poor_user, "password": poor_pw}), "poor login")
+ptok = plogin["accessToken"]
 pbal = ok_data(app("GET", "/gateway/usage/balance", tok=ptok), "poor balance")
+if pbal["available"] > 0 and plogin.get("userId"):
+    # 上一轮若误拿它当主测用户充过值，先撤回，保证它真的「没钱」
+    admin("POST", "/gateway/quota/revoke", {"userId": int(plogin["userId"]), "amount": pbal["available"], "ref": f"e2e-poor-reset-{int(time.time())}"})
+    pbal = ok_data(app("GET", "/gateway/usage/balance", tok=ptok), "poor balance")
 pk = ok_data(app("POST", "/gateway/token/create", {"name": "e2e-poor", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}, tok=ptok), "poor token")
 pk = pk.get("key") if isinstance(pk, dict) else pk
 s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": f"Bearer {pk}"})
