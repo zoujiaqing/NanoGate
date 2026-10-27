@@ -529,11 +529,14 @@ q "UPDATE gateway_tokens SET allowed_ips='' WHERE key_hash='${TOKEN_HASH}';" >/d
 echo "[S15] /v1/models 与原生认证"
 seed_reset
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
-   ('c-m1','openai_compatible','http://127.0.0.1:9880','default','gpt-4o,gpt-4o-mini',1,1,1,30000,90000,'1.0',0,0,0),
+   ('c-m1','openai_compatible','http://127.0.0.1:9880','default','gpt-4o,gpt-4o-mini,junk-up',1,1,1,30000,90000,'1.0',0,0,0),
    ('c-m2','anthropic','http://127.0.0.1:9880','vip','claude-3-5-sonnet',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
-   ((SELECT id FROM gateway_channels WHERE name='c-m1'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-m2'),'k',1,0,0,0,0);" >/dev/null
+   ((SELECT id FROM gateway_channels WHERE name='c-m1'),'k',1,0,0,0,0),((SELECT id FROM gateway_channels WHERE name='c-m2'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,listed,deleted,created_at,updated_at) VALUES
+   ('gpt-4o','2.5','10','0','0',5000,'manual',1,0,0,0),('gpt-4o-mini','1','1','0','0',5000,'manual',1,0,0,0),('claude-3-5-sonnet','3','15','0','0',5000,'manual',1,0,0,0),('junk-up','1','1','0','0',5000,'import',0,0,0,0);" >/dev/null
 models=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH")
+hasJunk=$(grep -c 'junk-up' <<< "$models")
 has4o=$(echo "$models" | grep -c '"gpt-4o"')
 hasMini=$(echo "$models" | grep -c '"gpt-4o-mini"')
 hasVip=$(echo "$models" | grep -c 'claude-3-5-sonnet')
@@ -541,9 +544,9 @@ hasVip=$(echo "$models" | grep -c 'claude-3-5-sonnet')
 q "UPDATE gateway_tokens SET allowed_models='gpt-4o' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
 narrowed=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH" | grep -c '"gpt-4o-mini"')
 q "UPDATE gateway_tokens SET allowed_models='' WHERE key_hash='${TOKEN_HASH}';" >/dev/null
-[ "$has4o" = "1" ] && [ "$hasMini" = "1" ] && [ "$hasVip" = "0" ] && [ "$narrowed" = "0" ] \
-  && pass "/v1/models 返回可用模型、排除非本组(vip)、遵守令牌白名单" \
-  || fail "/v1/models 错: gpt-4o=${has4o} mini=${hasMini} vip泄漏=${hasVip} 白名单后mini=${narrowed} body=${models}"
+[ "$has4o" = "1" ] && [ "$hasMini" = "1" ] && [ "$hasVip" = "0" ] && [ "$narrowed" = "0" ] && [ "$hasJunk" = "0" ] \
+  && pass "/v1/models 返回可用模型、排除非本组(vip)与未上架(价格库)的、遵守令牌白名单" \
+  || fail "/v1/models 错: gpt-4o=${has4o} mini=${hasMini} vip泄漏=${hasVip} 白名单后mini=${narrowed} 未上架=${hasJunk} body=${models}"
 # 三家原生认证载体都应能通过
 ck=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-api-key: ${TOKEN_PLAINTEXT}")
 gk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-goog-api-key: ${TOKEN_PLAINTEXT}")
@@ -882,6 +885,40 @@ mv1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/models/$cv1" -H "A
 [ -n "$cv1" ] && [ "$pv1" = "<null>" ] && [ "$rv1" = "200" ] && [ "${mv1%% *}" = "True" ] \
   && pass "管理台写法的渠道（Base URL 带 /v1、代理留空）：代理存为空、转发 200、拉模型成功" \
   || fail "管理台写法的渠道: id=${cv1} 代理=${pv1}(期望<null>) 转发=${rv1}(期望200) 拉模型='${mv1}'"
+
+# ══ 模型目录：对外提供哪些模型只由目录（价格行 listed）决定；上游只是线路（docs/model-catalog-design.md）══
+hasm() { curl -s --max-time 10 "$U/app/gateway/model/list" | python3 -c "import sys,json;print(any(m['model']=='$1' for m in json.load(sys.stdin)['data']))" 2>/dev/null; }
+hasv() { curl -s --max-time 10 "$U/v1/models" -H "$AUTH" | python3 -c "import sys,json;print(any(m['id']=='$1' for m in json.load(sys.stdin)['data']))" 2>/dev/null; }
+callm() { curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d "{\"model\":\"$1\",\"messages\":[]}"; }
+pid1=$(q "SELECT id FROM gateway_model_prices WHERE model='m-v1'")
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/gateway/price/listed?id=$pid1&listed=0" -H "Authorization: Bearer $GJ25"
+d1="$(hasm m-v1)/$(hasv m-v1)/$(callm m-v1)"
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/gateway/price/listed?id=$pid1&listed=1" -H "Authorization: Bearer $GJ25"
+u1="$(hasm m-v1)/$(hasv m-v1)/$(callm m-v1)"
+[ "$d1" = "False/False/404" ] && [ "$u1" = "True/True/200" ] \
+  && pass "模型目录：下架 → 模型列表与 /v1/models 都不列、调用 404；上架 → 都可见、调用 200" \
+  || fail "上架 / 下架: 下架='${d1}'(期望 False/False/404) 上架='${u1}'(期望 True/True/200)"
+# 服务上游：给对外模型 m-cat 勾选这条渠道、映射到上游名 m-v1；渠道上原有的 m-v1 不受影响
+q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-cat','1','1','0','0',100,'manual',0,0,0);" >/dev/null
+pre=$(callm m-cat)
+rt=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/channel/model-routes" -H "Authorization: Bearer $GJ25" -H "$CT" -d "{\"model\":\"m-cat\",\"routes\":[{\"channelId\":$cv1,\"upstreamModel\":\"m-v1\"}]}")
+row=$(q "SELECT models||' '||COALESCE(model_mapping,'') FROM gateway_channels WHERE id=$cv1")
+post=$(callm m-cat)
+srv=$(curl -s --max-time 10 "$U/admin/gateway/channel/model-routes?model=m-cat" -H "Authorization: Bearer $GJ25" | python3 -c "import sys,json;r=[x for x in json.load(sys.stdin)['data'] if x['channelId']==$cv1][0];print(r['serving'],r['upstreamModel'])" 2>/dev/null)
+[ "$pre" = "404" ] && [ "$rt" = "200" ] && [ "$row" = 'm-v1,m-cat {"m-cat":"m-v1"}' ] && [ "$post" = "200" ] && [ "$srv" = "True m-v1" ] \
+  && pass "服务上游：勾选渠道并映射上游名 → 渠道服务清单与映射写好（${row}），调用 200；勾选前没有上游 404" \
+  || fail "服务上游: 勾选前=${pre}(期望404) 保存=${rt} 渠道='${row}' 调用=${post}(期望200) 查询='${srv}'(期望 True m-v1)"
+curl -s --max-time 10 -o /dev/null -X PUT "$U/admin/gateway/channel/model-routes" -H "Authorization: Bearer $GJ25" -H "$CT" -d '{"model":"m-cat","routes":[]}'
+row2=$(q "SELECT models||' '||COALESCE(model_mapping,'<null>') FROM gateway_channels WHERE id=$cv1")
+[ "$row2" = "m-v1 <null>" ] && [ "$(callm m-cat)" = "404" ] && pass "取消服务上游：只拿掉该模型与它的映射，渠道上的 m-v1 照旧" || fail "取消服务上游: 渠道='${row2}'(期望 'm-v1 <null>')"
+# 拉取模型只记「支持的模型」，不进服务清单
+curl -s --max-time 15 -o /dev/null -X POST "$U/admin/gateway/channel/models/$cv1" -H "Authorization: Bearer $GJ25" -H "$CT"
+sup=$(q "SELECT (supported_models<>'')::text||' '||models FROM gateway_channels WHERE id=$cv1")
+[ "$sup" = "true m-v1" ] && pass "拉取模型只写支持列表，服务清单不变" || fail "拉取模型: '${sup}'(期望 'true m-v1')"
+# 价源导入新建的价格只进价格库（下架）
+imp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/gateway/price/import" -H "Authorization: Bearer $GJ25" -H "$CT" -d '{"items":[{"model":"m-imported","inputPrice":"1","outputPrice":"1"}],"overwrite":true}')
+ls1=$(q "SELECT listed FROM gateway_model_prices WHERE model='m-imported'")
+[ "$imp" = "200" ] && [ "$ls1" = "0" ] && pass "价源导入新建的价格默认下架（只进价格库）" || fail "导入上架状态: HTTP=${imp} listed=${ls1}(期望0)"
 
 # ════════════════════════════════════════════════════════════════════
 # S26–S34：计费组身份（gateway V002）与充值闭环（gateway V003）

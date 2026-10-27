@@ -127,10 +127,11 @@ CHANNELS = [
     ("e2e-gemini", "gemini", "http://127.0.0.1:19001/v1beta", "gemini-2.5-flash", "chat", 5, "sk-mock-a"),
 ]
 CH_IDS = {}
+# 上游只是线路：建渠道时不带服务清单，由模型目录（下面的「服务上游」）决定谁服务哪个模型
 for name, typ, url, models, caps, prio, key in CHANNELS:
     # 与管理台新建表单提交的同一整包：没填的可选项是空串
     CH_IDS[name] = admin("POST", "/gateway/channel/create", {
-        "name": name, "type": typ, "baseUrl": url, "models": models, "capabilities": caps, "priority": prio, "weight": 1,
+        "name": name, "type": typ, "baseUrl": url, "models": "", "capabilities": caps, "priority": prio, "weight": 1,
         "costSource": "official", "costDiscount": "0.6", "keys": [key], "status": 1, "groups": "default",
         "modelMapping": "", "paramOverride": "", "proxyUrl": "", "apiVersion": "", "providerConfig": "",
         "upstreamPricingFormat": "", "upstreamPricingUrl": "", "upstreamGroupRatio": "1", "upstreamCreditRate": "1", "remark": ""})
@@ -138,17 +139,24 @@ check(True, "建渠道（管理台写法）：OpenAI 兼容 ×2（一条故障�
 for name in ("e2e-openai", "e2e-anthropic", "e2e-gemini"):
     r = admin("POST", f"/gateway/channel/models/{CH_IDS[name]}", {})
     check(r.get("ok") and r.get("models"), f"拉取模型：{name}", f"{r}")
+ch = admin("GET", f"/gateway/channel/get/{CH_IDS['e2e-openai']}")
+check(ch["models"] == "" and "gpt-4o-mini" in ch["supportedModels"].split(","), "拉取模型只记「上游支持」，不并进服务清单", f"{ch['models']!r} {ch['supportedModels'][:80]!r}")
 
 prices = {p["model"]: p for p in admin("GET", "/gateway/price/list")}
 for model, (pin, pout) in PRICES.items():
     # 对话模型配默认输出上限（请求不带 max_tokens 时预扣与转发都用它）；向量模型不配——它不产生输出
     cap = None if model.startswith("text-embedding") else DEFAULT_CAP
-    body = {"model": model, "inputPrice": pin, "outputPrice": pout, "displayName": None, "defaultMaxOutputTokens": cap}
+    body = {"model": model, "inputPrice": pin, "outputPrice": pout, "displayName": None, "defaultMaxOutputTokens": cap, "listed": 1}
     if model in prices:
         admin("PUT", "/gateway/price/update", {**body, "id": prices[model]["id"]})
     else:
         admin("POST", "/gateway/price/create", body)
-check(True, "定价：5 个模型")
+check(True, "定价：5 个模型（上架）")
+for model in PRICES:
+    serving = [CH_IDS[n] for n, _, _, models, *_ in CHANNELS if model in models.split(",")]
+    admin("PUT", "/gateway/channel/model-routes", {"model": model, "routes": [{"channelId": i, "upstreamModel": None} for i in serving]})
+    got = {r["channelId"] for r in admin("GET", f"/gateway/channel/model-routes?model={model}") if r["serving"]}
+    check(got == set(serving), f"服务上游：{model} → {len(serving)} 个渠道", f"{got} vs {serving}")
 
 # ════════════════════════ 用户：登录、充值、建 Key ════════════════════════
 print("[member] 登录、模拟充值、兑换码、建 Key")
@@ -191,7 +199,7 @@ calls = []  # (model, stream)
 
 s, h, b = http("GET", f"{API}/v1/models", headers=OAI)
 ids = [m["id"] for m in (b.get("data") or [])] if isinstance(b, dict) else []
-check(s == 200 and all(m in ids for m in PRICES), "GET /v1/models 列出可用模型", f"{s} {ids}")
+check(s == 200 and set(ids) == set(PRICES), "GET /v1/models 只列上架且有服务上游的模型（不混进上游拉来的）", f"{s} {ids}")
 
 s, h, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, OAI)
 txt = (b.get("choices") or [{}])[0].get("message", {}).get("content", "") if isinstance(b, dict) else ""
