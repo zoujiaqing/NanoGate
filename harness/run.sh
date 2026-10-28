@@ -1184,8 +1184,10 @@ nrc2=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 # 再还原成清洁启动：cleanup 会杀掉进程并 drop 整个库，没有东西会被污染。
 stop_app; boot_app NETONAPI_MEMBER_GROUP_BILLING=true NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
-op31=$(curl -s --max-time 10 "$U/app/gateway/recharge/options" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['online'],d['quotaPerPriceUnit'],d['mock'])" 2>/dev/null)
-[ "$op31" = "True 1000 False" ] && pass "配了汇率：充值开通状态 online=true、汇率 1000、模拟充值关闭" || fail "充值开通状态: '${op31}'(期望 True 1000 False)"
+op31=$(curl -s --max-time 10 "$U/app/gateway/recharge/options" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['online'],d['quotaPerPriceUnit'],'mock' in d)" 2>/dev/null)
+# 模拟充值已整体删除：options 里不再有 mock 字段，用户侧接口也不存在（凭空发额度只能由运营在管理台手动充值）
+mk31=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge/mock" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"amount":1000000}')
+[ "$op31" = "True 1000 False" ] && [ "$mk31" = "404" ] && pass "配了汇率：充值开通状态 online=true、汇率 1000；模拟充值接口不存在(${mk31})" || fail "充值开通状态: '${op31}'(期望 True 1000 False) 模拟充值=${mk31}(期望404)"
 
 echo "[S31] 在途改 Key 的分组：按下单时冻结的快照计价"
 # 计价只看 Key 绑定的分组（BillingGroupResolver.resolve(token)），每次解析都活读 DB。

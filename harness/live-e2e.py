@@ -4,7 +4,7 @@
 上游是部署在服务器本机的模拟厂商（harness/mock-provider.py）：
   mock-a  127.0.0.1:19001  正常，上游 Key sk-mock-a
   mock-b  127.0.0.1:19002  永远 500（故障切换演练），上游 Key sk-mock-b
-后端需开 NETONAPI_ENABLE_MOCK_RECHARGE=true，出站放行 127.0.0.1 与这两个端口。
+后端出站放行 127.0.0.1 与这两个端口。演练账号的额度由管理员手动充值（/admin/gateway/quota/grant）。
 
 环境变量：
   ADMIN_URL（缺省 https://admin.neton.cloud）、API_URL（缺省 https://api.neton.cloud）
@@ -159,12 +159,14 @@ for model in PRICES:
     check(got == set(serving), f"服务上游：{model} → {len(serving)} 个渠道", f"{got} vs {serving}")
 
 # ════════════════════════ 用户：登录、充值、建 Key ════════════════════════
-print("[member] 登录、模拟充值、兑换码、建 Key")
+print("[member] 登录、管理员手动充值、兑换码、建 Key")
 MTOK = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": os.environ["MEMBER_USER"], "password": os.environ["MEMBER_PASSWORD"]}), "member login")["accessToken"]
+uid = next(u["id"] for u in admin("GET", f"/account/user/page?pageNo=1&pageSize=5&username={os.environ['MEMBER_USER']}")["list"] if u.get("username") == os.environ["MEMBER_USER"])
 bal0 = ok_data(app("GET", "/gateway/usage/balance"), "balance")
-r = app("POST", "/gateway/recharge/mock", {"amount": 20_000_000})
+admin("POST", "/gateway/quota/grant", {"userId": uid, "amount": 20_000_000, "ref": f"manual:e2e-{int(time.time())}"})
 bal1 = ok_data(app("GET", "/gateway/usage/balance"), "balance")
-check(r[0] == 200 and bal1["balance"] - bal0["balance"] == 20_000_000, "模拟充值 $20 入账", f"{r[0]} {bal0} → {bal1}")
+mock_gone = app("POST", "/gateway/recharge/mock", {"amount": 1_000_000})[0]
+check(bal1["balance"] - bal0["balance"] == 20_000_000 and mock_gone == 404, "管理员手动充值 $20 入账；用户侧模拟充值接口已不存在", f"{bal0} → {bal1} mock={mock_gone}")
 
 codes = admin("POST", "/gateway/redemption/generate", {"quotaMicro": 5_000_000, "count": 1, "note": "e2e"})
 code = (codes.get("codes") if isinstance(codes, dict) else codes)[0]
@@ -340,7 +342,6 @@ app("PUT", f"/gateway/token/update-status?id={main_id}&status=1")
 s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, OAI)
 check(s == 200, "重新启用后恢复调用", f"{s} {str(b)[:120]}")
 
-uid = next(u["id"] for u in admin("GET", f"/account/user/page?pageNo=1&pageSize=5&username={os.environ['MEMBER_USER']}")["list"] if u.get("username") == os.environ["MEMBER_USER"])
 # 用户自己建 Key，运营在后台给它设每分钟 2 次的限速：第 3 次被拒（后台不能代建 Key）
 created = ok_data(app("POST", "/gateway/token/create", {"name": "e2e-rpm", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}), "create rpm token")
 rkey = created.get("key") if isinstance(created, dict) else created

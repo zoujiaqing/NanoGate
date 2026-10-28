@@ -151,7 +151,7 @@ kotlinx          coroutines 1.11.0 / serialization 1.11.0
   Vertex AI（服务账号换 OAuth token；Anthropic 与 Gemini 两个发布者）；harness 的假上游会用同一套算法重算 SigV4 校验真实签名
 - 运维：/metrics（Prometheus）、定时任务 gateway-channel-probe（5 分钟测速）与 gateway-price-sync（每日价源同步）
 - 用户控制台：注册与登录、我的 Key / 用量账单 / 模型广场 / 用户中心 / 充值与流水
-  （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值保留给联调），typecheck 通过
+  （真实支付：选渠道 → 下单 → 跳转或二维码 → 轮询到账；模拟充值已删除，加额度由运营在管理台手动充值），typecheck 通过
 - 两个前端都有 Dockerfile，compose 里与 Caddy 边缘一起起（管理台与 API 同源 8888、控制台 8880）
 
 ### 验证与 CI

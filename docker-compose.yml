@@ -128,9 +128,6 @@ services:
       NETONAPI_METRICS_TOKEN: ${METRICS_TOKEN:-}
       NETONAPI_PAY_NOTIFY_BASE: ${PAY_NOTIFY_BASE:-}
       NETONAPI_PAY_RETURN_URL: ${PAY_RETURN_URL:-}
-      # 有意**不**在这里暴露 NETONAPI_ENABLE_MOCK_RECHARGE：它让 mock 充值接口凭空发额度
-      # （代码里标着「仅测试环境」）。不写进 compose 不是访问控制 —— 变量照样生效 ——
-      # 而是不把「白送钱」放进官方支持的部署面。真要在沙箱里开，自己往 environment 里加一行。
     ports:
       - "${NETONAPI_PORT:-8800}:8800"
 
