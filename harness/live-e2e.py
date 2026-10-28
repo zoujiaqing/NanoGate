@@ -356,6 +356,9 @@ check(s == 200, "重新启用后恢复调用", f"{s} {str(b)[:120]}")
 created = ok_data(app("POST", "/gateway/token/create", {"name": "e2e-rpm", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}), "create rpm token")
 rkey = created.get("key") if isinstance(created, dict) else created
 admin("PUT", "/gateway/token/update-limits", {"id": created["id"], "rpmLimit": 2, "tpmLimit": None, "concurrencyLimit": None})
+# RPM 按自然分钟计数：3 发若跨过整分钟会全部放行。过了本分钟第 50 秒就等到下一分钟开头再发
+while time.localtime().tm_sec > 50:
+    time.sleep(1)
 codes = [http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": f"Bearer {rkey}"})[0] for _ in range(3)]
 check(codes[:2] == [200, 200] and codes[2] == 429, "运营设的每分钟 2 次限速：第 3 次 429", f"{codes}")
 
