@@ -28,8 +28,8 @@ PRICES = {
     "text-embedding-3-small": ("0.02", "0"),
 }
 DEFAULT_CAP = 4096
-USAGE = {"gpt-4o-mini": (1200, 300), "gpt-4.1": (2000, 500), "claude-sonnet-4": (1500, 400),
-         "gemini-2.5-flash": (1000, 250), "text-embedding-3-small": (64, 0)}
+USAGE = {"gpt-4o-mini": (12, 40), "gpt-4.1": (12, 120), "claude-sonnet-4": (12, 200),
+         "gemini-2.5-flash": (12, 100), "text-embedding-3-small": (4, 0)}
 
 
 def jl(e):
@@ -204,7 +204,7 @@ check(s == 200 and set(ids) == set(PRICES), "GET /v1/models 只列上架且有�
 s, h, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, OAI)
 txt = (b.get("choices") or [{}])[0].get("message", {}).get("content", "") if isinstance(b, dict) else ""
 check(s == 200 and "mock-a" in txt, "OpenAI 非流式 gpt-4o-mini（故障线路失败后切到正常线路）", f"{s} {str(b)[:200]}")
-check(isinstance(b, dict) and b.get("usage", {}).get("prompt_tokens") == 1200 and b["usage"].get("completion_tokens") == 300, "非流式返回的 usage 与上游一致", str(b.get("usage") if isinstance(b, dict) else b))
+check(isinstance(b, dict) and (b.get("usage", {}).get("prompt_tokens"), b["usage"].get("completion_tokens")) == USAGE["gpt-4o-mini"], "非流式返回的 usage 与上游一致", str(b.get("usage") if isinstance(b, dict) else b))
 calls.append(("gpt-4o-mini", False))
 
 s, h, ev = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}, OAI, stream=True)
@@ -214,7 +214,7 @@ calls.append(("gpt-4o-mini", True))
 
 s, h, ev = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4.1", "stream": True, "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": "hi"}]}, OAI, stream=True)
 usage_chunks = [jl(e)["usage"] for e in ev if isinstance(jl(e), dict) and jl(e).get("usage")]
-check(s == 200 and usage_chunks and usage_chunks[-1].get("prompt_tokens") == 2000, "OpenAI 流式带 include_usage：最后一块是用量", f"{s} {usage_chunks}")
+check(s == 200 and usage_chunks and usage_chunks[-1].get("prompt_tokens") == USAGE["gpt-4.1"][0], "OpenAI 流式带 include_usage：最后一块是用量", f"{s} {usage_chunks}")
 calls.append(("gpt-4.1", True))
 
 s, h, b = http("POST", f"{API}/v1/embeddings", {"model": "text-embedding-3-small", "input": ["a", "b"]}, OAI)
@@ -223,7 +223,7 @@ calls.append(("text-embedding-3-small", False))
 
 ANT = {"x-api-key": KEY, "anthropic-version": "2023-06-01"}
 s, h, b = http("POST", f"{API}/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}, ANT)
-check(s == 200 and isinstance(b, dict) and "mock-a" in json.dumps(b.get("content")) and b.get("usage", {}).get("input_tokens") == 1500, "Anthropic 非流式 claude-sonnet-4", f"{s} {str(b)[:200]}")
+check(s == 200 and isinstance(b, dict) and "mock-a" in json.dumps(b.get("content")) and b.get("usage", {}).get("input_tokens") == USAGE["claude-sonnet-4"][0], "Anthropic 非流式 claude-sonnet-4", f"{s} {str(b)[:200]}")
 calls.append(("claude-sonnet-4", False))
 s, h, ev = http("POST", f"{API}/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 256, "stream": True, "messages": [{"role": "user", "content": "hi"}]}, ANT, stream=True)
 types = [jl(e).get("type") for e in ev if isinstance(jl(e), dict)]
@@ -232,7 +232,7 @@ calls.append(("claude-sonnet-4", True))
 
 GEM = {"x-goog-api-key": KEY}
 s, h, b = http("POST", f"{API}/v1beta/models/gemini-2.5-flash:generateContent", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}, GEM)
-check(s == 200 and isinstance(b, dict) and "mock-a" in json.dumps(b.get("candidates")) and b.get("usageMetadata", {}).get("promptTokenCount") == 1000, "Gemini 非流式 gemini-2.5-flash", f"{s} {str(b)[:200]}")
+check(s == 200 and isinstance(b, dict) and "mock-a" in json.dumps(b.get("candidates")) and b.get("usageMetadata", {}).get("promptTokenCount") == USAGE["gemini-2.5-flash"][0], "Gemini 非流式 gemini-2.5-flash", f"{s} {str(b)[:200]}")
 calls.append(("gemini-2.5-flash", False))
 s, h, ev = http("POST", f"{API}/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}, GEM, stream=True)
 gtext = "".join(p.get("text", "") for e in ev if isinstance(jl(e), dict) for c in jl(e).get("candidates", []) for p in c.get("content", {}).get("parts", []))
@@ -252,7 +252,8 @@ LIM = {"Authorization": f"Bearer {LKEY}"}
 s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4.1", "messages": [{"role": "user", "content": "hi"}]}, LIM)
 check(s in (400, 403, 404), "Key 不允许的模型 → 拒绝", f"{s} {str(b)[:120]}")
 limited_ok, limited_codes = 0, []
-for _ in range(6):
+# 用量真实后每发只扣几十 μUSD，$0.001 的额度要几十发才用完：给足次数，断言最终被拒
+for _ in range(80):
     s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 300, "messages": [{"role": "user", "content": "hi"}]}, LIM)
     limited_codes.append(s)
     if s == 200:
@@ -325,8 +326,8 @@ out = json.dumps(b.get("output") if isinstance(b, dict) else b)
 check(s == 200 and "mock-a" in out, "Responses 接口 /v1/responses", f"{s} {str(b)[:200]}")
 time.sleep(2)
 rl = ok_data(app("GET", "/gateway/usage/log/page?pageNo=1&pageSize=1"), "logs")["list"][0]
-want = micro(SALE["gpt-4o-mini"][0], 1200) + micro(SALE["gpt-4o-mini"][1], 300)
-check(rl["requestModel"] == "gpt-4o-mini" and (rl["promptTokens"], rl["completionTokens"]) == (1200, 300) and abs(rl["charged"] - want) <= 1,
+want = micro(SALE["gpt-4o-mini"][0], USAGE["gpt-4o-mini"][0]) + micro(SALE["gpt-4o-mini"][1], USAGE["gpt-4o-mini"][1])
+check(rl["requestModel"] == "gpt-4o-mini" and (rl["promptTokens"], rl["completionTokens"]) == USAGE["gpt-4o-mini"] and abs(rl["charged"] - want) <= 1,
       "Responses 调用按 input/output tokens 正确计费", f"{rl.get('promptTokens')}/{rl.get('completionTokens')} charged={rl.get('charged')} want={want}")
 s, _, b = http("POST", f"{API}/v1/messages", {"model": "gemini-2.5-flash", "max_tokens": 128, "messages": [{"role": "user", "content": "hi"}]}, ANT)
 check(s == 200 and "mock-a" in json.dumps(b.get("content") if isinstance(b, dict) else b), "跨协议：用 Anthropic 格式调 Gemini", f"{s} {str(b)[:200]}")
@@ -380,7 +381,7 @@ time.sleep(4)
 new_logs = [l for l in ok_data(app("GET", "/gateway/usage/log/page?pageNo=1&pageSize=50"), "logs")["list"] if l["id"] > top_id]
 after = ok_data(app("GET", "/gateway/usage/balance"), "balance")
 spent = sum(l["charged"] for l in new_logs)
-each = micro(SALE["gpt-4o-mini"][0], 1200) + micro(SALE["gpt-4o-mini"][1], 300)
+each = micro(SALE["gpt-4o-mini"][0], USAGE["gpt-4o-mini"][0]) + micro(SALE["gpt-4o-mini"][1], USAGE["gpt-4o-mini"][1])
 check(len(new_logs) == 20 and all(l["charged"] == each for l in new_logs), f"并发 20 条日志、每条扣 {each} μUSD", f"{len(new_logs)} {[l['charged'] for l in new_logs][:5]}")
 check(before["balance"] - after["balance"] == spent and after["reserved"] == 0, "并发后余额减少 = 扣费合计，预留归零", f"{before} → {after} spent={spent}")
 

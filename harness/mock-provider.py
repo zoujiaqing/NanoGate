@@ -19,21 +19,36 @@ EXPECT_KEY = os.environ.get("EXPECT_KEY", "")
 FAIL = os.environ.get("FAIL", "") == "1"
 
 # 模型 → (输入 tokens, 输出 tokens, 缓存读 tokens)。未列出的模型用 DEFAULT。
+# 固定用量，但要像真上游一样可信：输入 token 不超过请求字节数（演练里最小的请求约 37 字节），
+# 输出不超过请求的输出上限（见 output_cap）。不可信的用量（几十字节的请求报 1200 输入 token）会让每笔结算
+# 都超出网关的保守预留、刷出 settlement OVERAGE 告警 —— 那是上游在乱报，正式环境里不该被演练流量淹没。
 USAGE = {
-    "gpt-4o-mini": (1200, 300, 0),
-    "gpt-4.1": (2000, 500, 0),
-    "claude-sonnet-4": (1500, 400, 0),
-    "gemini-2.5-flash": (1000, 250, 0),
-    "text-embedding-3-small": (64, 0, 0),
+    "gpt-4o-mini": (12, 40, 0),
+    "gpt-4.1": (12, 120, 0),
+    "claude-sonnet-4": (12, 200, 0),
+    "gemini-2.5-flash": (12, 100, 0),
+    "text-embedding-3-small": (4, 0, 0),
 }
-DEFAULT = (100, 50, 0)
+DEFAULT = (8, 20, 0)
 
 _lock = threading.Lock()
 _stats = {"hits": {}, "last": {}}
 
 
-def usage_of(model):
-    return USAGE.get(model, DEFAULT)
+def output_cap(body):
+    """请求里的输出上限（OpenAI / Responses / Anthropic / Gemini 四种写法）；没写 = None。"""
+    body = body or {}
+    for k in ("max_completion_tokens", "max_tokens", "max_output_tokens"):
+        if isinstance(body.get(k), int):
+            return body[k]
+    v = (body.get("generationConfig") or {}).get("maxOutputTokens")
+    return v if isinstance(v, int) else None
+
+
+def usage_of(model, body=None):
+    pin, pout, pcache = USAGE.get(model, DEFAULT)
+    cap = output_cap(body)
+    return pin, (min(pout, cap) if cap is not None else pout), pcache
 
 
 def reply_text(model):
@@ -150,13 +165,13 @@ class H(BaseHTTPRequestHandler):
                 self._send(401, {"error": {"code": 401, "message": "API key not valid", "status": "UNAUTHENTICATED"}}); return
             if FAIL:
                 self._send(500, {"error": {"code": 500, "message": f"{NAME} is down", "status": "INTERNAL"}}); return
-            return self._gemini(m.group(1), stream=m.group(2) == "streamGenerateContent")
+            return self._gemini(m.group(1), stream=m.group(2) == "streamGenerateContent", body=body)
         self._send(404, {"error": {"message": f"no route {u.path}"}})
 
     # ── OpenAI ──
     def _openai_chat(self, body):
         model = body.get("model", "")
-        pin, pout, pcache = usage_of(model)
+        pin, pout, pcache = usage_of(model, body)
         text = reply_text(model)
         usage = {"prompt_tokens": pin, "completion_tokens": pout, "total_tokens": pin + pout,
                  "prompt_tokens_details": {"cached_tokens": pcache}}
@@ -181,7 +196,7 @@ class H(BaseHTTPRequestHandler):
     def _openai_responses(self, body):
         """OpenAI Responses API（非流式）：output 里一条 assistant 消息，usage 用 input_tokens / output_tokens。"""
         model = body.get("model", "")
-        pin, pout, pcache = usage_of(model)
+        pin, pout, pcache = usage_of(model, body)
         self._send(200, {"id": f"resp_{NAME}_{int(time.time() * 1000)}", "object": "response", "created_at": int(time.time()),
                          "status": "completed", "model": model,
                          "output": [{"type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
@@ -191,7 +206,7 @@ class H(BaseHTTPRequestHandler):
 
     def _openai_embeddings(self, body):
         model = body.get("model", "")
-        pin = usage_of(model)[0]
+        pin = usage_of(model, body)[0]
         inputs = body.get("input")
         n = len(inputs) if isinstance(inputs, list) else 1
         self._send(200, {"object": "list", "model": model,
@@ -201,7 +216,7 @@ class H(BaseHTTPRequestHandler):
     # ── Anthropic ──
     def _anthropic(self, body):
         model = body.get("model", "")
-        pin, pout, pcache = usage_of(model)
+        pin, pout, pcache = usage_of(model, body)
         text = reply_text(model)
         mid = f"msg_{NAME}_{int(time.time() * 1000)}"
         if not body.get("stream"):
@@ -221,8 +236,8 @@ class H(BaseHTTPRequestHandler):
         self._sse({"type": "message_stop"}, "message_stop")
 
     # ── Gemini ──
-    def _gemini(self, model, stream):
-        pin, pout, pcache = usage_of(model)
+    def _gemini(self, model, stream, body=None):
+        pin, pout, pcache = usage_of(model, body)
         text = reply_text(model)
         usage = {"promptTokenCount": pin, "candidatesTokenCount": pout, "totalTokenCount": pin + pout, "cachedContentTokenCount": pcache}
         if not stream:
