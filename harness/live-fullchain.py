@@ -119,7 +119,7 @@ try:
         log = latest_log()
         want = micro_cost(log["promptTokens"], pin) + micro_cost(log["completionTokens"], pout)
         tokens_ok = usage_in is None or (log["promptTokens"], log["completionTokens"]) == (usage_in, usage_out)
-        check(log["requestModel"] == MODEL and log["status"] == "success" and tokens_ok and abs(log["charged"] - want) <= 1,
+        check(log["requestModel"] == MODEL and log["status"] == "ok" and tokens_ok and abs(log["charged"] - want) <= 1,
               f"{name}：tokens {log['promptTokens']}+{log['completionTokens']}、扣费 {log['charged']} μUSD（期望 {want}）",
               f"log={ {k: log.get(k) for k in ('requestModel','status','promptTokens','completionTokens','charged')} } upstream usage={usage_in}/{usage_out}")
         spent += log["charged"]

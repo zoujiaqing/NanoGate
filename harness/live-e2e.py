@@ -245,6 +245,16 @@ s, h, b = http("POST", f"{API}/v1/chat/completions", {"model": "claude-sonnet-4"
 check(s == 200 and isinstance(b, dict) and "mock-a" in json.dumps(b.get("choices")), "跨协议：用 OpenAI 格式调 Claude", f"{s} {str(b)[:200]}")
 calls.append(("claude-sonnet-4", False))
 
+# Anthropic 格式调 OpenAI 渠道上的模型：请求体转成 Chat 格式后，路径也必须是上游的 /v1/chat/completions
+# （以前沿用入站的 /v1/messages，真实 new-api 上游回「该分组下模型暂无可用渠道」；模拟上游对路径宽松，靠统计核对）
+hits0 = (mock_stats(19001) or {}).get("hits", {})
+s, h, b = http("POST", f"{API}/v1/messages", {"model": "gpt-4o-mini", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}, ANT)
+hits1 = (mock_stats(19001) or {}).get("hits", {})
+path_ok = not os.environ.get("MOCK_STATS_CMD") or (hits1.get("/v1/chat/completions", 0) > hits0.get("/v1/chat/completions", 0) and hits1.get("/v1/messages", 0) == hits0.get("/v1/messages", 0))
+check(s == 200 and isinstance(b, dict) and b.get("type") == "message" and "mock-a" in json.dumps(b.get("content")) and path_ok,
+      "跨协议：用 Anthropic 格式调 OpenAI 渠道的模型，上游收到的是 /v1/chat/completions", f"{s} {str(b)[:160]} hits {hits0} → {hits1}")
+calls.append(("gpt-4o-mini", False))
+
 print("[deny] 拒绝路径")
 s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": "Bearer sk-not-a-real-key"})
 check(s == 401, "无效 Key → 401", f"{s} {str(b)[:120]}")

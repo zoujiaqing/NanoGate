@@ -483,6 +483,9 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-rl'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-rl','0','0','0','0',100,5000,'manual',0,0,0);
    UPDATE gateway_tokens SET rpm_limit=3 WHERE key_hash='${TOKEN_HASH}';" >/dev/null
+# RPM 按自然分钟计数（RateLimiter.windowOf = now / 60000）：5 发若跨过整分钟，计数归零、5 发全 200。
+# 过了本分钟第 45 秒就等到下一分钟开头再发，免得场景偶发失败。
+while [ "$((10#$(date +%S)))" -gt 45 ]; do sleep 1; done
 codes=""
 for i in 1 2 3 4 5; do
   c=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-rl","messages":[]}')
@@ -869,11 +872,13 @@ kf=$(q "SELECT COALESCE(SUM(fail_count),0) FROM gateway_channel_keys k JOIN gate
 probe=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-meta)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 palias=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/probe/$(CID s25b-alias)" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 refused=$(grep -c "relay target refused" "$WORK/logs/all.log")
-[ "$blocked" = "503" ] && grep -q "UPSTREAM_URL_PRIVATE_ADDRESS" <<< "$bbody" && [ "$okc" = "200" ] && [ "$kf" = "0" ] \
+# 拦截原因（UPSTREAM_URL_PRIVATE_ADDRESS）是我们自己渠道的配置问题：只进日志，回给调用方的只有 no_available_channel
+logcode=$(grep "relay target refused" "$WORK/logs/all.log" | grep -c "UPSTREAM_URL_PRIVATE_ADDRESS")
+[ "$blocked" = "503" ] && grep -q "no_available_channel" <<< "$bbody" && ! grep -q "UPSTREAM_URL" <<< "$bbody" && [ "${logcode:-0}" -ge 1 ] && [ "$okc" = "200" ] && [ "$kf" = "0" ] \
   && grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' <<< "$probe" && grep -q '"errorCode":"UPSTREAM_URL_PRIVATE_ADDRESS"' <<< "$palias" \
   && [ "$refused" -ge 2 ] \
   && pass "请求时拒绝 localhost 别名与 169.254.169.254（503、Key 不计失败、探测 errorCode=UPSTREAM_URL_PRIVATE_ADDRESS）；放行的 127.0.0.1 照常 200" \
-  || fail "请求时出站校验错: 拦截=${blocked}(期望503) body=${bbody:0:200} 放行=${okc}(期望200) Key失败=${kf}(期望0) 探测=${probe:0:200} 别名探测=${palias:0:200} 日志拒绝条数=${refused}"
+  || fail "请求时出站校验错: 拦截=${blocked}(期望503，body 只有 no_available_channel、不含内部拦截码；日志里的拦截码 ${logcode} 条) body=${bbody:0:200} 放行=${okc}(期望200) Key失败=${kf}(期望0) 探测=${probe:0:200} 别名探测=${palias:0:200} 日志拒绝条数=${refused}"
 # 运营在管理台建渠道的真实写法：Base URL 照 OpenAI SDK 带 /v1、代理等可选项留空（表单提交 ""）。
 # 曾经 ""代理被当成非法代理地址、/v1 又被拼成 /v1/v1，这样的渠道拉模型与转发全部失败（2026-10-27 线上）
 GJ25=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
