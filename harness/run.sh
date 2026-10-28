@@ -1005,7 +1005,7 @@ VIP26=$(GID vip26)
 
 # (a) 令牌覆盖指向不存在的 code。修复前这里是 `?: "default"`：请求照常放行、按 default 计价，
 #     而运营以为自己给这个令牌配了 vip 价 —— 差额不会出现在任何日志里。
-q "UPDATE gateway_tokens SET group_override='ghost26' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override='ghost26', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 ca=$(relay26); sleep 1
 na=$(q "SELECT COUNT(*) FROM gateway_settlements")
 da=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -1014,7 +1014,7 @@ da=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
   || fail "缺目标组未拒绝: code=${ca}(期望500) body=$(head -c 160 "$GB") settlement=${na} balanceΔ=${da}"
 
 # (b) default 组本身缺失：最后一级也不能回落，只能拒绝
-q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';
    UPDATE gateway_groups SET deleted=1 WHERE code='default';" >/dev/null
 cb=$(relay26); sleep 1
 nb=$(q "SELECT COUNT(*) FROM gateway_settlements")
@@ -1032,7 +1032,7 @@ sc26=$(charged26)
   || fail "开关未门控: code=${cc} charged=${sc26}(期望7500，即 default 组 ratio 1.0)"
 
 echo "[S27] 计费组：改显示名不动路由与计价，code 不可变"
-q "UPDATE gateway_tokens SET group_override='vip26' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override='vip26', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 c0=$(relay26); sleep 1; s0=$(charged26)
 ren=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/group/update" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"id\":$VIP26,\"name\":\"贵宾二十六\",\"ratio\":\"2.0\"}")
@@ -1074,7 +1074,7 @@ gone=$(q "SELECT deleted FROM gateway_groups WHERE id=$DEL26")
 # 409 是对的，原因却不是：把用户级例外那个 if 整块删掉，这条也照样绿。它此前正是这个状态
 # （S27 把令牌的 group_override 设成 vip26 后一直没清，d1 与 d2 因此都在证明同一件事）。
 # 于是每一发只留一类引用，并断言 409 的 message **点名**是哪一类 —— 点名才是真守卫。
-q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 
 # (1) 只剩用户级例外。走管理端 API 建（写路径本身由 S48 覆盖），要的是「生产上真会出现的那种引用」，
 #     而不是一行手写 SQL —— 手写 SQL 正是悬空 group_code 的来源。
@@ -1086,11 +1086,11 @@ a1=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
 rm28=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/group-override/delete/1" -H "Authorization: Bearer $GJWT")
 
 # (2) 只剩令牌覆盖
-q "UPDATE gateway_tokens SET group_override='vip26' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override='vip26', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 d2=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
 m2=$(head -c 300 "$GB" 2>/dev/null)
 a2=$(q "SELECT deleted FROM gateway_groups WHERE id=$VIP26")
-q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 
 # (3) 只剩渠道 CSV（c-grp 的 groups 一直是 'default,vip26'）
 d3=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X DELETE "$U/admin/gateway/group/delete/$VIP26" -H "Authorization: Bearer $GJWT")
@@ -1107,7 +1107,8 @@ p3=$(printf '%s' "$m3" | grep -c '"message":"GROUP_IN_USE_BY_CHANNEL"')
   || fail "删除保护没分开证明: 建例外=${c28}(期望200) 撤例外=${rm28}(期望200) 例外=${d1}(期望409)/deleted=${a1}/点名=${p1}(期望1) 令牌=${d2}(期望409)/deleted=${a2}/点名=${p2}(期望1) 渠道=${d3}(期望409)/deleted=${a3}/点名=${p3}(期望1) m1=${m1:0:110} m2=${m2:0:110} m3=${m3:0:110}"
 
 echo "[S29] 用户不能自行提组"
-# 自助建 Key 的 DTO（CreateMyTokenRequest）里没有 groupOverride 字段，TokenLogic.issue 也不收这个参数。
+# 用户建 Key 时可以选分组（group），但只能在对他开放的范围里选（default + 用户可选 + 单独开通的）；
+# 运营指定用的 groupOverride / groupAssigned 不在自助 DTO 里。
 # 这里不断言注入请求的响应码：@Body 目前用默认 Json 解码（ignoreUnknownKeys=false），所以多塞
 # 一个键会被直接 400；但那是框架的解码宽严，不是本场景要守的东西 —— 哪天有人为兼容客户端
 # 放宽了它，提组依然必须失败。所以只断言不变量：无论注入请求结局如何，自助路径写不进
@@ -1123,6 +1124,13 @@ go=$(q "SELECT COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$T
 [ "$leak" = "0" ] && [ -n "$TID" ] && [ "$go" = "<null>" ] \
   && pass "自助建 Key 提不了组：注入请求 HTTP=${inj} 且零泄漏行，干净请求建出令牌 ${TID} 的 group_override=${go}" \
   || fail "用户能自行提组: 泄漏行=${leak}(期望0) 干净建Key id=${TID} group_override=${go}(期望 <null>) 注入HTTP=${inj} body=$(head -c 200 "$GB")"
+# 选一个不对他开放的分组（vip26 不是「用户可选」、也没单独开通给他）→ 400 TOKEN_GROUP_NOT_ALLOWED，一行不写
+sel=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $UJWT" -H "$CT" \
+  -d '{"name":"s29sel","group":"vip26"}')
+selrows=$(q "SELECT COUNT(*) FROM gateway_tokens WHERE name='s29sel'")
+[ "$sel" = "400" ] && grep -q TOKEN_GROUP_NOT_ALLOWED "$GB" && [ "$selrows" = "0" ] \
+  && pass "自助建 Key 选不对自己开放的分组：HTTP=${sel} TOKEN_GROUP_NOT_ALLOWED、零写入" \
+  || fail "用户选到了不对他开放的分组: HTTP=${sel}(期望400) 行数=${selrows}(期望0) body=$(head -c 200 "$GB")"
 # 组管理只在 admin 组：app 组没有这条路由，且 admin 路由不带凭据必须拒
 ratioBefore=$(q "SELECT ratio FROM gateway_groups WHERE id=$VIP26")
 appgrp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/group/update" -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"id\":$VIP26,\"name\":\"x\",\"ratio\":\"0.1\"}")
@@ -1179,17 +1187,19 @@ GJWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{
 op31=$(curl -s --max-time 10 "$U/app/gateway/recharge/options" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['online'],d['quotaPerPriceUnit'],d['mock'])" 2>/dev/null)
 [ "$op31" = "True 1000 False" ] && pass "配了汇率：充值开通状态 online=true、汇率 1000、模拟充值关闭" || fail "充值开通状态: '${op31}'(期望 True 1000 False)"
 
-echo "[S31] 在途改会员组映射：按下单时冻结的快照计价"
-# 装配层的 MemberGroupPort 是 `MemberTable.get(userId)?.groupId` —— 每次解析都活读 DB，没缓存。
-# 所以本场景真的能测到东西：如果结算重查组，中途改成 ratio 5.0 的组就会把 15000 变成 37500。
-# S17 测的是「在途改模型价/改 default 组倍率」，这里测的是「在途换掉用户所属的组」—— 另一条路径。
+echo "[S31] 在途改 Key 的分组：按下单时冻结的快照计价"
+# 计价只看 Key 绑定的分组（BillingGroupResolver.resolve(token)），每次解析都活读 DB。
+# 所以本场景真的能测到东西：如果结算重查组，中途把 Key 换到 ratio 5.0 的组就会把 15000 变成 37500。
+# Key 先绑 vip26 且是**用户自选**（group_assigned=0）：vip26 不对所有人开放，用户能选它全靠会员组 9926 的映射
+# —— 顺带证明「会员组映射 = 可选范围」这条在开关打开时真的生效。在途换组用运营指定（hot31 不对他开放）。
+# S17 测的是「在途改模型价/改 default 组倍率」，这里测的是「在途换掉 Key 的分组」—— 另一条路径。
 seed_reset; fake slowok 9932; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-snap31','openai_compatible','http://127.0.0.1:9932','default,vip26,hot31','m-snap31',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-snap31'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-snap31','2.5','10','0','0',5000,'manual',0,0,0);
    INSERT INTO member_groups (id,name,status,created_at,updated_at) VALUES (9927,'热点会员组',1,0,0) ON CONFLICT (id) DO NOTHING;
    UPDATE member_profiles SET group_id=9926 WHERE user_id=1;
-   UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+   UPDATE gateway_tokens SET group_override='vip26', group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 # 组与映射走管理端 API 建（而不是直插 SQL）：顺便让 requireMappingFree 与会员组列真的跑一遍
 hot=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"code":"hot31","name":"热点三十一","ratio":"5.0","memberGroupId":9927}')
@@ -1205,16 +1215,16 @@ else
   # 在途改组：上游 2s 慢响应，sleep 1 后请求必然已预留、未结算
   ( relay31 >/tmp/s31-code-$$ ) & CURL31=$!
   sleep 1
-  q "UPDATE member_profiles SET group_id=9927 WHERE user_id=1" >/dev/null
+  q "UPDATE gateway_tokens SET group_override='hot31', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
   wait "$CURL31"; sleep 1
   ci=$(cat /tmp/s31-code-$$ 2>/dev/null); rm -f /tmp/s31-code-$$
   si=$(charged31)
   # 对照二：变更生效后的**新**请求按 hot31 的 5.0 收 37500。这一发是关键：
-  # 没它就无法区分「快照真的冻结了」与「会员组映射根本没生效」（后者也会停在 15000）。
+  # 没它就无法区分「快照真的冻结了」与「换组根本没生效」（后者也会停在 15000）。
   c2=$(relay31); sleep 1; s2=$(charged31)
-  q "UPDATE member_profiles SET group_id=9926 WHERE user_id=1" >/dev/null   # 还原，不污染后续场景
+  q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null   # 还原，不污染后续场景
   [ "$c0" = "200" ] && [ "$s0" = "15000" ] && [ "$ci" = "200" ] && [ "$si" = "15000" ] && [ "$c2" = "200" ] && [ "$s2" = "37500" ] \
-    && pass "在途改会员组不改本次计价：改前=${s0} 在途=${si}（仍按 vip26 的 2.0）改后新请求=${s2}（按 hot31 的 5.0）" \
+    && pass "在途改 Key 的分组不改本次计价：改前=${s0}（会员组映射放行的自选 vip26，2.0）在途=${si}（仍按 2.0）改后新请求=${s2}（按 hot31 的 5.0）" \
     || fail "在途改组影响了计价: 改前=${c0}/${s0}(期望200/15000) 在途=${ci}/${si}(期望200/15000) 改后=${c2}/${s2}(期望200/37500)"
 fi
 
@@ -1359,9 +1369,10 @@ ngtx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='wallet:rech
   && pass "钱包充值 200 只进钱包（pay_wallets.balance=${wbal}）：网关充值单 ${nrc34}→${nrc34b}、网关余额仍 ${gbal34b}、台账无以 wallet: 为 ref 的记录" \
   || fail "两个账本串了: 建单=${w1} 发起=${w2} 回调=${w3} 钱包pay_status=${wps}(期望1) 钱包余额=${wbal}(期望200) 网关充值单=${nrc34}->${nrc34b} 网关余额=${gbal34}->${gbal34b} wallet前缀台账=${ngtx}(期望0)"
 
-echo "[S35] 会员组没配计费组 → 403，且 5xx/4xx 的日志级别分得开"
-# 解析第 3 层的拒绝：member_profiles.group_id 命中了，但没有 gateway_groups.member_group_id 指向它。
-# 这是部署决策（这批用户没开通），不是故障 —— 配置不变就永远 403，回 5xx 客户端会一直重试撞墙，
+echo "[S35] Key 自选的分组不再对用户开放 → 403，且 5xx/4xx 的日志级别分得开"
+# Key 绑着用户自选的 vip26（group_assigned=0），而 vip26 不对所有人开放、只经会员组 9926 的映射开给他。
+# 把他挪到没映射的会员组 9999 = 收回了这个分组：这把 Key 必须立即 403，而不是继续按 vip26 的价计费。
+# 这是运营决策，不是故障 —— 配置不变就永远 403，回 5xx 客户端会一直重试撞墙，
 # 与 RelayEngine 里 no_candidate 非 retryable 走 404 是同一条标准（见 GroupReject 的 KDoc）。
 # 拒绝走 respondError、不抛异常，所以框架那条「5xx → 落 infra_api_error_logs」的路径不可达，
 # 日志级别就是运营唯一的告警面 —— 于是级别本身要锁：5xx 类必须 ERROR，403 必须留 WARN。
@@ -1371,10 +1382,11 @@ echo "[S35] 会员组没配计费组 → 403，且 5xx/4xx 的日志级别分得
 # 这不是疏漏 —— resolve 在 RelayEngine 里排在选渠道之前（:97 vs :125），拒绝必然先发生。但只有
 # 403 一条断言的话，「403 只是环境反正跑不通的副产品」这个可能排除不掉（S29 犯过同类错）。
 # 所以补一个对照组：把映射还原后同一发请求必须**换个失败原因**，证明解析这一层已经放行、
-# 403 确实由 group_id=9999 造成，而不是普遍坏掉。对照组的期望值是 **503 no_available_channel**
+# 403 确实由 group_id=9999 造成（收回了可选范围），而不是普遍坏掉。对照组的期望值是 **503 no_available_channel**
 # 而不是 404：渠道表为空时 noCandidateReason 第一层就返回 NO_CHANNEL_ENABLED，而它的
 # retryable=true（渠道全下线是运维态、可能自行恢复，与「模型根本没配」不同）。
-q "UPDATE member_profiles SET group_id=9999 WHERE user_id=1" >/dev/null
+q "UPDATE member_profiles SET group_id=9999 WHERE user_id=1;
+   UPDATE gateway_tokens SET group_override='vip26', group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 na=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
   -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
 nabody=$(grep -c "billing_group_not_allowed" "$GB")
@@ -1382,6 +1394,7 @@ q "UPDATE member_profiles SET group_id=9926 WHERE user_id=1" >/dev/null
 ctl=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" \
   -H "$AUTH" -H "$CT" -d '{"model":"m-snap31","messages":[]}')
 ctlbody=$(grep -c "no_available_channel" "$GB")
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 sleep 1   # 日志异步落盘，与 S30 等错误日志同理
 loglvl() { grep "reason=$1" "$WORK/logs/all.log" 2>/dev/null | tail -1 | grep -oE " (ERROR|WARN|INFO) " | tr -d ' '; }
 nalvl=$(loglvl NOT_ALLOWED)
@@ -1389,8 +1402,8 @@ cblvl=$(loglvl CONFIG_BROKEN)
 cbn=$(grep -c "reason=CONFIG_BROKEN" "$WORK/logs/all.log" 2>/dev/null)
 [ "$na" = "403" ] && [ "$nabody" = "1" ] && [ "$ctl" = "503" ] && [ "$ctlbody" = "1" ] \
   && [ "$nalvl" = "WARN" ] && [ "$cblvl" = "ERROR" ] && [ "${cbn:-0}" -ge 2 ] \
-  && pass "会员组未映射 → 403 billing_group_not_allowed（对照：映射还原后同一发变 503 no_available_channel，已走到选渠道阶段，证明拒绝出自解析层）；告警级别分得开：NOT_ALLOWED=${nalvl}、CONFIG_BROKEN=${cblvl}(${cbn} 行)" \
-  || fail "未映射会员组的处置不对: HTTP=${na}(期望403) body命中=${nabody}(期望1) 对照组=${ctl}(期望503)/${ctlbody}(期望1) NOT_ALLOWED级别=${nalvl}(期望WARN) CONFIG_BROKEN级别=${cblvl}(期望ERROR，${cbn:-0}行)"
+  && pass "Key 自选的分组被收回（会员组挪到未映射组）→ 403 billing_group_not_allowed（对照：会员组还原后同一发变 503 no_available_channel，已走到选渠道阶段，证明拒绝出自分组复核）；告警级别分得开：NOT_ALLOWED=${nalvl}、CONFIG_BROKEN=${cblvl}(${cbn} 行)" \
+  || fail "收回分组后的处置不对: HTTP=${na}(期望403) body命中=${nabody}(期望1) 对照组=${ctl}(期望503)/${ctlbody}(期望1) NOT_ALLOWED级别=${nalvl}(期望WARN) CONFIG_BROKEN级别=${cblvl}(期望ERROR，${cbn:-0}行)"
 
 echo "[S36] 兑换码：生成 → 兑换 → 入账，重复兑换只入一次"
 # 台账的 type='redeem' 与「ref = 兑换码」从 V001 起就预留着，此前没有任何代码会产生这种记录。
@@ -1818,7 +1831,7 @@ k3=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b3" && k3=yes
 
 rm -f "$GB"
 
-echo "[S48] 用户级计价例外：管理端能写、写了真的改变计价，悬空组写不进去"
+echo "[S48] 用户专属分组：管理端能开通、开通后用户可选、绑上才改计价、收回即 403，悬空组写不进去"
 # 这一条补的是两层空白：
 #   ① 写路径此前**根本不存在** —— gateway_group_overrides 只有 SQL + 表对象 + 解析器第 2 步的读，
 #      运营要给人配谈判价只能手工改库，而手工改库正是悬空 group_code 的来源。
@@ -1845,7 +1858,7 @@ q "INSERT INTO account_users (id,nickname,status,deleted,created_at,updated_at) 
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
    UPDATE gateway_groups SET deleted=0, ratio='1.0' WHERE code='default';
    DELETE FROM gateway_group_overrides WHERE user_id IN (1,2);
-   UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+   UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 g48=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"code":"vip48","name":"谈判价三倍","ratio":"3.0"}')
 VIP48=$(GID vip48)
@@ -1853,11 +1866,20 @@ b0=$(relay26); sleep 1; base=$(charged26)
 cr=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip48","remark":"S48 大客户谈判价"}')
 row48=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=1")
-b1=$(relay26); sleep 1; with48=$(charged26)
+# 开通只是「允许选」：Key 没绑之前计价不变
+b1=$(relay26); sleep 1; open48=$(charged26)
+opts48=$(curl -s --max-time 10 "$U/app/gateway/token/groups" -H "Authorization: Bearer $UJWT" | python3 -c "import sys,json;print(','.join(g['code'] for g in json.load(sys.stdin)['data']))" 2>/dev/null)
+# 用户在控制台把 Key 绑到 vip48（走自助更新接口，带上原名称）
+TID48=$(q "SELECT id FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+TNAME48=$(q "SELECT name FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
+bind48=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
+  -d "{\"id\":$TID48,\"name\":\"$TNAME48\",\"group\":\"vip48\"}")
+b1b=$(relay26); sleep 1; with48=$(charged26)
 [ "$g48" = "200" ] && [ -n "$VIP48" ] && [ "$b0" = "200" ] && [ "$cr" = "200" ] && [ "$row48" = "vip48" ] \
-  && [ "$b1" = "200" ] && [ -n "$base" ] && [ "$base" -gt 0 ] && [ "$with48" = "$((base*3))" ] \
-  && pass "用户级例外真的改变计价（解析第 2 层，此前零覆盖）：建组=${g48}(id=${VIP48}) 基线 relay=${b0} charged=${base}（default ratio 1.0）→ 管理端配例外=${cr} 且库里 group_code=${row48} → relay=${b1} charged=${with48}，恰好是基线的 3 倍（vip48 ratio 3.0）" \
-  || fail "例外没生效: 建组=${g48}(期望200) VIP48=${VIP48} 基线=${b0}/${base} 配例外=${cr}(期望200) 库里=${row48}(期望vip48) 例外后=${b1}/${with48}(期望$(( ${base:-0} * 3 ))) body=$(head -c 160 "$GB" 2>/dev/null)"
+  && [ "$b1" = "200" ] && [ -n "$base" ] && [ "$base" -gt 0 ] && [ "$open48" = "$base" ] && grep -q "vip48" <<< "$opts48" \
+  && [ "$bind48" = "200" ] && [ "$b1b" = "200" ] && [ "$with48" = "$((base*3))" ] \
+  && pass "用户专属分组：建组=${g48}(id=${VIP48}) 基线 charged=${base} → 开通=${cr}（库里 ${row48}）后 Key 未绑仍是 ${open48}、可选分组=[${opts48}] → 用户把 Key 绑到 vip48=${bind48} → charged=${with48}，恰好是基线的 3 倍（vip48 ratio 3.0）" \
+  || fail "专属分组不对: 建组=${g48}(期望200) VIP48=${VIP48} 基线=${b0}/${base} 开通=${cr}(期望200) 库里=${row48}(期望vip48) 开通未绑=${b1}/${open48}(期望=${base}) 可选=[${opts48}](期望含 vip48) 绑定=${bind48}(期望200) 绑后=${b1b}/${with48}(期望$(( ${base:-0} * 3 ))) body=$(head -c 160 "$GB" 2>/dev/null)"
 
 # 悬空 group_code 必须在**写入时**就被拒。放它进去的代价不是脏数据，是该用户此后每一个请求
 # 都 500 billing_group_config_broken（第 2 层命中却找不到活组，且不回落）。
@@ -1891,11 +1913,13 @@ still=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHE
 upd=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X PUT "$U/admin/gateway/group-override/update" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"default","remark":"改回默认价"}')
 now48=$(q "SELECT COALESCE(group_code,'<none>') FROM gateway_group_overrides WHERE user_id=1")
-b2=$(relay26); sleep 1; back=$(charged26)
+# 专属分组换成 default = 收回了 vip48：绑着它的 Key 必须立即 403，不能继续按谈判价计费
+b2=$(relay26); sleep 1
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 [ "$dup" = "409" ] && [ "$still" = "vip48" ] && [ "$upd" = "200" ] && [ "$now48" = "default" ] \
-  && [ "$b2" = "200" ] && [ "$back" = "$base" ] \
-  && pass "一人一条：重复 create=${dup}（409 而非 500）且旧行仍是 ${still} 没被踩；update 才是改它的入口=${upd} → ${now48}，且计价跟着回到基线（charged ${with48}→${back}，等于基线 ${base}）" \
-  || fail "唯一性/更新不对: 重复create=${dup}(期望409) 被拒后库里=${still}(期望vip48) update=${upd}(期望200) 现值=${now48}(期望default) relay=${b2} charged=${back}(期望=${base}) body=$(head -c 160 "$GB" 2>/dev/null)"
+  && [ "$b2" = "403" ] && grep -q "billing_group_not_allowed" "$GB" \
+  && pass "一人一条：重复 create=${dup}（409 而非 500）且旧行仍是 ${still} 没被踩；update 才是改它的入口=${upd} → ${now48}，收回 vip48 后绑着它的 Key 立即 ${b2} billing_group_not_allowed" \
+  || fail "唯一性/更新不对: 重复create=${dup}(期望409) 被拒后库里=${still}(期望vip48) update=${upd}(期望200) 现值=${now48}(期望default) 收回后relay=${b2}(期望403) body=$(head -c 160 "$GB" 2>/dev/null)"
 
 # 最后两件事：撤销真的是硬删（表无 deleted 列），以及 app 组一条也不许有 ——
 # 自助用户能设自己的计费组就等于自己给自己打折。404 而不是 403：路由就不应该存在，
@@ -2414,11 +2438,11 @@ post54e=$(row54 90542)
 # 无法判断是谈判价配错了还是标准价本身配错了。撤销用户例外时这个缺口最疼：那张表是硬删。
 #
 # 四块各钉一件事，少一块就有一种「看着对」的实现能溜过去：
-#   A 无例外无覆盖 → DEFAULT，charged 作后两块的基准
-#   B 配用户例外 → USER_OVERRIDE，**且 charged 恰好翻倍**：把归因与金额绑成同一件事的两面，
-#     硬编码一个假 source 骗得过字符串断言，骗不过「金额也跟着变了」
-#   C 令牌覆盖与用户例外并存且指向不同的组 → TOKEN_OVERRIDE 胜出。没有这一块，「source 是随手
-#     取了第一层」与「source 真跟着优先级走」分不出来
+#   A Key 没绑分组 → DEFAULT，charged 作后两块的基准
+#   B 开通专属分组并让用户把 Key 绑上去 → TOKEN_SELECTED，**且 charged 恰好翻倍**：把归因与金额绑成
+#     同一件事的两面，硬编码一个假 source 骗得过字符串断言，骗不过「金额也跟着变了」
+#   C 运营指定分组（group_assigned=1）→ TOKEN_OVERRIDE，金额跟着它。没有这一块，「运营指定」与
+#     「用户自选」在归因里分不出来
 #   D 上游 403 → 失败请求那行也带归因。成功行由 finalize 落、失败行由 recordLog 落，进的是同一
 #     张表；失败行缺归因，这张表就只能按组统计成功量，「某个组是不是在集中撞某个上游」问不出来
 # 两块表都断言（usage_logs 与 settlements）：finalize 的日志维度全部取自结算行，worker 重放时
@@ -2426,7 +2450,7 @@ post54e=$(row54 90542)
 # 不覆盖 MEMBER_GROUP 那层：它要 NETONAPI_MEMBER_GROUP_BILLING 开关加会员组映射（其解析行为 S26
 # 已覆盖），而本场景要证的是「source 落库了、且跟着优先级走」，三层足够。
 # ════════════════════════════════════════════════════════════════════
-echo "[S55] 计费归因落库：DEFAULT / USER_OVERRIDE / TOKEN_OVERRIDE 三层 + 失败请求也带归因"
+echo "[S55] 计费归因落库：DEFAULT / TOKEN_SELECTED / TOKEN_OVERRIDE + 失败请求也带归因"
 # seed_reset 会 TRUNCATE usage_logs 与 settlements，所以本场景里「最新一行」是干净的。
 # 端口避开 S4 的 9950(err403)/9940(err429) 与 S48 的 9948：那些 fake 进程整轮都活着。
 seed_reset; fake ok 9955; sleep 1
@@ -2435,7 +2459,7 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-grp','2.5','10','0','0',5000,'manual',0,0,0);
    UPDATE gateway_groups SET deleted=0, ratio='1.0' WHERE code='default';
    DELETE FROM gateway_group_overrides WHERE user_id=1;
-   UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+   UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 g55=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"code":"vip55","name":"归因两倍","ratio":"2.0"}')
 # 归因读取。'<null>' 而不是空串：空串与「列不存在/查不出」在 shell 里分不开，而 NULL 是本场景
@@ -2452,28 +2476,30 @@ atA55=$(attr55); satA55=$(sattr55); chA55=$(chg55)
   && pass "块A 兜底层有归因：建 vip55(ratio 2.0)=${g55} → relay=${rA55}；usage_logs 最新行 group/source=${atA55}、settlements 最新行=${satA55}（两张表都落了），charged=${chA55}（default ratio 1.0，作块B 的基准）" \
   || fail "块A 归因没落库: 建组=${g55}(期望200) relay=${rA55}(期望200) usage_logs='${atA55}'(期望 default/DEFAULT；'<null>/<null>' 说明 V007 的列没被写进去、空串说明查询本身没出行) settlements='${satA55}'(期望同) charged=${chA55}(期望>0)"
 
-# ── 块 B：谈判价那一层，且金额跟着变 ──
+# ── 块 B：用户自选的分组，且金额跟着变 ──
+# vip55 不对所有人开放：先给用户 1 开通（专属分组），再把 Key 绑上去（用户自选，group_assigned=0）
 crB55=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/group-override/create" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"userId":1,"groupCode":"vip55","remark":"S55 归因"}')
+q "UPDATE gateway_tokens SET group_override='vip55', group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 rB55=$(relay26); sleep 1
 atB55=$(attr55); satB55=$(sattr55); chB55=$(chg55)
-[ "$crB55" = "200" ] && [ "$rB55" = "200" ] && [ "$atB55" = "vip55/USER_OVERRIDE" ] && [ "$satB55" = "vip55/USER_OVERRIDE" ] \
+[ "$crB55" = "200" ] && [ "$rB55" = "200" ] && [ "$atB55" = "vip55/TOKEN_SELECTED" ] && [ "$satB55" = "vip55/TOKEN_SELECTED" ] \
   && [ "$chB55" = "$((chA55*2))" ] \
-  && pass "块B 谈判价那一层有归因、且金额跟着变：配例外=${crB55} → relay=${rB55}；group/source=${atB55}（结算行 ${satB55}），charged ${chA55}→${chB55} 恰好两倍（vip55 ratio 2.0）。归因与计价是同一件事的两面：写死一个假 source 能过字符串断言，过不了这条" \
-  || fail "块B 归因或金额不对: 配例外=${crB55}(期望200；400 说明 userId=1 不是活会员，那是 S54 那件事) relay=${rB55}(期望200) usage_logs='${atB55}'(期望 vip55/USER_OVERRIDE) settlements='${satB55}'(期望同) charged=${chB55}(期望$(( ${chA55:-0} * 2 ))，基准 ${chA55})"
+  && pass "块B 用户自选的分组有归因、且金额跟着变：配例外=${crB55} → relay=${rB55}；group/source=${atB55}（结算行 ${satB55}），charged ${chA55}→${chB55} 恰好两倍（vip55 ratio 2.0）。归因与计价是同一件事的两面：写死一个假 source 能过字符串断言，过不了这条" \
+  || fail "块B 归因或金额不对: 配例外=${crB55}(期望200；400 说明 userId=1 不是活会员，那是 S54 那件事) relay=${rB55}(期望200) usage_logs='${atB55}'(期望 vip55/TOKEN_SELECTED) settlements='${satB55}'(期望同) charged=${chB55}(期望$(( ${chA55:-0} * 2 ))，基准 ${chA55})"
 
-# ── 块 C：令牌覆盖压过用户例外，归因与金额都取自第一层 ──
-# 用户例外留在 vip55(2.0)，令牌覆盖指向 default(1.0)。若来源报 TOKEN_OVERRIDE 而金额回到块A 的
-# 水平，就同时证明了「记的是第一层」与「计价也真按第一层」—— 只断言字符串的话，一个把 source
+# ── 块 C：运营指定的分组，归因与金额都跟着它 ──
+# 用户专属分组仍是 vip55(2.0)，运营把这把 Key 指定到 default(1.0)。若来源报 TOKEN_OVERRIDE 而金额回到块A 的
+# 水平，就同时证明了「记的是运营指定」与「计价也真按它」—— 只断言字符串的话，一个把 source
 # 写死成 TOKEN_OVERRIDE 的实现同样能过。
-q "UPDATE gateway_tokens SET group_override='default' WHERE key_hash='$TOKEN_HASH'" >/dev/null
+q "UPDATE gateway_tokens SET group_override='default', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 rC55=$(relay26); sleep 1
 atC55=$(attr55); satC55=$(sattr55); chC55=$(chg55)
 [ "$rC55" = "200" ] && [ "$atC55" = "default/TOKEN_OVERRIDE" ] && [ "$satC55" = "default/TOKEN_OVERRIDE" ] \
   && [ "$chC55" = "$chA55" ] \
-  && pass "块C 归因跟着优先级走：令牌覆盖 default 压过用户例外 vip55 → relay=${rC55}；group/source=${atC55}（结算行 ${satC55}），charged=${chC55} 回到块A 水平而不是 vip55 的 ${chB55} —— 来源与金额取自同一层" \
-  || fail "块C 优先级归因不对: relay=${rC55}(期望200) usage_logs='${atC55}'(期望 default/TOKEN_OVERRIDE；若是 vip55/USER_OVERRIDE 则令牌覆盖这一层没被记进来源) settlements='${satC55}'(期望同) charged=${chC55}(期望=${chA55}，即按 default 计而非 vip55)"
-q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';
+  && pass "块C 归因跟着运营指定走：Key 被指定到 default（用户仍可选 vip55） → relay=${rC55}；group/source=${atC55}（结算行 ${satC55}），charged=${chC55} 回到块A 水平而不是 vip55 的 ${chB55} —— 来源与金额取自同一层" \
+  || fail "块C 优先级归因不对: relay=${rC55}(期望200) usage_logs='${atC55}'(期望 default/TOKEN_OVERRIDE；若是 default/TOKEN_SELECTED 则 group_assigned 没被认出来) settlements='${satC55}'(期望同) charged=${chC55}(期望=${chA55}，即按 default 计而非 vip55)"
+q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';
    DELETE FROM gateway_group_overrides WHERE user_id=1;" >/dev/null
 
 # ── 块 D：上游 403 的失败请求也带归因（recordLog 那半边）──
@@ -2481,14 +2507,15 @@ q "UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';
 # 无缓存，所以 UPDATE base_url 立即生效。一发 403 不会禁用 Key —— S4 证明要连续 5 发。
 fake err403 9956; sleep 1
 q "UPDATE gateway_channels SET base_url='http://127.0.0.1:9956' WHERE name='c55';
-   INSERT INTO gateway_group_overrides (user_id,group_code,remark) VALUES (1,'vip55','S55 失败路径归因');" >/dev/null
+   INSERT INTO gateway_group_overrides (user_id,group_code,remark) VALUES (1,'vip55','S55 失败路径归因');
+   UPDATE gateway_tokens SET group_override='vip55', group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 rD55=$(relay26); sleep 1
 # 按 status='error' 取行，不取「最新一行」：worker 可能在 TTL 后把结算行 finalize 掉、
 # 于是最新那行变成成功行，断言就会指着错的那半边。
 atD55=$(q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<null>')||'/'||status FROM gateway_usage_logs WHERE status='error' ORDER BY id DESC LIMIT 1")
-[ "$rD55" = "403" ] && [ "$atD55" = "vip55/USER_OVERRIDE/error" ] \
+[ "$rD55" = "403" ] && [ "$atD55" = "vip55/TOKEN_SELECTED/error" ] \
   && pass "块D 失败请求也有归因：上游 403 → relay=${rD55}；usage_logs 里 status=error 那行 group/source=${atD55}（recordLog 路径 —— 此前它的 group 参数从 V001 起就白传，这一行连组都没有）" \
-  || fail "块D 失败路径缺归因: relay=${rD55}(期望403；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/USER_OVERRIDE/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
+  || fail "块D 失败路径缺归因: relay=${rD55}(期望403；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/TOKEN_SELECTED/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
 
 # ════════════════════════════════════════════════════════════════════
 # S56 支付回调地址：发出去的 notify_url 必须是一条**活路由**
@@ -2701,7 +2728,7 @@ hc=$(curl -s --max-time 5 -o /tmp/netonapi-health.json -w "%{http_code}" "$U/hea
 # ══ S58 模型映射反向：响应里的 model 是客户端请求的名字，上游名不外泄；日志记的仍是上游名 ══
 echo "[S58] 模型映射反向改写"
 # S55 给 user 1 留了 vip55 的用户例外，后面三个场景都只在 default 组开渠道，先清掉
-q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 seed_reset; fake ok 9958; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,model_mapping,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-map','openai_compatible','http://127.0.0.1:9958','default','gpt-x','{\"gpt-x\":\"up-x\"}',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-map'),'k',1,0,0,0,0);
@@ -2849,13 +2876,20 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-st','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 s68tok=$(curl -s --max-time 10 -X POST "$U/app/gateway/token/create" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"name":"s68"}')
 S68ID=$(echo "$s68tok" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null)
-q "UPDATE gateway_tokens SET rpm_limit=7, group_override='default' WHERE id=$S68ID" >/dev/null
+q "UPDATE gateway_tokens SET rpm_limit=7, group_override='default', group_assigned=1 WHERE id=$S68ID" >/dev/null
 s68future=$(( $(date +%s) * 1000 + 86400000 ))
 up=$(curl -s --max-time 10 -o /tmp/netonapi-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"s68-renamed\",\"quotaBudget\":5000000,\"expiresAt\":$s68future,\"allowedModels\":\"m-st\",\"allowedIps\":\"\"}")
 row=$(q "SELECT name||'/'||quota_budget||'/'||allowed_models||'/'||rpm_limit||'/'||COALESCE(group_override,'<null>') FROM gateway_tokens WHERE id=$S68ID")
 [ "$up" = "200" ] && [ "$row" = "s68-renamed/5000000/m-st/7/default" ] \
   && pass "自助更新：名称/预算/模型范围改了，rpm_limit=7 与 group_override 原样" || fail "自助更新: HTTP=$up row=$row body=$(cat /tmp/netonapi-s68.json)"
+# 运营指定的分组（group_assigned=1）用户改不了：带别的 group 来 → 400 TOKEN_GROUP_LOCKED，分组不动
+lk=$(curl -s --max-time 10 -o /tmp/netonapi-s68.json -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"name\":\"s68-renamed\",\"group\":\"vip26\"}")
+lkg=$(q "SELECT COALESCE(group_override,'<null>')||'/'||group_assigned FROM gateway_tokens WHERE id=$S68ID")
+[ "$lk" = "400" ] && grep -q TOKEN_GROUP_LOCKED /tmp/netonapi-s68.json && [ "$lkg" = "default/1" ] \
+  && pass "运营指定的分组用户改不了：HTTP=${lk} TOKEN_GROUP_LOCKED，分组仍是 ${lkg}" \
+  || fail "用户改掉了运营指定的分组: HTTP=${lk}(期望400) 分组=${lkg}(期望 default/1) body=$(cat /tmp/netonapi-s68.json)"
 inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"x\",\"rpmLimit\":9999}")
 rl=$(q "SELECT rpm_limit FROM gateway_tokens WHERE id=$S68ID")
@@ -2883,7 +2917,7 @@ lg=$(curl -s --max-time 30 -o /tmp/netonapi-lg.json -w "%{http_code}" -X POST "$
 
 # ══ S70 跨协议保真：Anthropic 入口（Claude Code 形状）打 OpenAI 上游的工具调用、thinking、缓存用量、多轮回填 ══
 echo "[S70] Anthropic 入口 ↔ OpenAI 上游：工具调用与 thinking"
-q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null
+q "DELETE FROM gateway_group_overrides WHERE user_id=1; UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 seed_reset; fake tools 9970; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-tools','openai_compatible','http://127.0.0.1:9970','default','m-tl',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-tools'),'k',1,0,0,0,0);
