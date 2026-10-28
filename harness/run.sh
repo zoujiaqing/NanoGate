@@ -1273,6 +1273,20 @@ ntx32b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID'")
   && pass "串行重投不再入账：余额仍 ${bal32b}、台账仍 ${ntx32b} 条" \
   || fail "重投又入账了: 余额 ${bal32}→${bal32b} 台账 ${ntx32}→${ntx32b}"
 
+# 后台「同步支付状态」：向支付平台查单，平台确认已付才入账；没有无凭证的「标记已支付」。
+# 已支付的单 → ALREADY_FINAL；新开一笔待支付单走沙箱 → 沙箱不支持查单 → UNSUPPORTED，订单与余额都不动；无凭据 → 401。
+# GJWT 由 S30 重启后重新登录取得。
+PO32=$(q "SELECT id FROM pay_orders WHERE merchant_order_id='$MOID'")
+sy1=$(curl -s --max-time 15 -X POST "$U/admin/pay/order/sync/$PO32" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['status'])" 2>/dev/null)
+curl -s --max-time 15 -o "$GB" -X POST "$U/app/gateway/recharge" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}'
+MOID2=$(jdata merchantOrderId); PO32B=$(q "SELECT id FROM pay_orders WHERE merchant_order_id='$MOID2'")
+sy2=$(curl -s --max-time 15 -X POST "$U/admin/pay/order/sync/$PO32B" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['status'])" 2>/dev/null)
+st32b=$(q "SELECT status FROM pay_orders WHERE id=$PO32B"); bal32c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+sy3=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/admin/pay/order/sync/$PO32B" -H "$CT" -d '{}')
+[ "$sy1" = "ALREADY_FINAL" ] && [ "$sy2" = "UNSUPPORTED" ] && [ "$st32b" = "0" ] && [ "$bal32c" = "$bal32" ] && [ "$sy3" = "401" ] \
+  && pass "同步支付状态：已支付单=${sy1}；沙箱待支付单=${sy2}（不支持查单，订单仍待支付、余额不动）；无凭据=${sy3}" \
+  || fail "同步支付状态不对: 已支付单=${sy1}(期望ALREADY_FINAL) 沙箱单=${sy2}(期望UNSUPPORTED) 订单状态=${st32b}(期望0) 余额 ${bal32}→${bal32c} 无凭据=${sy3}(期望401)"
+
 echo "[S33] 入账失败可恢复：整笔回滚，不留「付了钱没额度」也不留「已支付但台账没记」"
 rc33=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
