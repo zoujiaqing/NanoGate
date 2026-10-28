@@ -2894,6 +2894,18 @@ inj=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gatewa
   -d "{\"id\":$S68ID,\"name\":\"x\",\"rpmLimit\":9999}")
 rl=$(q "SELECT rpm_limit FROM gateway_tokens WHERE id=$S68ID")
 [ "$inj" = "400" ] && [ "$rl" = "7" ] && pass "塞 rpmLimit 被拒（400）且限速不变" || fail "限速注入: HTTP=$inj rpm_limit=$rl"
+# 限速只有运营能设：管理端 update-limits 生效，非正数 400 且不改库，app 组没有这条路由
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)
+lim=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/token/update-limits" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"rpmLimit\":11,\"tpmLimit\":null,\"concurrencyLimit\":3}")
+limbad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/token/update-limits" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"rpmLimit\":0}")
+limapp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update-limits" -H "Authorization: Bearer $UJWT" -H "$CT" \
+  -d "{\"id\":$S68ID,\"rpmLimit\":99999}")
+limrow=$(q "SELECT COALESCE(rpm_limit::text,'-')||'/'||COALESCE(tpm_limit::text,'-')||'/'||COALESCE(concurrency_limit::text,'-') FROM gateway_tokens WHERE id=$S68ID")
+[ "$lim" = "200" ] && [ "$limbad" = "400" ] && [ "$limapp" = "404" ] && [ "$limrow" = "11/-/3" ] \
+  && pass "限速由运营在后台设：update-limits=${lim} → ${limrow}，非正数=${limbad}，app 组无此路由=${limapp}" \
+  || fail "限速设置不对: update-limits=${lim}(期望200) 非正数=${limbad}(期望400) app组=${limapp}(期望404) 库里=${limrow}(期望 11/-/3)"
 past=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/token/update" -H "Authorization: Bearer $UJWT" -H "$CT" \
   -d "{\"id\":$S68ID,\"name\":\"x\",\"expiresAt\":1000}")
 [ "$past" = "400" ] && pass "过去的有效期被拒" || fail "过去有效期: HTTP=$past"

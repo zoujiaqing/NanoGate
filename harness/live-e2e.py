@@ -339,10 +339,10 @@ app("PUT", f"/gateway/token/update-status?id={main_id}&status=1")
 s, _, b = http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, OAI)
 check(s == 200, "重新启用后恢复调用", f"{s} {str(b)[:120]}")
 
-# 运营给用户建一个每分钟 2 次的 Key：第 3 次被拒
-uid = next(u["id"] for u in admin("GET", f"/account/user/page?pageNo=1&pageSize=5&username={os.environ['MEMBER_USER']}")["list"] if u.get("username") == os.environ["MEMBER_USER"])
-rkey = admin("POST", "/gateway/token/create", {"userId": uid, "name": "e2e-rpm", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": "", "groupOverride": None, "rpmLimit": 2, "tpmLimit": None, "concurrencyLimit": None})
-rkey = rkey.get("key") if isinstance(rkey, dict) else rkey
+# 用户自己建 Key，运营在后台给它设每分钟 2 次的限速：第 3 次被拒（后台不能代建 Key）
+created = ok_data(app("POST", "/gateway/token/create", {"name": "e2e-rpm", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}), "create rpm token")
+rkey = created.get("key") if isinstance(created, dict) else created
+admin("PUT", "/gateway/token/update-limits", {"id": created["id"], "rpmLimit": 2, "tpmLimit": None, "concurrencyLimit": None})
 codes = [http("POST", f"{API}/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}, {"Authorization": f"Bearer {rkey}"})[0] for _ in range(3)]
 check(codes[:2] == [200, 200] and codes[2] == 429, "运营设的每分钟 2 次限速：第 3 次 429", f"{codes}")
 
