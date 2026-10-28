@@ -29,6 +29,8 @@ export PGPASSWORD="$PGPASS" PGHOST PGPORT
 # 管理员 MFA 的 TOTP 密钥加密主密钥（module-system，base64 解码后 32 字节）。固定测试值；
 # 不设时「要求 MFA」的管理员根本登不进来（MFA_NOT_CONFIGURED）。
 export NETON_MFA_MASTER_KEY="${NETON_MFA_MASTER_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
+# 查价缓存（PriceBook）：harness 大量场景直接改库后立刻转发，缓存设 0 = 每次读库；S93 单独用长 TTL 验缓存失效
+export NETONAPI_PRICEBOOK_TTL_MILLIS="${NETONAPI_PRICEBOOK_TTL_MILLIS:-0}"
 # JWT 签名密钥：仓库配置里只有占位值，应用检测到占位或短于 32 字符的密钥会拒绝启动（system 的
 # requireUsableJwtSecret）。harness 用一个只在本脚本里出现的测试值。
 export NETON_SECURITY__JWT__SECRETKEY="${NETON_SECURITY__JWT__SECRETKEY:-harness-only-jwt-secret-not-for-production-000}"
@@ -3625,7 +3627,7 @@ wallet=$(q "SELECT COUNT(*) FROM system_menus WHERE status=1 AND component IN ('
 # 授权行不得指向已停用的菜单：留着不越权，但会让角色管理页面勾着一堆看不见的东西
 ghost=$(q "SELECT COUNT(*) FROM system_role_menus rm JOIN system_menus m ON m.id=rm.menu_id JOIN system_roles r ON r.id=rm.role_id WHERE m.status=0 AND r.code <> 'super_admin'")
 [ "$top1" = "AI 网关" ] && [ "$gone" = "0" ] && [ "$msgctr" = "0" ] && [ "$deadpg" = "0" ] && [ "$leftget" = "0" ] && [ "$wallet" = "2" ] && [ "$ghost" = "0" ] \
-  && [ "$gworder" = "overview,log,channel,price,token,group,group-override,redemption,settlement" ] \
+  && [ "$gworder" = "overview,log,channel,price,user-price,token,group,group-override,redemption,settlement" ] \
   && pass "菜单：AI 网关排第一且内部按使用频率排序，6 类无关页面下架，两个后端 404 的死页面也下架，权限动词无 :get 残留" \
   || fail "菜单: 第一组=$top1 无关页残留=$gone 消息中心残留=$msgctr 死页面残留=$deadpg 残留get=$leftget 钱包页归位=$wallet 幽灵授权=$ghost 网关顺序=$gworder"
 
@@ -3667,6 +3669,93 @@ allow=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X GET "$U/admin/ga
 created=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='s79-should-fail'")
 [ "$deny" != "200" ] && [ "$created" = "0" ] && pass "后端真拦：客服建渠道被拒（HTTP=${deny}），库里没有多出渠道行" \
   || fail "越权没拦住: 建渠道 HTTP=$deny 库里行数=${created}（查日志 HTTP=${allow}）"
+
+
+# ══ S93 定价规则与用户价目表（docs/gateway-pricing-spec.md §4.3）══
+# 查价 = 用户规则 ?: 分组规则 ?: 平台价 × 分组倍率；以官方价为锚；命中折扣 / 固定价不乘分组倍率；
+# RULES_ONLY 模型只对有规则的用户 / 分组可用；保存时亏本拒绝；本进程写入立即生效（长 TTL 下验证）。
+echo "[S93] 定价规则：官方价折扣 / 固定价 / 仅开放、优先级、亏本拦截、限定开放、缓存失效"
+[ -n "$GJWT" ] || GJWT=$(admin_jwt)
+seed_reset; fake ok 9993; sleep 1
+q "DELETE FROM gateway_price_rules;
+   DELETE FROM gateway_groups WHERE code='vip93';
+   INSERT INTO gateway_groups (code,name,ratio,description,selectable,deleted,created_at,updated_at) VALUES ('vip93','VIP 93','0.9',NULL,0,0,0,0);
+   INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c93','openai_compatible','http://127.0.0.1:9993','default,vip93','m-93,m-93r,m-93t',1,1,1,30000,90000,'0.5',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c93'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,access,deleted,created_at,updated_at) VALUES
+     ('m-93','2.5','10','0','0',5000,'manual','ALL',0,0,0),
+     ('m-93r','2.5','10','0','0',5000,'manual','RULES_ONLY',0,0,0),
+     ('m-93t','2.5','10','0','0',5000,'manual','ALL',0,0,0);
+   UPDATE gateway_model_prices SET tiers='[{\"maxPromptTokens\":200000,\"input\":\"2.5\",\"output\":\"10\",\"cacheRead\":\"0\",\"cacheWrite\":\"0\"},{\"maxPromptTokens\":null,\"input\":\"5\",\"output\":\"20\",\"cacheRead\":\"0\",\"cacheWrite\":\"0\"}]' WHERE model='m-93t';
+   UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
+relay93() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d "{\"model\":\"$1\",\"messages\":[]}"; }
+charged93() { q "SELECT charged FROM gateway_usage_logs WHERE request_model='$1' ORDER BY id DESC LIMIT 1"; }
+rule93() { curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X PUT "$U/admin/gateway/price-rule/save" -H "Authorization: Bearer $GJWT" -H "$CT" -d "$1"; }
+near() { [ -n "$1" ] && [ -n "$2" ] && [ $(( $1 > $2 ? $1 - $2 : $2 - $1 )) -le 2 ]; }
+U93=1
+# (a) 基线：default 组、无规则 → 平台价（加价率 1）× 1
+b0=$(relay93 m-93); sleep 1; base=$(charged93 m-93)
+# (b) 用户规则：官方价 6 折 → 实付 = 基线 × 0.6
+r1=$(rule93 "{\"subjectType\":\"USER\",\"subjectId\":\"$U93\",\"model\":\"m-93\",\"mode\":\"OFFICIAL_DISCOUNT\",\"discount\":\"0.6\"}")
+b1=$(relay93 m-93); sleep 1; c1=$(charged93 m-93)
+[ "$b0" = "200" ] && [ -n "$base" ] && [ "$base" -gt 0 ] && [ "$r1" = "200" ] && [ "$b1" = "200" ] && near "$c1" "$((base*6/10))" \
+  && pass "用户规则官方价 6 折：基线 ${base} → ${c1}（= 官方价 × 0.6）" \
+  || fail "用户规则不对: 基线=${b0}/${base} 保存=${r1} 规则后=${b1}/${c1}(期望≈$((${base:-0}*6/10))) body=$(head -c 200 "$GB")"
+# (c) 亏本拦截：渠道成本是官方价 5 折，约定 4 折必须拒绝，预览给出 LOSS
+lossp=$(curl -s --max-time 10 -X POST "$U/admin/gateway/price-rule/preview" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"subjectType\":\"USER\",\"subjectId\":\"$U93\",\"model\":\"m-93\",\"mode\":\"OFFICIAL_DISCOUNT\",\"discount\":\"0.4\"}" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['status'])" 2>/dev/null)
+loss=$(rule93 "{\"subjectType\":\"USER\",\"subjectId\":\"$U93\",\"model\":\"m-93\",\"mode\":\"OFFICIAL_DISCOUNT\",\"discount\":\"0.4\"}")
+lossbody=$(grep -c MODEL_PRICE_BELOW_COST "$GB")
+still=$(q "SELECT discount FROM gateway_price_rules WHERE subject_type='USER' AND subject_id='$U93' AND model='m-93'")
+[ "$lossp" = "LOSS" ] && [ "$loss" = "409" ] && [ "$lossbody" -ge 1 ] && [ "$still" = "0.6" ] \
+  && pass "亏本拦截：成本 5 折、约定 4 折 → 预览 ${lossp}、保存 ${loss} MODEL_PRICE_BELOW_COST，库里仍是 ${still}" \
+  || fail "亏本没拦住: 预览=${lossp}(期望LOSS) 保存=${loss}(期望409) 机器码=${lossbody} 库里=${still}(期望0.6)"
+# (d) 优先级与分组规则：Key 指定到 vip93（倍率 0.9），分组对 m-93 固定价 8 折；用户规则仍优先；删掉用户规则后走分组固定价（不乘 0.9）
+q "UPDATE gateway_tokens SET group_override='vip93', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
+g1=$(rule93 '{"subjectType":"GROUP","subjectId":"vip93","model":"m-93","mode":"FIXED","prices":"{\"input\":\"2\",\"output\":\"8\"}"}')
+b2=$(relay93 m-93); sleep 1; c2=$(charged93 m-93)
+del=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X DELETE "$U/admin/gateway/price-rule/delete?subjectType=USER&subjectId=$U93&model=m-93" -H "Authorization: Bearer $GJWT")
+b3=$(relay93 m-93); sleep 1; c3=$(charged93 m-93)
+b4=$(relay93 m-93t); sleep 1; c4=$(charged93 m-93t)
+[ "$g1" = "200" ] && near "$c2" "$((base*6/10))" && [ "$del" = "200" ] && near "$c3" "$((base*8/10))" && [ "$b4" = "200" ] && near "$c4" "$((base*9/10))" \
+  && pass "优先级：用户规则 ${c2}（6 折）> 分组固定价 ${c3}（8 折，不乘分组 0.9）；无规则模型 ${c4} = 平台价 × 0.9" \
+  || fail "优先级不对: 分组规则保存=${g1} 有用户规则=${b2}/${c2}(期望≈$((${base:-0}*6/10))) 删用户规则=${del} 分组固定价=${b3}/${c3}(期望≈$((${base:-0}*8/10))) 无规则=${b4}/${c4}(期望≈$((${base:-0}*9/10))) body=$(head -c 160 "$GB")"
+# (e) 分档模型不能用固定价
+tier=$(rule93 '{"subjectType":"GROUP","subjectId":"vip93","model":"m-93t","mode":"FIXED","prices":"{\"input\":\"2\",\"output\":\"8\"}"}')
+tierbody=$(grep -c PRICE_RULE_FIXED_TIERED "$GB")
+[ "$tier" = "400" ] && [ "$tierbody" -ge 1 ] && pass "分档模型拒绝固定价：${tier} PRICE_RULE_FIXED_TIERED" || fail "分档模型固定价没拦: ${tier} body=$(head -c 160 "$GB")"
+# (f) 限定开放：RULES_ONLY 的 m-93r 没规则时 /v1/models 不列、公开目录不列、转发 404；给用户一条「仅开放」规则后可用
+lsA=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH" | grep -c '"m-93r"')
+pubA=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c '"m-93r"')
+rA=$(relay93 m-93r)
+op=$(rule93 "{\"subjectType\":\"USER\",\"subjectId\":\"$U93\",\"model\":\"m-93r\",\"mode\":\"PLATFORM\"}")
+lsB=$(curl -s --max-time 10 "$U/v1/models" -H "$AUTH" | grep -c '"m-93r"')
+pubB=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c '"m-93r"')
+rB=$(relay93 m-93r); sleep 1; cB=$(charged93 m-93r)
+[ "$lsA" = "0" ] && [ "$pubA" = "0" ] && [ "$rA" = "404" ] && [ "$op" = "200" ] && [ "$lsB" = "1" ] && [ "$pubB" = "0" ] && [ "$rB" = "200" ] && near "$cB" "$((base*9/10))" \
+  && pass "限定开放：无规则时 /v1/models=${lsA}、公开目录=${pubA}、转发=${rA}；仅开放规则后 /v1/models=${lsB}、转发=${rB}、按平台价 × 0.9 = ${cB}，公开目录仍=${pubB}" \
+  || fail "限定开放不对: 前 v1=${lsA} pub=${pubA} relay=${rA}(期望0/0/404) 开放=${op} 后 v1=${lsB} pub=${pubB} relay=${rB}/${cB}(期望1/0/200/≈$((${base:-0}*9/10)))"
+# (g) 我的价目表：与转发同一口径
+mine=$(curl -s --max-time 10 "$U/app/gateway/pricebook/mine" -H "Authorization: Bearer $UJWT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)['data']; rows={r['model']:r for g in d if g['groupCode']=='vip93' for r in g['rows']}
+print(rows.get('m-93',{}).get('source'), rows.get('m-93',{}).get('discountBp'), rows.get('m-93r',{}).get('source'))" 2>/dev/null)
+[ "$mine" = "GROUP 8000 USER" ] && pass "我的价目表：m-93 来源分组约定、官方价 8 折；m-93r 来源用户规则（${mine}）" || fail "我的价目表不对: '${mine}'(期望 'GROUP 8000 USER')"
+# (h) 用户自助接口没有写规则的路由
+appw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/gateway/price-rule/save" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{}')
+[ "$appw" = "404" ] && pass "app 组没有定价规则写路由(${appw})" || fail "app 组暴露了定价规则写路由: ${appw}"
+# (i) 缓存：长 TTL 下，直接改库要等 TTL；管理端写入立即生效
+stop_app; boot_app NETONAPI_PRICEBOOK_TTL_MILLIS=600000 NETONAPI_QUOTA_PER_PRICE_UNIT=1000
+relay93 m-93t >/dev/null; sleep 1; w0=$(charged93 m-93t)
+q "UPDATE gateway_model_prices SET input_price='25', output_price='100', tiers=NULL WHERE model='m-93t'" >/dev/null
+relay93 m-93t >/dev/null; sleep 1; w1=$(charged93 m-93t)
+api=$(rule93 '{"subjectType":"GROUP","subjectId":"vip93","model":"m-93t","mode":"OFFICIAL_DISCOUNT","discount":"0.7"}')
+relay93 m-93t >/dev/null; sleep 1; w2=$(charged93 m-93t)
+q "DELETE FROM gateway_price_rules; UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH'" >/dev/null
+[ "$w1" = "$w0" ] && [ "$api" = "200" ] && near "$w2" "$((base*70/10))" \
+  && pass "缓存：长 TTL 下直接改库不生效（${w0}→${w1}），管理端写规则立即生效（→${w2} = 新官方价 × 0.7）" \
+  || fail "缓存失效不对: 改库前=${w0} 改库后=${w1}(期望不变) 规则=${api} 规则后=${w2}(期望≈$((${base:-0}*70/10)))"
+stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }
