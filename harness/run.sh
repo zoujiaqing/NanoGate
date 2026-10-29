@@ -3606,10 +3606,26 @@ grep -q '"message":"PAY_CHANNEL_CODE_EXISTS"' /tmp/netonapi-dup.json && [ "$dup"
   && pass "重复编码给的是机器码 PAY_CHANNEL_CODE_EXISTS 而不是 500（HTTP=${dup}）" || fail "重复编码: HTTP=$dup body=$(head -c 200 /tmp/netonapi-dup.json)"
 # 侧栏里要有入口，且用户端能看到这条渠道
 pcmenu=$(q "SELECT COUNT(*) FROM system_menus WHERE component='pay/channel/index' AND status=1 AND parent_id=(SELECT id FROM system_menus WHERE name='支付中心' AND type=1 AND parent_id=0)")
-pcapp=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT" | grep -c "s81_alipay")
+# 收银台只列此刻真能下单的通道：模拟支付关着时只有真实通道，开着时只有沙箱通道（与下单同一互斥）
+setsite payment.mock.enabled false >/dev/null
+applist=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT")
+pcapp=$(grep -c "s81_alipay" <<< "$applist"); sboff=$(grep -c "sandbox_" <<< "$applist")
+setsite payment.mock.enabled true >/dev/null
+applist=$(curl -s --max-time 10 "$U/app/pay/channel/list" -H "Authorization: Bearer $UJWT")
+pcon=$(grep -c "s81_alipay" <<< "$applist"); sbon=$(grep -c "sandbox_" <<< "$applist")
+[ "$sboff" = "0" ] && [ "$pcon" = "0" ] && [ "$sbon" = "1" ] \
+  && pass "收银台通道随模拟开关互斥：关 → 只有真实通道、不列沙箱；开 → 只有沙箱通道" \
+  || fail "收银台互斥: 关时沙箱=${sboff}(期望0) 开时真实=${pcon}(期望0) 开时沙箱=${sbon}(期望1) ${applist:0:200}"
 [ "$pcmenu" = "1" ] && [ "$pcapp" = "1" ] && pass "支付中心下有「支付渠道」入口，且用户端选渠道时看得到它" \
   || fail "入口或用户端可见性: 菜单=$pcmenu 用户端命中=$pcapp"
 
+# 编辑渠道（停用 / 改配置）是对接正式通道的日常操作：整行写回不能丢 created_at（曾每次编辑都 500）
+pcc0=$(q "SELECT created_at FROM pay_channels WHERE id=${pcid:-0}")
+pu=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/pay/channel/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":${pcid:-0},\"code\":\"s81_alipay\",\"platformCode\":\"alipay\",\"method\":\"alipay\",\"displayMode\":\"REDIRECT_URL\",\"config\":\"{}\",\"feeRate\":6,\"status\":0}")
+pcs=$(q "SELECT status || ':' || created_at FROM pay_channels WHERE id=${pcid:-0}")
+[ "$pu" = "200" ] && [ "$pcs" = "0:${pcc0}" ] && pass "编辑支付渠道（停用）：200、状态落库、创建时间不变" \
+  || fail "编辑支付渠道: HTTP=${pu} 状态:创建时间=${pcs}(期望 0:${pcc0})"
 # ══ S80 权限字符串规范（RBAC spec §3）：格式、冻结词汇表、死授权 ══
 echo "[S80] 权限字符串规范"
 # 1) 格式：三段式、全小写、复合词用连字符（§3.1 / §3.3）
