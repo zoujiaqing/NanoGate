@@ -817,7 +817,7 @@ fi
 echo "[S25] 渠道 SSRF 校验（admin API）"
 JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 mkch() { curl -s --max-time 10 -o "/tmp/s25-$2-$$" -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" \
-  -H "Authorization: Bearer $JWT" -H "$CT" -d "{\"name\":\"s25-$2\",\"type\":\"openai_compatible\",\"baseUrl\":\"$1\"}"; }
+  -H "Authorization: Bearer $JWT" -H "$CT" -d "{\"name\":\"s25-$2\",\"type\":\"openai_compatible\",\"baseUrl\":\"$1\",\"costSource\":\"official\",\"costDiscount\":\"1\"}"; }
 meta=$(mkch "http://169.254.169.254/latest/meta-data" meta)
 loop=$(mkch "http://[::1]:9974/v1" loop)
 port=$(mkch "http://8.8.8.8:8080/v1" port); portbody=$(cat "/tmp/s25-port-$$" 2>/dev/null)
@@ -3341,6 +3341,26 @@ v92=$(curl -s --max-time 10 -o /tmp/netonapi-s92.json -w "%{http_code}" -X PUT "
 grep -q 'CHANNEL_PRICING_FORMAT_REQUIRED' /tmp/netonapi-s92.json && [ "$v92" = "400" ] \
   && pass "成本来源选上游价目接口却不选格式 → 400 CHANNEL_PRICING_FORMAT_REQUIRED" || fail "上游格式校验: HTTP=${v92} $(head -c 200 /tmp/netonapi-s92.json)"
 rm -f /tmp/netonapi-s92.json
+# 成本设置必须由管理员明确给出（上游几乎不可能按官方价 1:1 计费）：不补默认值，缺哪项报哪项的机器码，渠道不落库
+ck92() { curl -s --max-time 10 -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"name\":\"c-ck92\",\"type\":\"openai_compatible\",\"baseUrl\":\"http://127.0.0.1:9996\"$1}" | grep -oE 'CHANNEL_[A-Z_]+_REQUIRED' | head -1; }
+k1=$(ck92 ',"costDiscount":"0.6"')
+k2=$(ck92 ',"costSource":"official"')
+k3=$(ck92 ',"costSource":"official","costDiscount":" "')
+k4=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi"')
+k5=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1"')
+k6=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1","upstreamCreditRate":""')
+n92=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='c-ck92'")
+[ "$k1" = "CHANNEL_COST_SOURCE_REQUIRED" ] && [ "$k2" = "CHANNEL_COST_DISCOUNT_REQUIRED" ] && [ "$k3" = "CHANNEL_COST_DISCOUNT_REQUIRED" ] \
+  && [ "$k4" = "CHANNEL_UPSTREAM_GROUP_RATIO_REQUIRED" ] && [ "$k5" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$k6" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$n92" = "0" ] \
+  && pass "渠道成本设置必填：缺来源 / 折扣 / 上游分组倍率 / 充值汇率分别报对应机器码，不补默认值、不落库" \
+  || fail "成本必填: 缺来源=${k1} 缺折扣=${k2} 空折扣=${k3} 缺分组倍率=${k4} 缺汇率=${k5} 空汇率=${k6} 落库=${n92}(期望0)"
+# 从官方价改成上游价目接口：库里的分组倍率 / 汇率 1 只是占位，必须重新给出
+v92b=$(curl -s --max-time 10 -X PUT "$U/admin/gateway/channel/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":$CC92,\"name\":\"c-cc\",\"type\":\"openai_compatible\",\"baseUrl\":\"http://127.0.0.1:9996\",\"groups\":\"default\",\"models\":\"m-cc\",\"capabilities\":\"chat\",\"costSource\":\"upstream\",\"upstreamPricingFormat\":\"newapi\"}" \
+  | grep -oE 'CHANNEL_[A-Z_]+_REQUIRED' | head -1)
+[ "$v92b" = "CHANNEL_UPSTREAM_GROUP_RATIO_REQUIRED" ] && pass "改成上游价目接口时必须给出上游分组倍率与充值汇率（不沿用占位的 1）" \
+  || fail "切换到上游价目接口未要求分组倍率: ${v92b}"
 
 # 上游价目接口：假 new-api（9997）报 up-a 倍率 1 → 输入 2 美元/1M；× 上游分组倍率 0.5 × 额度单价 0.2 = 0.2
 export PRICING_JSON=/tmp/netonapi-s92-pricing.json
