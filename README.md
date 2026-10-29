@@ -64,13 +64,13 @@ new-api 一列依据其公开文档整理，细节以 new-api 最新版本为准
 
 ```
 NewGate/                 ← 本仓：编排、harness、文档
-  netonapi-backend/      服务端（GitHub 仓 netonapi/netonapi）：装配 Neton 各模块，含 Dockerfile
-  netonapi-frontend/     管理后台（netonapi/netonapi-admincp）：Next.js，装配 canonical 前端模块
-  netonapi-client/       网站前端（netonapi/netonapi-web）：门户首页、价格页与用户控制台，Next.js
+  netonapi-backend/      服务端（GitHub 仓 netonapi/netonapi）：网关模块 module-gateway 与装配，含 Dockerfile
+  netonapi-frontend/     管理后台（netonapi/netonapi-admincp）：Next.js，网关页面在 packages/front-gateway
+  netonapi-client/       网站前端（netonapi/netonapi-web）：门户首页、价格页与用户控制台，网关页面在 packages/client-gateway
   harness/               端到端 harness：真网关 + 假上游 + 隔离数据库
   docker-compose.yml     后端 + PostgreSQL + Redis + 两个前端 + Caddy 边缘
   deploy/                Caddyfile 与生产 compose 叠加
-Neton/                   ← 同级目录：框架与 canonical 模块（module-gateway 是网关核心）
+Neton/                   ← 同级目录：框架与 Neton Application 通用模块
 ```
 
 ## 快速开始
@@ -90,7 +90,7 @@ docker compose up -d --build
 
 - [DEPLOY.md](DEPLOY.md)：部署、密钥、定价与毛利、收款、渠道类型、端点能力、邮件通道、可观测性、升级
 - 服务端仓 `netonapi-backend/docs/`：产品规范（计价、模型目录、API Key、充值、转发错误、线上演练等）
-- `Neton/neton-application-module-gateway/docs/`：网关模块的结算设计与上游适配 / 转码规范
+- `netonapi-backend/module-gateway/docs/`：网关模块的结算设计与上游适配 / 转码规范
 - `harness/run.sh`：每条场景的注释就是行为规格
 
 ## 验证

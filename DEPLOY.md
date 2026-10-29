@@ -22,19 +22,17 @@ projects/
 │   ├── neton-application-module-member/
 │   ├── neton-application-module-payment/
 │   ├── neton-application-module-platform/
-│   ├── neton-application-module-gateway/   # NetonAPI 的核心模块
 │   ├── neton-application-front/            # 前端底座包（两个前端镜像都需要）
-│   ├── neton-application-front-{system,infra,account,member,payment,platform,gateway}/
-│   └── neton-application-client-{account,member,payment,gateway}/   # 控制台模块
+│   ├── neton-application-front-{system,infra,account,member,payment,platform}/
+│   └── neton-application-client-{account,member,payment}/   # 控制台模块
 └── NewGate/                                # 本仓（含 docker-compose.yml）
-    ├── netonapi-backend/                            # 后端发行版（Dockerfile 在此）
-    ├── netonapi-frontend/                      # 管理台
-    └── netonapi-client/                     # 用户控制台
+    ├── netonapi-backend/                            # 服务端（含网关模块 module-gateway/，Dockerfile 在此）
+    ├── netonapi-frontend/                      # 管理后台（含网关页面 packages/front-gateway/）
+    └── netonapi-client/                     # 网站前端（含网关页面 packages/client-gateway/）
 ```
 
-**构建前提**：需要上面每个仓的读权限。目前私有的是后端的 `neton-application-module-infra`、
-`neton-application-module-gateway`，管理台的 `neton-application-front-{gateway,member,payment}`，
-以及控制台的 `neton-application-client-gateway`；其余为公开仓。在它们公开之前，只凭公开源码构建不出镜像。
+**构建前提**：需要上面每个仓的读权限。目前私有的是服务端依赖的 `neton-application-module-infra`
+与管理后台依赖的 `neton-application-front-{member,payment}`；其余为公开仓。在它们公开之前，只凭公开源码构建不出镜像。
 
 **验证状态**：正式环境（首尔）目前是 systemd 直接运行二进制与 Next 服务，不经 Docker。下文的 Docker 路径
 （后端、两个前端镜像与 Caddy 边缘）还没有在实机上构建过；`COPY` 布局按 `settings.gradle.kts` 与各前端的 `file:` 依赖推导。

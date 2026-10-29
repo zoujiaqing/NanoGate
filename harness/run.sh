@@ -785,11 +785,11 @@ else
   sleep 2   # 等前序场景的在途结算落定，否则它们的 recordTokens 会混进本轮计数
   rkdel "*ngrl:rpm:${TID}:*"; rkdel "*ngrl:tpm:${TID}:*"; rkdel "*ngrl:cc:${TID}"
   seq 1 20 | xargs -P 20 -I{} curl -s --max-time 20 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-atom","messages":[]}'
-  sleep 2   # 非流式：先响应后结算，recordTokens 发生在结算之后
-  n=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1")
+  # 非流式：先响应后结算，recordTokens 发生在结算之后。等结算行与 TPM 落定再对账（机器忙时固定 sleep 不够）
+  n=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1" 20 75)
   dbt=$(q "SELECT COALESCE(SUM(prompt_tokens+completion_tokens),0) FROM gateway_usage_logs WHERE user_id=1")
   rpm=$(rksum "*ngrl:rpm:${TID}:*")   # 跳分钟窗口也要算全，否则边界上会假失败
-  tpm=$(rksum "*ngrl:tpm:${TID}:*")
+  for _ in $(seq 1 25); do tpm=$(rksum "*ngrl:tpm:${TID}:*"); [ "$tpm" = "$dbt" ] && break; sleep 0.2; done
   ttl=$(rc ttl "$(rc --scan --pattern "*ngrl:rpm:${TID}:*" | head -1)")
   [ "$n" = "20" ] && [ "$rpm" = "20" ] && [ "$tpm" = "$dbt" ] && [ "$dbt" != "0" ] && [ "${ttl:-0}" -gt 0 ] && [ "${ttl:-0}" -le 120 ] \
     && pass "20 并发：RPM=${rpm}（精确 20，无丢增量）、TPM=${tpm} == 账本 token 总数 ${dbt}、窗口键 TTL=${ttl}s" \
@@ -797,10 +797,9 @@ else
   q "UPDATE gateway_tokens SET concurrency_limit=3 WHERE key_hash='${TOKEN_HASH}';" >/dev/null
   rkdel "*ngrl:cc:${TID}"
   codes=$(seq 1 12 | xargs -P 12 -I{} curl -s --max-time 20 -o /dev/null -w "%{http_code}\n" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-atom","messages":[]}')
-  sleep 2
   nok=$(echo "$codes" | grep -c "^200$"); n429=$(echo "$codes" | grep -c "^429$")
+  led=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1" "$((20 + nok))" 75)
   ccn=$(rc --scan --pattern "*ngrl:cc:${TID}" | grep -c ngrl)
-  led=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1")
   q "UPDATE gateway_tokens SET rpm_limit=NULL, concurrency_limit=NULL WHERE key_hash='${TOKEN_HASH}';" >/dev/null
   # 429 的具体个数取决于调度时序（假上游太快时可能一个也不限），故只断言可对账的部分
   [ $((nok + n429)) -eq 12 ] && [ "$ccn" = "0" ] && [ "$led" = "$((20 + nok))" ] \
@@ -1975,8 +1974,8 @@ rm -f "$GB"
 #    根目录被跳时整棵子树跟着不可达）。
 echo "[S49] 权限→菜单→页面 接线完整性"
 NETON="$BACKEND_DIR/../../Neton"
-GWSRC="$NETON/neton-application-module-gateway/src/commonMain/kotlin"
-GWMANIFEST="$NETON/neton-application-front-gateway/src/manifest.ts"
+GWSRC="$BACKEND_DIR/module-gateway/src/commonMain/kotlin"
+GWMANIFEST="$ROOT/netonapi-frontend/packages/front-gateway/src/manifest.ts"
 A1=/tmp/s49-annot-$$; A2=/tmp/s49-seeded-$$; A3=/tmp/s49-comp-$$; A4=/tmp/s49-keys-$$
 if [ -d "$GWSRC" ]; then
   # 注解集只取字面量形式。已核实本模块 44 处 @Permission 全是字面量、无 @Permission(CONST)
@@ -2251,6 +2250,11 @@ B1=/tmp/s52-mods-$$; B2=/tmp/s52-pages-$$; B3=/tmp/s52-nav-$$; B4=/tmp/s52-icons
 if [ -f "$CONSOLE52/package.json" ] && [ -f "$NAV52" ] && [ -f "$SHELL52" ]; then
   grep -oE '"@neton/application-client-[a-z]+": "file:[^"]+"' "$CONSOLE52/package.json" \
     | sed 's/.*"file://;s/"$//' > "$B1"
+  # 产品独有的模块在本仓 packages/ 下、以 workspace:* 引入（如 client-gateway）：按包名找到目录，同样计入
+  grep -oE '"@neton/application-client-[a-z]+": "workspace:[^"]*"' "$CONSOLE52/package.json" \
+    | sed -E 's/^"@neton\/application-(client-[a-z]+)".*/\1/' | while read -r w52; do
+      if [ -f "$CONSOLE52/../../packages/$w52/src/manifest.ts" ]; then echo "../../packages/$w52"; fi
+    done >> "$B1"
   : > "$B2"
   # while read 而不是 for $mods：for 靠词分割，而词分割在 zsh 下不发生（整个多行串被当成一个
   # 路径）。本场景的提取链就是这么断过一次 —— 页面数算成 0，5 条正确的 nav 全被报成悬空入口。
