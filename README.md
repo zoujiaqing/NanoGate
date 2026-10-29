@@ -89,8 +89,7 @@ docker compose up -d --build
 ## 文档
 
 - [DEPLOY.md](DEPLOY.md)：部署、密钥、定价与毛利、收款、渠道类型、端点能力、邮件通道、可观测性、升级
-- [HANDOFF.md](HANDOFF.md)：项目交接：已完成 / 未完成 / 已知边界
-- `docs/superpowers/specs/`：设计文档（架构、协议转换矩阵、账务模型、决策记录）
+- 服务端仓 `netonapi-backend/docs/`：产品规范（计价、模型目录、API Key、充值、转发错误、线上演练等）
 - `Neton/neton-application-module-gateway/docs/`：网关模块的结算设计与上游适配 / 转码规范
 - `harness/run.sh`：每条场景的注释就是行为规格
 
