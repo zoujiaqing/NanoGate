@@ -3626,6 +3626,23 @@ pu=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/pay/c
 pcs=$(q "SELECT status || ':' || created_at FROM pay_channels WHERE id=${pcid:-0}")
 [ "$pu" = "200" ] && [ "$pcs" = "0:${pcc0}" ] && pass "编辑支付渠道（停用）：200、状态落库、创建时间不变" \
   || fail "编辑支付渠道: HTTP=${pu} 状态:创建时间=${pcs}(期望 0:${pcc0})"
+# 通道配置里的密钥只写不读：列表只给遮罩；带遮罩 / 留空 / 不写保存都沿用原值，填新值才替换；新建不收遮罩
+pcfg() { curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/pay/channel/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d "{\"id\":${pcid:-0},\"code\":\"s81_alipay\",\"platformCode\":\"alipay\",\"method\":\"alipay\",\"displayMode\":\"REDIRECT_URL\",\"config\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"),\"feeRate\":6,\"status\":0}"; }
+s1=$(pcfg '{"appId":"app81","privateKey":"pk-real-81","alipayPublicKey":"pub-81"}')
+listed81=$(curl -s --max-time 10 "$U/admin/pay/channel/page?pageNo=1&pageSize=50&code=s81_alipay" -H "Authorization: Bearer $GJWT")
+byc81=$(curl -s --max-time 10 "$U/admin/pay/channel/get-by-app-and-code?code=s81_alipay" -H "Authorization: Bearer $GJWT")
+s2=$(pcfg '{"appId":"app81b","privateKey":"******","alipayPublicKey":"pub-81"}'); k2=$(q "SELECT config::json->>'privateKey' || '|' || (config::json->>'appId') FROM pay_channels WHERE id=${pcid:-0}")
+s3=$(pcfg '{"appId":"app81b","alipayPublicKey":"pub-81"}'); k3=$(q "SELECT config::json->>'privateKey' FROM pay_channels WHERE id=${pcid:-0}")
+s4=$(pcfg '{"appId":"app81b","privateKey":"pk-new-81","alipayPublicKey":"pub-81"}'); k4=$(q "SELECT config::json->>'privateKey' FROM pay_channels WHERE id=${pcid:-0}")
+mk81=$(curl -s --max-time 10 -X POST "$U/admin/pay/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
+  -d '{"code":"s81_masked","platformCode":"alipay","method":"alipay","displayMode":"REDIRECT_URL","config":"{\"appId\":\"x\",\"privateKey\":\"******\"}"}')
+nmk81=$(q "SELECT COUNT(*) FROM pay_channels WHERE code='s81_masked'")
+[ "$s1" = "200" ] && ! grep -q "pk-real-81" <<< "$listed81$byc81" && grep -q 'privateKey\\":\\"\*\*\*\*\*\*' <<< "$listed81" && grep -q "pub-81" <<< "$listed81" \
+  && [ "$s2" = "200" ] && [ "$k2" = "pk-real-81|app81b" ] && [ "$s3" = "200" ] && [ "$k3" = "pk-real-81" ] && [ "$s4" = "200" ] && [ "$k4" = "pk-new-81" ] \
+  && grep -q "PAY_CHANNEL_SECRET_REQUIRED" <<< "$mk81" && [ "$nmk81" = "0" ] \
+  && pass "支付通道密钥只写不读：列表 / 详情只给 ******（公钥照常）、带遮罩或不写保存沿用原值、填新值替换、新建不收遮罩" \
+  || fail "通道密钥: 存=${s1} 列表漏密钥=$(grep -c pk-real-81 <<< "$listed81$byc81") 遮罩保存=${s2}/${k2} 不写保存=${s3}/${k3} 新值=${s4}/${k4} 新建遮罩=${mk81:0:120} 落库=${nmk81} 列表=${listed81:0:300}"
 # ══ S80 权限字符串规范（RBAC spec §3）：格式、冻结词汇表、死授权 ══
 echo "[S80] 权限字符串规范"
 # 1) 格式：三段式、全小写、复合词用连字符（§3.1 / §3.3）

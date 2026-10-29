@@ -6,14 +6,16 @@
 ## 依赖仓库布局
 
 镜像用 Gradle composite build，`netonapi-backend/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：
-本仓必须正好在那层目录的**两层深处**，框架与六个 canonical 模块必须落在同层的 `Neton/` 下。
+本仓必须正好在那层目录的**两层深处**，框架与七个 canonical 模块必须落在同层的 `Neton/` 下。
 外层目录名（`Neton`、`NewGate`）也是契约的一部分——`netonapi-backend/Dockerfile` 的 `COPY` 源同样写死了它们。
 
 ```
 projects/
 ├── Neton/
 │   ├── neton/                              # 框架（includeBuild）
+│   ├── neton-ai/                           # LLM 协议编解码（includeBuild）
 │   ├── geolite4k/                          # GeoIP（includeBuild）
+│   ├── neton-application-contract/         # 模块间契约（includeBuild）
 │   ├── neton-application-module-system/
 │   ├── neton-application-module-infra/
 │   ├── neton-application-module-account/
@@ -21,27 +23,22 @@ projects/
 │   ├── neton-application-module-payment/
 │   ├── neton-application-module-platform/
 │   ├── neton-application-module-gateway/   # NetonAPI 的核心模块
-│   ├── neton-application-front/            # 管理台基础包（前端镜像需要）
+│   ├── neton-application-front/            # 前端底座包（两个前端镜像都需要）
 │   ├── neton-application-front-{system,infra,account,member,payment,platform,gateway}/
-│   └── neton-application-client-{gateway,member,payment}/   # 控制台模块
+│   └── neton-application-client-{account,member,payment,gateway}/   # 控制台模块
 └── NewGate/                                # 本仓（含 docker-compose.yml）
     ├── netonapi-backend/                            # 后端发行版（Dockerfile 在此）
     ├── netonapi-frontend/                      # 管理台
     └── netonapi-client/                     # 用户控制台
 ```
 
-> ⚠️ 八个仓里有六个是公开的（`netonframework/neton`、`netonframework/geolite4k`、
-> `neton-application/neton-application-module-{system,member,payment,platform}`），但
-> **`neton-application-module-infra` 与 `neton-application-module-gateway` 目前是私有仓**。
-> 没有这两个仓的读权限就 clone 不全、也就构建不出镜像；它们转公开之前，本仓的公开只是
-> 「源码可读」，不是「人人可自建」。前端同理（见各自 README）。
+**构建前提**：需要上面每个仓的读权限。目前私有的是后端的 `neton-application-module-infra`、
+`neton-application-module-gateway`，管理台的 `neton-application-front-{gateway,member,payment}`，
+以及控制台的 `neton-application-client-gateway`；其余为公开仓。在它们公开之前，只凭公开源码构建不出镜像。
 
-> ⚠️ 下文 Docker 路径**尚未在实机验证过**（修正时的开发机上 Docker daemon 未运行）。
-> 两个前端镜像（`netonapi-frontend/Dockerfile`、`netonapi-client/Dockerfile`）与 Caddy 边缘同样**未实机构建过**，
-> 写法照后端镜像的上下文约定推导；首次 `docker compose build` 请当作待验证项。
-> `COPY` 布局是按 `settings.gradle.kts` 的路径推导修正的，此前它既漏了三个必需仓、
-> 又把应用放在了 `../../Neton` 解不到的深度。首次 `docker compose build` 请当作待验证项，
-> 失败时先看是不是布局问题。
+**验证状态**：正式环境（首尔）目前是 systemd 直接运行二进制与 Next 服务，不经 Docker。下文的 Docker 路径
+（后端、两个前端镜像与 Caddy 边缘）还没有在实机上构建过；`COPY` 布局按 `settings.gradle.kts` 与各前端的 `file:` 依赖推导。
+首次 `docker compose build` 失败时，先核对 `COPY` 是否与 `settings.gradle.kts` 一致。
 
 ## 本机开发（不经 Docker）
 
@@ -197,13 +194,13 @@ API 客户端（OpenAI / Anthropic / Gemini SDK）的 base URL 用 `8888`（生�
 
 启动日志里这两行各说各的后果（logger `payment.callback-url`），不会互相借词。
 
-⚠️ **别把兜底那条路也关掉**：`pay-order-reconcile` 在后台定时任务页可以停用（`infra_jobs` 是运行期
+**停用对账任务前先配回调基址**：`pay-order-reconcile` 在后台定时任务页可以停用（`infra_jobs` 是运行期
 调度真源，代码 `@Job` 只定义 handler）。它被停用、而 `PAY_NOTIFY_BASE` 又没配的话，两条到账路径
 同时断掉 —— **钱会到账，额度永远不发**：用户只看到「付了钱没额度」，运维只看到订单一直待支付，
 两边都看不出原因。启动时会为这个组合打一行 ERROR 点名是哪两条；但它**只在启动时查一次**，
 运行期在后台停用不会重新检查 —— 所以停用那个任务前，先确认回调基址已经配了。
 
-⚠️ 别填容器内部地址（`http://localhost:8800`、`http://netonapi:8800`）：本地跑得通，
+**回调与跳转地址必须是公网可达的地址**，别填容器内部地址（`http://localhost:8800`、`http://netonapi:8800`）：本地跑得通，
 上线后一律回调失败，而失败发生在渠道那一侧 —— 你的日志里只会看到订单一直是待支付。
 
 漏写 `https://` 之类的非法值**不会**被静默当成没配：按未配置处理并记 ERROR。
