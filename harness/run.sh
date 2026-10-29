@@ -3663,8 +3663,9 @@ badact=$(q "SELECT COALESCE(string_agg(DISTINCT permission, ' '), '') FROM syste
 #    模块源码路径沿用本 harness 一贯的仓库布局假设（与 gradle 的 ../../Neton 同源）
 MODSRC="$HERE/../../Neton"
 if [ -d "$MODSRC" ]; then
-  for m in system infra account member payment platform gateway; do
-    grep -rhoE '@Permission\("[^"]+"\)' "$MODSRC/neton-application-module-$m/src/commonMain/kotlin" 2>/dev/null | sed 's/@Permission("//;s/")//'
+  # gateway 模块在服务端仓 module-gateway/，其余是 Neton/ 下的通用模块
+  for d in "$MODSRC"/neton-application-module-{system,infra,account,member,payment,platform} "$BACKEND_DIR/module-gateway"; do
+    grep -rhoE '@Permission\("[^"]+"\)' "$d/src/commonMain/kotlin" 2>/dev/null | sed 's/@Permission("//;s/")//'
   done | sort -u > /tmp/netonapi-backend-perms.txt
   q "SELECT DISTINCT permission FROM system_menus WHERE permission <> '' AND status = 1" | sort -u > /tmp/netonapi-menu-perms.txt
   dead=$(comm -13 /tmp/netonapi-backend-perms.txt /tmp/netonapi-menu-perms.txt | tr '\n' ' ')
