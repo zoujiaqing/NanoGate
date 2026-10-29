@@ -14,8 +14,12 @@ ROOT="$(cd "$HERE/.." && pwd)"
 BACKEND_DIR="$ROOT/netonapi-backend"
 # 构建目标可覆盖：本机默认 macosArm64，CI（Linux）传 NETONAPI_TARGET=linuxX64
 TARGET="${NETONAPI_TARGET:-macosArm64}"
-LINK_TASK="${NETONAPI_LINK_TASK:-:application:linkDebugExecutable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
-APP="$BACKEND_DIR/application/build/bin/$TARGET/debugExecutable/application.kexe"
+# 构建类型可覆盖：本机默认 debug（链接快）；CI（Linux）传 NETONAPI_BUILD_TYPE=release，测的就是上线的那种产物
+# （Linux 上 debug 链接走 Kotlin/Native 编译器缓存，会把 cryptography-kotlin 预编译的 OpenSSL 与 openssl-kotlin 的重复链入）
+BUILD_TYPE="${NETONAPI_BUILD_TYPE:-debug}"
+case "$BUILD_TYPE" in debug) BT=Debug ;; release) BT=Release ;; *) echo "NETONAPI_BUILD_TYPE 只能是 debug 或 release" >&2; exit 2 ;; esac
+LINK_TASK="${NETONAPI_LINK_TASK:-:application:link${BT}Executable$(echo "${TARGET:0:1}" | tr '[:lower:]' '[:upper:]')${TARGET:1}}"
+APP="$BACKEND_DIR/application/build/bin/$TARGET/${BUILD_TYPE}Executable/application.kexe"
 LOGS="$HERE/logs"; mkdir -p "$LOGS"
 DB="netonapi_harness_$$"
 TOKEN_PLAINTEXT="sk-harness-token-000000000000000000000000000000000000"
