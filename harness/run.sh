@@ -1882,6 +1882,15 @@ d=[r for r in json.load(sys.stdin).get('data') or [] if r['userId'] in (90481,90
 print(';'.join(f\"{r['userId']}:{r['models']}:{r['updatedAt']}\" for r in d))" 2>/dev/null)
 grp48=$(printf '%s' "$u48" | grep -c 'vip-s48')
 q "DELETE FROM gateway_price_rules WHERE subject_id IN ('90481','90482','vip-s48')" >/dev/null
+# 用户价目表（管理端）：default 始终在（他随时能建不绑分组的 Key），他的 Key 所在分组各一张，带 Key 数
+pb48a=$(curl -s --max-time 10 "$U/admin/gateway/price-rule/pricebook?userId=90481" -H "Authorization: Bearer $GJWT" \
+  | python3 -c "import sys,json;print(','.join(f\"{g['groupCode']}:{g['keys']}\" for g in json.load(sys.stdin)['data']))" 2>/dev/null)
+pb48b=$(curl -s --max-time 10 "$U/admin/gateway/price-rule/pricebook?userId=1" -H "Authorization: Bearer $GJWT" \
+  | python3 -c "import sys,json;print(','.join(f\"{g['groupCode']}:{g['keys']}\" for g in json.load(sys.stdin)['data']))" 2>/dev/null)
+k48=$(q "SELECT COUNT(*) FROM gateway_tokens WHERE user_id=1 AND deleted=0 AND COALESCE(group_override,'')=''")
+[ "$pb48a" = "default:0" ] && [ "${pb48b%%,*}" = "default:${k48}" ] \
+  && pass "用户价目表：没有 Key 的用户也有 default（${pb48a}），有 Key 的带 Key 数（${pb48b}）" \
+  || fail "用户价目表分组不对: 无 Key 用户=${pb48a}(期望 default:0) 用户1=${pb48b}(期望以 default:${k48} 开头)"
 [ "$v48" = "90481:2:3000;90482:1:2000" ] && [ "$grp48" = "0" ] \
   && pass "用户定价列表：按用户聚合约定了几个模型、最近修改在前（${v48}），分组规则不混进来" \
   || fail "用户定价列表不对: 得到=${v48}(期望 90481:2:3000;90482:1:2000) 分组规则泄漏=${grp48} body=${u48:0:200}"
