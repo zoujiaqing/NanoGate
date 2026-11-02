@@ -262,7 +262,8 @@ check(row and row["source"] == "USER" and row.get("discountBp") == 7000, f"他�
 s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}, OAI)
 time.sleep(3)
 lg = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=1")[1]["data"]["list"][0]
-exp = math.ceil(int(lg["promptTokens"]) * 0.15 * 0.7 - 1e-9) + math.ceil(int(lg["completionTokens"]) * 0.6 * 0.7 - 1e-9)
+# 结算口径：先按售价轨逐项向上取整，再整体 × 折扣、向下取整（PricingCalc.charge，与分组倍率同一条路径）
+exp = (math.ceil(int(lg["promptTokens"]) * 0.15 - 1e-9) + math.ceil(int(lg["completionTokens"]) * 0.6 - 1e-9)) * 7000 // 10000
 check(s == 200 and int(lg["charged"]) == exp, f"按 7 折扣费：tokens {lg['promptTokens']}+{lg['completionTokens']} → {lg['charged']} μUSD（期望 {exp}）", f"{s} {lg}")
 s, b = admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4o-mini")
 s2, pb = backend("GET", "/app/gateway/pricebook/mine")
