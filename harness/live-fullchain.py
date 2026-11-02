@@ -16,13 +16,15 @@
 环境变量：ADMIN_USER / ADMIN_PASSWORD；MODEL（缺省 gpt-4.1-mini）；CHANNELS（逗号分隔渠道 ID，缺省 26,27）；
 ADMIN_URL / API_URL 同 live-e2e.py。
 """
-import json, os, sys, time, urllib.error, urllib.request, secrets, math
+import json, os, sys, time, urllib.error, urllib.request, secrets, math, uuid
 
 ADMIN = os.environ.get("ADMIN_URL", "https://admin.neton.cloud")
 API = os.environ.get("API_URL", "https://api.neton.cloud")
 MODEL = os.environ.get("MODEL", "gpt-4.1-mini")
 CHANNELS = [int(x) for x in os.environ.get("CHANNELS", "26,27").split(",") if x.strip()]
 RESULTS = []
+# 会员登录 / 注册必须带客户端生成的 UUID v4 设备号（account 模块的设备号契约）
+DEVICE = {"deviceId": str(uuid.uuid4()), "platform": "web"}
 
 
 def check(ok, name, detail=""):
@@ -95,8 +97,8 @@ try:
     # ════════ 2. 新用户、手动充值 ════════
     uname = "fc" + secrets.token_hex(4)
     pw = "fc-" + secrets.token_hex(8)
-    http("POST", f"{ADMIN}/app/auth/register", {"mode": "USERNAME_PASSWORD", "username": uname, "password": pw, "nickname": "fullchain"})
-    login = data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": uname, "password": pw}), "member login")
+    http("POST", f"{ADMIN}/app/auth/register", {"device": DEVICE, "mode": "USERNAME_PASSWORD", "username": uname, "password": pw, "nickname": "fullchain"})
+    login = data(http("POST", f"{ADMIN}/app/auth/login-username", {"device": DEVICE, "username": uname, "password": pw}), "member login")
     MTOK, UID = login["accessToken"], int(login["userId"])
     admin("POST", "/gateway/quota/grant", {"userId": UID, "amount": 1_000_000, "ref": f"manual:fullchain-{UID}"})
     bal0 = data(app("GET", "/gateway/usage/balance"), "balance")

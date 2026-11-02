@@ -12,12 +12,14 @@
   MOCK_STATS_CMD：取 mock 统计的命令前缀（如 "ssh … root@host"），设了才核对上游侧
 只建 / 改名字以 e2e- 开头的渠道与 Key，跑完删掉本次建的 Key；渠道与价格保留，下次覆盖。
 """
-import json, os, shlex, ssl, subprocess, sys, time, urllib.error, urllib.request
+import json, os, shlex, ssl, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 ADMIN = os.environ.get("ADMIN_URL", "https://admin.neton.cloud").rstrip("/")
 API = os.environ.get("API_URL", "https://api.neton.cloud").rstrip("/")
 CTX = ssl.create_default_context()
 RESULTS = []
+# 会员登录 / 注册必须带客户端生成的 UUID v4 设备号（account 模块的设备号契约）
+DEVICE = {"deviceId": str(uuid.uuid4()), "platform": "web"}
 
 # 价格（USD / 1M tokens）与模拟上游的固定用量（与 mock-provider.py 的 USAGE 一致）
 PRICES = {
@@ -160,7 +162,7 @@ for model in PRICES:
 
 # ════════════════════════ 用户：登录、充值、建 Key ════════════════════════
 print("[member] 登录、管理员手动充值、兑换码、建 Key")
-MTOK = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": os.environ["MEMBER_USER"], "password": os.environ["MEMBER_PASSWORD"]}), "member login")["accessToken"]
+MTOK = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"device": DEVICE, "username": os.environ["MEMBER_USER"], "password": os.environ["MEMBER_PASSWORD"]}), "member login")["accessToken"]
 uid = next(u["id"] for u in admin("GET", f"/account/user/page?pageNo=1&pageSize=5&username={os.environ['MEMBER_USER']}")["list"] if u.get("username") == os.environ["MEMBER_USER"])
 bal0 = ok_data(app("GET", "/gateway/usage/balance"), "balance")
 admin("POST", "/gateway/quota/grant", {"userId": uid, "amount": 20_000_000, "ref": f"manual:e2e-{int(time.time())}"})
@@ -364,8 +366,8 @@ check(codes[:2] == [200, 200] and codes[2] == 429, "运营设的每分钟 2 次�
 
 # 零余额用户：注册（已存在就登录）、建 Key、调用 → 402
 poor_user, poor_pw = "e2epoor", "e2e-poor-pass-9"  # 用户名只允许字母数字下划线
-r = http("POST", f"{ADMIN}/app/auth/register", {"mode": "USERNAME_PASSWORD", "username": poor_user, "password": poor_pw, "nickname": "e2e poor"})
-plogin = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"username": poor_user, "password": poor_pw}), "poor login")
+r = http("POST", f"{ADMIN}/app/auth/register", {"device": DEVICE, "mode": "USERNAME_PASSWORD", "username": poor_user, "password": poor_pw, "nickname": "e2e poor"})
+plogin = ok_data(http("POST", f"{ADMIN}/app/auth/login-username", {"device": DEVICE, "username": poor_user, "password": poor_pw}), "poor login")
 ptok = plogin["accessToken"]
 pbal = ok_data(app("GET", "/gateway/usage/balance", tok=ptok), "poor balance")
 if pbal["available"] > 0 and plogin.get("userId"):

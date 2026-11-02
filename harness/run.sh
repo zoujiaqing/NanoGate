@@ -269,7 +269,9 @@ seed_reset; fake bigstream 9960; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('big','openai_compatible','http://127.0.0.1:9960','default','m-pr',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='big'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-pr','0','0','0','0',5000,5000,'manual',0,0,0);" >/dev/null
-curl -sN --max-time 1 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-pr","stream":true,"messages":[]}' >/dev/null 2>&1; sleep 3
+curl -sN --max-time 1 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-pr","stream":true,"messages":[]}' >/dev/null 2>&1
+# 等结算落库再核对（固定 sleep 3 在机器忙时会读到空行，偶发误报）
+wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-pr'" 1 50 >/dev/null
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-pr' ORDER BY id DESC LIMIT 1")
 ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
 bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
@@ -563,6 +565,21 @@ bad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models" -H "x-
 [ "$ck" = "200" ] && [ "$gk" = "200" ] && [ "$bad" != "200" ] \
   && pass "原生认证载体：x-api-key=200、x-goog-api-key=200、错误 key 被拒(${bad})" \
   || fail "原生认证错: x-api-key=${ck} x-goog-api-key=${gk} 错误key=${bad}"
+# Gemini 的 ?key= 查询参数（Google 文档里的 curl 写法）；错误 key 同样被拒
+qk=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models?alt=sse&key=${TOKEN_PLAINTEXT}")
+qbad=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/v1/models?key=sk-wrong-key")
+[ "$qk" = "200" ] && [ "$qbad" = "401" ] \
+  && pass "?key= 查询参数认证：正确 key=200、错误 key=401" \
+  || fail "?key= 认证错: 正确=${qk} 错误=${qbad}"
+# 认证失败按入站协议回官方错误结构（SDK 读 error.message / error.type），不是框架信封
+oe=$(curl -s --max-time 10 -X POST "$U/v1/chat/completions" -H "Authorization: Bearer sk-wrong-key" -H "Content-Type: application/json" -d '{}')
+ae=$(curl -s --max-time 10 -X POST "$U/v1/messages" -H "Content-Type: application/json" -d '{}')
+ge=$(curl -s --max-time 10 -X POST "$U/v1beta/models/gemini-2.5-flash:generateContent?key=sk-wrong-key" -H "Content-Type: application/json" -d '{}')
+echo "$oe" | grep -q '"code":"invalid_api_key"' && echo "$oe" | grep -q '"message":"invalid API key"' \
+  && echo "$ae" | grep -q '"type":"authentication_error"' && echo "$ae" | grep -q '"message":"missing API key"' \
+  && echo "$ge" | grep -q '"status":"UNAUTHENTICATED"' && ! echo "$oe$ae$ge" | grep -q AUTH_REQUIRED \
+  && pass "认证失败按协议回错误结构：OpenAI invalid_api_key、Anthropic authentication_error、Gemini UNAUTHENTICATED" \
+  || fail "认证失败错误结构不对: openai=${oe} anthropic=${ae} gemini=${ge}"
 
 # ══ S16 用户端 app 路由组：自助令牌 / 用量 / 模型广场 / 越权防护 ══
 echo "[S16] 用户端 app API"
@@ -970,9 +987,9 @@ sms_register() {
   code=$(sms_code_of "$mobile")
   if [ -z "$code" ]; then echo "0 NO_SMS_CODE_IN_REDIS"; return 0; fi
   if [ -n "$invite" ]; then
-    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\",\"inviteCode\":\"$invite\"}"
+    body="{\"device\":{\"deviceId\":\"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"platform\":\"web\"},\"mobile\":\"$mobile\",\"smsCode\":\"$code\",\"inviteCode\":\"$invite\"}"
   else
-    body="{\"mobile\":\"$mobile\",\"smsCode\":\"$code\"}"
+    body="{\"device\":{\"deviceId\":\"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"platform\":\"web\"},\"mobile\":\"$mobile\",\"smsCode\":\"$code\"}"
   fi
   resp=$(curl -s --max-time 15 -X POST "$U/app/auth/sms-login" -H "$CT" -d "$body")
   out=$(printf '%s' "$resp" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(d.get('userId') or 0, d.get('accessToken') or '')" 2>/dev/null)
@@ -2953,8 +2970,8 @@ lgv=$(echo "$lgp" | python3 -c "import sys,json;l=json.load(sys.stdin)['data']['
 # ══ S69 控制台自助注册：用户名密码模式必须开着（NetonAPI 在 Main.kt 绑定了 MemberAuthPolicy）══
 echo "[S69] 用户名密码注册"
 rg=$(curl -s --max-time 30 -o /tmp/netonapi-reg.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" \
-  -d '{"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/netonapi-reg.json)
-lg=$(curl -s --max-time 30 -o /tmp/netonapi-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s69user","password":"s69pass123"}')
+  -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"mode":"USERNAME_PASSWORD","username":"s69user","password":"s69pass123","nickname":"s69"}'); rgb=$(cat /tmp/netonapi-reg.json)
+lg=$(curl -s --max-time 30 -o /tmp/netonapi-lg.json -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"username":"s69user","password":"s69pass123"}')
 [ "$rg" = "200" ] && grep -q '"code":0' <<< "$rgb" && [ "$lg" = "200" ] && grep -q 'accessToken' /tmp/netonapi-lg.json \
   && pass "用户名注册 200 且能用该账号登录" || fail "注册: HTTP=$rg body=$rgb 登录 HTTP=$lg body=$(head -c 200 /tmp/netonapi-lg.json)"
 
@@ -3112,7 +3129,7 @@ q "DELETE FROM system_message_channels WHERE type='email'" >/dev/null 2>&1
 mac=$(curl -s --max-time 10 -o /tmp/netonapi-mac.json -w "%{http_code}" -X POST "$U/admin/system/mail-account/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d '{"mail":"noreply@netonapi.test","fromName":"NetonAPI","vendor":"http","apiKey":"mail-key","endpoint":"http://127.0.0.1:9939/send","status":1}')
 [ "$mac" = "200" ] && pass "邮箱账号（vendor=http）创建成功，SMTP 字段不再必填" || fail "邮箱账号创建: HTTP=$mac $(head -c 200 /tmp/netonapi-mac.json)"
-rg=$(curl -s --max-time 30 -X POST "$U/app/auth/register" -H "$CT" -d '{"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
+rg=$(curl -s --max-time 30 -X POST "$U/app/auth/register" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"mode":"USERNAME_PASSWORD","username":"s77user","password":"s77pass123","nickname":"s77"}')
 S77T=$(echo "$rg" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['accessToken'])" 2>/dev/null)
 sc=$(curl -s --max-time 10 -o /tmp/netonapi-sec.json -w "%{http_code}" -X POST "$U/app/member/user/send-email-code" -H "Authorization: Bearer $S77T" -H "$CT" -d '{"email":"S77@Example.com","scene":"bind_email"}')
 lm=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail")
@@ -3135,12 +3152,12 @@ rkdel "*vc:cooldown:*"
 curl -s --max-time 10 -o /dev/null -X POST "$U/app/auth/send-email-code" -H "$CT" -d '{"email":"s77@example.com","scene":"reset_password"}'
 code2=$(curl -s --max-time 5 "http://127.0.0.1:9939/last-mail" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(re.search(r'\\d{6}', d['body']['text']).group(0))" 2>/dev/null)
 rp=$(curl -s --max-time 10 -o /tmp/netonapi-rp.json -w "%{http_code}" -X PUT "$U/app/auth/reset-password-by-email" -H "$CT" -d "{\"email\":\"s77@example.com\",\"code\":\"$code2\",\"newPassword\":\"newpass12345\"}")
-lg=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}')
-old=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"s77pass123"}')
+lg=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"username":"s77user","password":"newpass12345"}')
+old=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST "$U/app/auth/login-username" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"username":"s77user","password":"s77pass123"}')
 [ "$rp" = "200" ] && [ "$lg" = "200" ] && [ "$old" != "200" ] && pass "邮箱找回密码：新密码能登、旧密码失效" || fail "找回密码: reset=$rp newLogin=$lg oldLogin=$old $(head -c 200 /tmp/netonapi-rp.json)"
 # 重置密码作废该账号的全部会话（spec identity-realm）：旧令牌必须 401；S78 继续用这个账号，按新密码重新登录。
 stale77=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/user/get" -H "Authorization: Bearer $S77T")
-S77T=$(curl -s --max-time 30 -X POST "$U/app/auth/login-username" -H "$CT" -d '{"username":"s77user","password":"newpass12345"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
+S77T=$(curl -s --max-time 30 -X POST "$U/app/auth/login-username" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"username":"s77user","password":"newpass12345"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
 [ "$stale77" = "401" ] && [ -n "$S77T" ] && pass "重置密码后旧令牌失效" || fail "重置密码后会话: 旧令牌=${stale77}(期望401) 新令牌=${S77T:-无}"
 ml=$(q "SELECT COUNT(*) FROM system_message_logs WHERE receiver='s77@example.com' AND send_status=0")
 [ "$ml" = "2" ] && pass "两封验证码邮件都进了邮件日志" || fail "邮件日志行=$ml"
@@ -3445,7 +3462,7 @@ pub87=$(curl -s --max-time 10 "$U/admin/system/site/public" | python3 -c "import
 reg87() { # $1=凭证（空=不带） $2=用户名 $3=XFF
   local h=(); [ -n "$1" ] && h=(-H "X-Captcha-Token: $1")
   curl -s --max-time 15 -o /tmp/ng-s87.json -w "%{http_code}" -X POST "$U/app/auth/register" -H "$CT" ${h[@]+"${h[@]}"} -H "X-Forwarded-For: $3" \
-    -d "{\"mode\":\"USERNAME_PASSWORD\",\"username\":\"$2\",\"password\":\"s87pass123\"}"
+    -d "{\"device\":{\"deviceId\":\"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"platform\":\"web\"},\"mode\":\"USERNAME_PASSWORD\",\"username\":\"$2\",\"password\":\"s87pass123\"}"
 }
 msg87() { python3 -c "import json;print(json.load(open('/tmp/ng-s87.json')).get('message',''))" 2>/dev/null; }
 r1=$(reg87 "" s87a 203.0.113.91); m1=$(msg87)
@@ -3533,7 +3550,7 @@ nkv=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data')
 setpw=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"","newPassword":"s84-pass-123"}')
 # 设密码同样作废该账号的全部会话（spec identity-realm）：旧令牌 401，用手机号 + 新密码重新登录。
 stale84=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$U/app/member/user/get" -H "Authorization: Bearer $t84")
-t84=$(curl -s --max-time 30 -X POST "$U/app/auth/login" -H "$CT" -d '{"mobile":"+8615000084001","password":"s84-pass-123"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
+t84=$(curl -s --max-time 30 -X POST "$U/app/auth/login" -H "$CT" -d '{"device":{"deviceId":"6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f","platform":"web"},"mobile":"+8615000084001","password":"s84-pass-123"}' | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('accessToken',''))" 2>/dev/null)
 [ "$stale84" = "401" ] && [ -n "$t84" ] && pass "设密码后旧令牌失效，新密码可登录" || fail "设密码后会话: 旧令牌=${stale84}(期望401) 新登录令牌=${t84:-无}"
 haspw=$(mget | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('hasPassword'))" 2>/dev/null)
 wrongpw=$(curl -s --max-time 10 -o /tmp/ng-wrongpw-$$.json -w "%{http_code}" -X PUT "$U/app/member/user/update-password" -H "Authorization: Bearer $t84" -H "$CT" -d '{"oldPassword":"nope-nope","newPassword":"s84-pass-456"}')
