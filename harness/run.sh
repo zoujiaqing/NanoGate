@@ -1860,8 +1860,8 @@ k3=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b3" && k3=yes
 
 rm -f "$GB"
 
-echo "[S48] 用户专属分组已下线（V028）；「用户定价」列表按用户列出约定价"
-# 给单个用户调价只剩「用户定价」（用户 × 模型的定价规则）；专线 / 特价分组由运营指定到 Key 上。
+echo "[S48] 用户专属分组已下线（V028）；「协议定价」列表按用户列出约定价"
+# 给单个用户调价只剩「协议定价」（用户 × 模型的定价规则）；专线 / 特价分组由运营指定到 Key 上。
 # 这里钉住两件事：旧的表 / 接口 / 菜单都不在了（不会有第二个入口悄悄改价），新列表只按用户聚合。
 stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
 [ -n "$GJWT" ] || GJWT=$(admin_jwt)   # 复用：admin 登录有 IP 限流，token 跨重启有效
@@ -1892,8 +1892,8 @@ k48=$(q "SELECT COUNT(*) FROM gateway_tokens WHERE user_id=1 AND deleted=0 AND C
   && pass "用户价目表：没有 Key 的用户也有 default（${pb48a}），有 Key 的带 Key 数（${pb48b}）" \
   || fail "用户价目表分组不对: 无 Key 用户=${pb48a}(期望 default:0) 用户1=${pb48b}(期望以 default:${k48} 开头)"
 [ "$v48" = "90481:2:3000;90482:1:2000" ] && [ "$grp48" = "0" ] \
-  && pass "用户定价列表：按用户聚合约定了几个模型、最近修改在前（${v48}），分组规则不混进来" \
-  || fail "用户定价列表不对: 得到=${v48}(期望 90481:2:3000;90482:1:2000) 分组规则泄漏=${grp48} body=${u48:0:200}"
+  && pass "协议定价列表：按用户聚合约定了几个模型、最近修改在前（${v48}），分组规则不混进来" \
+  || fail "协议定价列表不对: 得到=${v48}(期望 90481:2:3000;90482:1:2000) 分组规则泄漏=${grp48} body=${u48:0:200}"
 
 # ══ S49 权限 → 菜单 → 页面 的接线完整性（常驻哨兵）══
 # 前面 48 个场景断言的都是「跑起来的行为」，这一条断言的是「能不能被委派」。
@@ -3494,7 +3494,8 @@ echo "[S82] 站点品牌配置"
 site() { curl -s --max-time 10 "$U/admin/system/site/public" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('name',''),'|',d.get('tagline',''))" 2>/dev/null; }
 setsite() { curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST "$U/admin/system/setting/update" -H "Authorization: Bearer $GJWT" -H "$CT" -d "{\"key\":\"$1\",\"value\":\"$2\"}"; }
 listed=$(curl -s --max-time 10 "$U/admin/system/setting/list?category=system" -H "Authorization: Bearer $GJWT" | grep -o '"key":"system\.site\.[a-z]*"' | sort | tr '\n' ' ')
-[ "$listed" = '"key":"system.site.name" "key":"system.site.tagline" ' ] && pass "配置管理里列出 system.site.name / system.site.tagline" || fail "配置管理列表: $listed"
+# 只要求品牌两项都在：system 模块以后再加站点设置（如 system.site.locale）不该让这条误报
+case "$listed" in *'"key":"system.site.name"'*'"key":"system.site.tagline"'*) pass "配置管理里列出 system.site.name / system.site.tagline（全部：${listed}）";; *) fail "配置管理列表: $listed";; esac
 [ "$(site)" = "Neton | " ] && pass "匿名读到默认品牌（Neton，副标题空）" || fail "默认品牌: $(site)"
 c1=$(setsite system.site.name "Neton Cloud"); c2=$(setsite system.site.tagline "API GATEWAY")
 [ "$c1" = "200" ] && [ "$c2" = "200" ] && [ "$(site)" = "Neton Cloud | API GATEWAY" ] \

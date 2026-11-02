@@ -250,20 +250,20 @@ print("     统计：", str(b)[:300])
 check(ok((s, b)), "用量统计接口可用", f"{s} {str(b)[:150]}")
 
 # ═══ 8. Key 限制 ═══
-print("[7b] 用户定价：管理员给他 gpt-4o-mini 打 7 折")
+print("[7b] 协议定价：管理员给他 gpt-4o-mini 打 7 折")
 s, b = admin("PUT", "/admin/gateway/price-rule/save", {"subjectType": "USER", "subjectId": str(UID), "model": "gpt-4o-mini", "mode": "OFFICIAL_DISCOUNT", "discount": "0.7"})
 check(ok((s, b)), f"设 7 折（毛利 {(b.get('data') or {}).get('status') if isinstance(b, dict) else ''}）", f"{s} {str(b)[:200]}")
 s, b = admin("GET", "/admin/gateway/price-rule/users")
 mine = next((u for u in (b.get("data") or []) if u.get("userId") == UID), None) if isinstance(b, dict) else None
-check(mine is not None and mine.get("models") == 1, f"「用户定价」列表里有他：{mine}", str(b)[:200])
+check(mine is not None and mine.get("models") == 1, f"「协议定价」列表里有他：{mine}", str(b)[:200])
 s, pb = backend("GET", "/app/gateway/pricebook/mine")
 row = next((r for g in pb["data"] for r in g["rows"] if r["model"] == "gpt-4o-mini"), None)
 check(row and row["source"] == "USER" and row.get("discountBp") == 7000, f"他的价目表：gpt-4o-mini {row and row['price']['input']}/{row and row['price']['output']}、来源 {row and row['source']}、{row and row.get('discountBp')}", str(row)[:200])
 s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}, OAI)
 time.sleep(3)
 lg = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=1")[1]["data"]["list"][0]
-# 结算口径：先按售价轨逐项向上取整，再整体 × 折扣、向下取整（PricingCalc.charge，与分组倍率同一条路径）
-exp = (math.ceil(int(lg["promptTokens"]) * 0.15 - 1e-9) + math.ceil(int(lg["completionTokens"]) * 0.6 - 1e-9)) * 7000 // 10000
+# 结算口径：按价目表上的实付单价（0.105 / 0.42）逐项向上取整——展示的单价就是扣费的单价
+exp = math.ceil(int(lg["promptTokens"]) * 0.105 - 1e-9) + math.ceil(int(lg["completionTokens"]) * 0.42 - 1e-9)
 check(s == 200 and int(lg["charged"]) == exp, f"按 7 折扣费：tokens {lg['promptTokens']}+{lg['completionTokens']} → {lg['charged']} μUSD（期望 {exp}）", f"{s} {lg}")
 s, b = admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4o-mini")
 s2, pb = backend("GET", "/app/gateway/pricebook/mine")
