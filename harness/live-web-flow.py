@@ -224,8 +224,8 @@ time.sleep(4)
 s, b = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=50")
 logs = (b.get("data") or {}).get("list", []) if isinstance(b, dict) else []
 okcalls = [c for c in calls]
-check(len([l for l in logs if l.get("status") == "ok"]) == len(okcalls) + 1,
-      f"使用日志 {len(logs)} 条，全部 status=ok（{len(okcalls)} 次调用 + 缺 messages 那次透传）", json.dumps(logs[:1], ensure_ascii=False)[:300])
+check(len([l for l in logs if l.get("status") == "ok"]) == len(logs) == len(okcalls) + 3,
+      f"使用日志 {len(logs)} 条，全部 status=ok（{len(okcalls)} 次调用 + 缺 messages 透传 + 两次 ?key= 调用）", json.dumps(logs[:1], ensure_ascii=False)[:300])
 if logs:
     print("     日志字段：", sorted(logs[0].keys()))
 cost = sum(int(l["charged"]) for l in logs)
