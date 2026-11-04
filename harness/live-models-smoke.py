@@ -5,7 +5,7 @@
 对话模型发一句话（推理模型多给些输出额度，否则可能只想不答），向量模型算一条 embedding。花费几美分。
 
 环境变量：ADMIN_USER / ADMIN_PASSWORD；WEB_URL / API_URL / ADMIN_URL（缺省 neton.cloud 三个域名）。
-跑完删掉本次建的 Key；用户保留（e2es… 开头）。
+跑完删掉本次建的 Key。设了 MEMBER_USER / MEMBER_PASSWORD 就用这个测试账号，否则新注册一个（e2es… 开头）。
 """
 import http.cookiejar, json, math, os, secrets, sys, time, urllib.error, urllib.request, uuid
 
@@ -50,12 +50,23 @@ def backend(method, path, body=None):
     return req(web, method, WEB + "/api/backend" + path, body, WEBH)
 
 
+def member_session(prefix):
+    """有 MEMBER_USER / MEMBER_PASSWORD 就登录这个测试账号（不占注册限流：每 IP 每小时 10 次）；否则新注册一个。"""
+    dev = str(uuid.uuid4())
+    if os.environ.get("MEMBER_USER"):
+        need(req(web, "POST", WEB + "/api/auth/login", {"username": os.environ["MEMBER_USER"], "password": os.environ["MEMBER_PASSWORD"], "deviceId": dev}, WEBH), "member login")
+        return os.environ["MEMBER_USER"]
+    name = prefix + secrets.token_hex(4)
+    need(req(web, "POST", WEB + "/api/auth/register", {"username": name, "password": "Pw-" + secrets.token_hex(8), "deviceId": dev}, WEBH), "register")
+    return name
+
+
 ATOK = need(req(plain, "POST", ADMIN + "/admin/system/auth/login", {"username": os.environ["ADMIN_USER"], "password": os.environ["ADMIN_PASSWORD"]}), "admin login")["accessToken"]
-uname = "e2es" + secrets.token_hex(4)
-need(req(web, "POST", WEB + "/api/auth/register", {"username": uname, "password": "Pw-" + secrets.token_hex(8), "deviceId": str(uuid.uuid4())}, WEBH), "register")
+uname = member_session("e2es")
 UID = int(need(backend("GET", "/app/member/user/get"), "me")["id"])
 need(req(plain, "POST", ADMIN + "/admin/gateway/quota/grant", {"userId": UID, "amount": 5_000_000, "ref": f"manual:e2e-smoke-{UID}"},
          {"Authorization": "Bearer " + ATOK}), "grant")
+BAL_START = need(backend("GET", "/app/gateway/usage/balance"), "balance")["balance"]
 key = need(backend("POST", "/app/gateway/token/create", {"name": "e2e-smoke", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}), "key")
 OAI = {"Authorization": "Bearer " + key["key"]}
 book = {r["model"]: r for g in need(backend("GET", "/app/gateway/pricebook/mine"), "pricebook") for r in g["rows"]}
@@ -98,7 +109,7 @@ try:
               f"{m}：{lg['latencyMs']}ms，tokens {lg['promptTokens']}+{lg['completionTokens']}{f'（缓存读 {cr}）' if cr else ''} × ${pin}/${pout} → 扣 {lg['charged']} μUSD（期望 {exp}）{tier}", str(lg))
     time.sleep(1)
     bal = need(backend("GET", "/app/gateway/usage/balance"), "balance")
-    check(5_000_000 - bal["balance"] == spent and not bal["reserved"], f"余额减少 {5_000_000 - bal['balance']} μUSD = 逐笔扣费合计 {spent} μUSD，预留归零", str(bal))
+    check(BAL_START - bal["balance"] == spent and not bal["reserved"], f"余额减少 {BAL_START - bal['balance']} μUSD = 逐笔扣费合计 {spent} μUSD，预留归零", str(bal))
 finally:
     backend("DELETE", f"/app/gateway/token/delete/{key['id']}")
 

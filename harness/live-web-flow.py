@@ -66,6 +66,30 @@ ATOK = req(plain, "POST", ADMIN + "/admin/system/auth/login", {"username": os.en
 def admin(method, path, body=None):
     return req(plain, method, ADMIN + path, body, {"Authorization": "Bearer " + ATOK})
 
+
+# 渠道成本目前按官方价记（成本 = 官方价，正式拿货价待补），任何低于官方价的折扣都会被毛利闸门拦下（MODEL_PRICE_BELOW_COST）。
+# 这里测的是「折扣怎么生效」，所以测试期间把承载渠道的成本临时记成官方价 5 折，跑完原样恢复（只影响这几分钟的成本记账，不影响扣费）。
+COST_FIELDS = ("id", "name", "type", "baseUrl", "groups", "models", "capabilities", "modelMapping", "paramOverride", "priority", "weight",
+               "proxyUrl", "apiVersion", "providerConfig", "costDiscount", "costSource", "upstreamPricingFormat", "upstreamPricingUrl",
+               "upstreamGroupRatio", "upstreamCreditRate", "lossPolicy", "reasoningSuffix", "remark")
+def set_channel_cost(names, discount=None, restore=None):
+    """discount 给值 = 临时调低并返回原值；restore 给原值 = 恢复。"""
+    hdr = {"Authorization": "Bearer " + ATOK}
+    s, lst = req(plain, "GET", ADMIN + "/admin/gateway/channel/list", None, hdr)
+    saved = {}
+    for c in lst["data"]:
+        if c["name"] not in names: continue
+        s, d = req(plain, "GET", ADMIN + f"/admin/gateway/channel/get/{c['id']}", None, hdr)
+        ch = d["data"]; body = {k: ch[k] for k in COST_FIELDS if k in ch}
+        saved[c["id"]] = (ch.get("costSource"), ch.get("costDiscount"))
+        if restore is not None:
+            body["costSource"], body["costDiscount"] = restore[c["id"]]
+        else:
+            body["costSource"], body["costDiscount"] = "official", discount
+        req(plain, "PUT", ADMIN + "/admin/gateway/channel/update", body, hdr)
+    return saved
+
+
 # ═══ 1. 网站页面 ═══
 print("[1] 网站页面")
 for p in ["/", "/models", "/pricing", "/register", "/login", "/docs"]:
@@ -217,8 +241,8 @@ good = (s, s2, s3) == (401, 401, 401) and isinstance(oe, dict) and (oe.get("erro
     and isinstance(ae, dict) and ae.get("type") == "error" and (ae.get("error") or {}).get("type") == "authentication_error" \
     and isinstance(ge, dict) and (ge.get("error") or {}).get("status") == "UNAUTHENTICATED"
 check(good, "认证失败按协议回官方错误结构（OpenAI invalid_api_key / Anthropic authentication_error / Gemini UNAUTHENTICATED）", f"{s} {oe} | {s2} {ae} | {s3} {ge}")
-s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4.1-mini", "messages": [{"role": "user", "content": "hi"}]}, OAI)
-check(s in (403, 404), f"未上架模型 gpt-4.1-mini → {s} {str(b)[:100]}", str(b)[:150])
+s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "hi"}]}, OAI)
+check(s in (403, 404), f"未上架模型 claude-sonnet-4 → {s} {str(b)[:100]}", str(b)[:150])
 
 # ═══ 7. 日志与对账 ═══
 print("[7] 日志与对账")
@@ -257,25 +281,29 @@ check(ok((s, b)), "用量统计接口可用", f"{s} {str(b)[:150]}")
 
 # ═══ 8. Key 限制 ═══
 print("[7b] 协议定价：管理员给他 gpt-4o-mini 打 7 折")
-s, b = admin("PUT", "/admin/gateway/price-rule/save", {"subjectType": "USER", "subjectId": str(UID), "model": "gpt-4o-mini", "mode": "OFFICIAL_DISCOUNT", "discount": "0.7"})
-check(ok((s, b)), f"设 7 折（毛利 {(b.get('data') or {}).get('status') if isinstance(b, dict) else ''}）", f"{s} {str(b)[:200]}")
-s, b = admin("GET", "/admin/gateway/price-rule/users")
-mine = next((u for u in (b.get("data") or []) if u.get("userId") == UID), None) if isinstance(b, dict) else None
-check(mine is not None and mine.get("models") == 1, f"「协议定价」列表里有他：{mine}", str(b)[:200])
-s, pb = backend("GET", "/app/gateway/pricebook/mine")
-row = next((r for g in pb["data"] for r in g["rows"] if r["model"] == "gpt-4o-mini"), None)
-check(row and row["source"] == "USER" and row.get("discountBp") == 7000, f"他的价目表：gpt-4o-mini {row and row['price']['input']}/{row and row['price']['output']}、来源 {row and row['source']}、{row and row.get('discountBp')}", str(row)[:200])
-s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}, OAI)
-time.sleep(3)
-lg = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=1")[1]["data"]["list"][0]
-# 结算口径：按价目表上的实付单价逐项向上取整——展示的单价就是扣费的单价
-pin, pout = float(row["price"]["input"]), float(row["price"]["output"])
-exp = math.ceil(int(lg["promptTokens"]) * pin - 1e-9) + math.ceil(int(lg["completionTokens"]) * pout - 1e-9)
-check(s == 200 and int(lg["charged"]) == exp, f"按 7 折扣费：tokens {lg['promptTokens']}+{lg['completionTokens']} → {lg['charged']} μUSD（期望 {exp}）", f"{s} {lg}")
-s, b = admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4o-mini")
-s2, pb = backend("GET", "/app/gateway/pricebook/mine")
-row = next((r for g in pb["data"] for r in g["rows"] if r["model"] == "gpt-4o-mini"), None)
-check(s == 200 and row and row["source"] != "USER", f"恢复原价：来源回到 {row and row['source']}", f"{s} {row}")
+ORIG_COST = set_channel_cost(("openlux", "v-api"), discount="0.5")
+try:
+    s, b = admin("PUT", "/admin/gateway/price-rule/save", {"subjectType": "USER", "subjectId": str(UID), "model": "gpt-4o-mini", "mode": "OFFICIAL_DISCOUNT", "discount": "0.7"})
+    check(ok((s, b)), f"设 7 折（毛利 {(b.get('data') or {}).get('status') if isinstance(b, dict) else ''}）", f"{s} {str(b)[:200]}")
+    s, b = admin("GET", "/admin/gateway/price-rule/users")
+    mine = next((u for u in (b.get("data") or []) if u.get("userId") == UID), None) if isinstance(b, dict) else None
+    check(mine is not None and mine.get("models") == 1, f"「协议定价」列表里有他：{mine}", str(b)[:200])
+    s, pb = backend("GET", "/app/gateway/pricebook/mine")
+    row = next((r for g in pb["data"] for r in g["rows"] if r["model"] == "gpt-4o-mini"), None)
+    check(row and row["source"] == "USER" and row.get("discountBp") == 7000, f"他的价目表：gpt-4o-mini {row and row['price']['input']}/{row and row['price']['output']}、来源 {row and row['source']}、{row and row.get('discountBp')}", str(row)[:200])
+    s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}, OAI)
+    time.sleep(3)
+    lg = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=1")[1]["data"]["list"][0]
+    # 结算口径：按价目表上的实付单价逐项向上取整——展示的单价就是扣费的单价
+    pin, pout = float(row["price"]["input"]), float(row["price"]["output"])
+    exp = math.ceil(int(lg["promptTokens"]) * pin - 1e-9) + math.ceil(int(lg["completionTokens"]) * pout - 1e-9)
+    check(s == 200 and int(lg["charged"]) == exp, f"按 7 折扣费：tokens {lg['promptTokens']}+{lg['completionTokens']} → {lg['charged']} μUSD（期望 {exp}）", f"{s} {lg}")
+    s, b = admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4o-mini")
+    s2, pb = backend("GET", "/app/gateway/pricebook/mine")
+    row = next((r for g in pb["data"] for r in g["rows"] if r["model"] == "gpt-4o-mini"), None)
+    check(s == 200 and row and row["source"] != "USER", f"恢复原价：来源回到 {row and row['source']}", f"{s} {row}")
+finally:
+    set_channel_cost(("openlux", "v-api"), restore=ORIG_COST)
 
 print("[8] Key 限制")
 s, b = backend("POST", "/app/gateway/token/create", {"name": "e2e-limited", "quotaBudget": 1, "expiresAt": None, "allowedModels": "gpt-4o-mini", "allowedIps": ""})

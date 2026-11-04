@@ -15,7 +15,7 @@
   D 取消协议价 → 回到分组价；Key 取消指定 → 回到全站价。
 上游是真实渠道（CHANNELS，缺省 openlux、v-api），十来次 max_tokens=32 的小调用，花费不到 1 美分。跑完删掉临时分组、规则、Key，渠道分组清单恢复原样。
 
-环境变量：ADMIN_USER / ADMIN_PASSWORD；WEB_URL / API_URL / ADMIN_URL（缺省 neton.cloud 三个域名）。
+环境变量：ADMIN_USER / ADMIN_PASSWORD；MEMBER_USER / MEMBER_PASSWORD（可选，用固定测试账号、不占注册限流）；WEB_URL / API_URL / ADMIN_URL（缺省 neton.cloud 三个域名）。
 """
 import http.cookiejar, json, math, os, secrets, sys, time, urllib.error, urllib.request, uuid
 
@@ -74,6 +74,30 @@ def channel_body(ch, groups):
     return {**{k: ch[k] for k in UPDATE_FIELDS if k in ch}, "groups": groups}
 
 
+
+# 渠道成本目前按官方价记（成本 = 官方价，正式拿货价待补），任何低于官方价的折扣都会被毛利闸门拦下（MODEL_PRICE_BELOW_COST）。
+# 这里测的是「折扣怎么生效」，所以测试期间把承载渠道的成本临时记成官方价 5 折，跑完原样恢复（只影响这几分钟的成本记账，不影响扣费）。
+COST_FIELDS = ("id", "name", "type", "baseUrl", "groups", "models", "capabilities", "modelMapping", "paramOverride", "priority", "weight",
+               "proxyUrl", "apiVersion", "providerConfig", "costDiscount", "costSource", "upstreamPricingFormat", "upstreamPricingUrl",
+               "upstreamGroupRatio", "upstreamCreditRate", "lossPolicy", "reasoningSuffix", "remark")
+def set_channel_cost(names, discount=None, restore=None):
+    """discount 给值 = 临时调低并返回原值；restore 给原值 = 恢复。"""
+    hdr = {"Authorization": "Bearer " + ATOK}
+    s, lst = req(plain, "GET", ADMIN + "/admin/gateway/channel/list", None, hdr)
+    saved = {}
+    for c in lst["data"]:
+        if c["name"] not in names: continue
+        s, d = req(plain, "GET", ADMIN + f"/admin/gateway/channel/get/{c['id']}", None, hdr)
+        ch = d["data"]; body = {k: ch[k] for k in COST_FIELDS if k in ch}
+        saved[c["id"]] = (ch.get("costSource"), ch.get("costDiscount"))
+        if restore is not None:
+            body["costSource"], body["costDiscount"] = restore[c["id"]]
+        else:
+            body["costSource"], body["costDiscount"] = "official", discount
+        req(plain, "PUT", ADMIN + "/admin/gateway/channel/update", body, hdr)
+    return saved
+
+
 def micro(v):
     """价格串（USD/1M）→ μUSD/1M 整数（6 位小数截断，与网关 parseMicro 一致）。"""
     s = str(v); i, _, f = s.partition(".")
@@ -85,8 +109,10 @@ def charge_of(tokens_in, tokens_out, price):
     return -(-tokens_in * micro(price["input"]) // 1_000_000) + -(-tokens_out * micro(price["output"]) // 1_000_000)
 
 
-def pricebook():
-    return {r["model"]: (g["groupCode"], r) for g in need(backend("GET", "/app/gateway/pricebook/mine"), "pricebook") for r in g["rows"]}
+def pricebook(group="default"):
+    """控制台价目表里指定分组那一张（测试账号可能还有别的 Key 在 default）。"""
+    books = need(backend("GET", "/app/gateway/pricebook/mine"), "pricebook")
+    return {r["model"]: (g["groupCode"], r) for g in books if g["groupCode"] == group for r in g["rows"]}
 
 
 def call_and_check(model, price, label):
@@ -107,11 +133,21 @@ def call_and_check(model, price, label):
     return int(lg["charged"])
 
 
+def member_session(prefix):
+    """有 MEMBER_USER / MEMBER_PASSWORD 就登录这个测试账号（不占注册限流：每 IP 每小时 10 次）；否则新注册一个。"""
+    dev = str(uuid.uuid4())
+    if os.environ.get("MEMBER_USER"):
+        need(req(web_opener, "POST", WEB + "/api/auth/login", {"username": os.environ["MEMBER_USER"], "password": os.environ["MEMBER_PASSWORD"], "deviceId": dev}, WEBH), "member login")
+        return os.environ["MEMBER_USER"]
+    name = prefix + secrets.token_hex(4)
+    need(req(web_opener, "POST", WEB + "/api/auth/register", {"username": name, "password": "Pw-" + secrets.token_hex(8), "deviceId": dev}, WEBH), "register")
+    return name
+
+
 # ════════ 准备：注册、充值、建 Key ════════
 print("[准备] 网站注册、管理员充值 $5、网站建 Key")
 DEVICE = str(uuid.uuid4())
-uname, pw = "e2ep" + secrets.token_hex(4), "Pw-" + secrets.token_hex(8)
-need(req(web_opener, "POST", WEB + "/api/auth/register", {"username": uname, "password": pw, "deviceId": DEVICE}, WEBH), "register")
+uname = member_session("e2ep")
 UID = int(need(backend("GET", "/app/member/user/get"), "me")["id"])
 admin("POST", "/admin/gateway/quota/grant", {"userId": UID, "amount": 5_000_000, "ref": f"manual:e2e-pricing-{UID}"})
 key = need(backend("POST", "/app/gateway/token/create", {"name": "e2e-pricing", "quotaBudget": None, "expiresAt": None, "allowedModels": "", "allowedIps": ""}), "create key")
@@ -128,6 +164,7 @@ channels = [c for c in admin("GET", "/admin/gateway/channel/list") if c["name"] 
 orig_groups = {c["id"]: c["groups"] for c in channels}
 spent = 0
 
+ORIG_COST = set_channel_cost(CHANNELS, discount="0.5")
 try:
     # ════════ A 全站价 ════════
     print(f"[A] 全站价（Key 不绑分组；全站加价率 ×{markup}）")
@@ -151,10 +188,11 @@ try:
         admin("PUT", "/admin/gateway/channel/update", channel_body(ch, ch["groups"] + "," + GROUP))
     admin("PUT", "/admin/gateway/price-rule/save", {"subjectType": "GROUP", "subjectId": GROUP, "model": "gpt-4.1", "mode": "OFFICIAL_DISCOUNT", "discount": "0.75"})
     admin("PUT", f"/admin/gateway/token/update-group?id={KID}&groupCode={GROUP}")
+    GB = lambda: pricebook(GROUP)
     toks = need(backend("GET", "/app/gateway/token/list"), "tokens")
     mine = next(t for t in (toks["list"] if isinstance(toks, dict) else toks) if t["id"] == KID)
     check(mine.get("group") == GROUP, f"控制台 Key 列表显示分组 {mine.get('group')}", str(mine)[:200])
-    pb = pricebook()
+    pb = GB()
     g, mini = pb["gpt-4o-mini"]; _, g41 = pb["gpt-4.1"]
     site_mini = catalog["gpt-4o-mini"]
     exp_mini = (micro(site_mini["inputPrice"]) * 8000 // 10000, micro(site_mini["outputPrice"]) * 8000 // 10000)
@@ -175,7 +213,7 @@ try:
     check(r["status"] in ("OK", "THIN", "UNSERVED"), f"管理台保存协议价（毛利 {r['status']}）", str(r))
     users = admin("GET", "/admin/gateway/price-rule/users")
     check(any(u["userId"] == UID for u in users), "「协议定价」列表里有这个用户", str(users)[:200])
-    pb = pricebook()
+    pb = GB()
     _, u41 = pb["gpt-4.1"]; _, mini2 = pb["gpt-4o-mini"]
     expu = (micro(off41["input"]) * 6000 // 10000, micro(off41["output"]) * 6000 // 10000)
     check(u41["source"] == "USER" and u41.get("discountBp") == 6000 and (micro(u41["price"]["input"]), micro(u41["price"]["output"])) == expu,
@@ -186,7 +224,7 @@ try:
     # ════════ D 逐层回退 ════════
     print("[D] 取消协议价 → 分组价；Key 取消指定 → 全站价")
     admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4.1")
-    _, back41 = pricebook()["gpt-4.1"]
+    _, back41 = GB()["gpt-4.1"]
     check(back41["source"] == "GROUP" and back41["price"] == g41["price"], f"取消协议价后回到分组价 ${back41['price']['input']}/${back41['price']['output']}", str(back41))
     spent += call_and_check("gpt-4.1", back41["price"], "回到分组价")
     admin("PUT", f"/admin/gateway/token/update-group?id={KID}")
@@ -201,6 +239,8 @@ try:
     check(BAL0 - bal["balance"] == spent and not bal["reserved"], f"余额减少 {BAL0 - bal['balance']} μUSD = 逐笔扣费合计 {spent} μUSD，预留归零", str(bal))
 finally:
     print("[清理]")
+    set_channel_cost(CHANNELS, restore=ORIG_COST)
+    print(f"  渠道成本恢复为 {ORIG_COST}")
     req(plain, "DELETE", ADMIN + f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4.1", None, {"Authorization": "Bearer " + ATOK})
     req(plain, "DELETE", ADMIN + f"/admin/gateway/price-rule/delete?subjectType=GROUP&subjectId={GROUP}&model=gpt-4.1", None, {"Authorization": "Bearer " + ATOK})
     req(plain, "PUT", ADMIN + f"/admin/gateway/token/update-group?id={KID}", None, {"Authorization": "Bearer " + ATOK})
