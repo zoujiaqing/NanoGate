@@ -13,7 +13,7 @@
      gpt-4o-mini = 全站价 × 0.8（来源 全站价 × 分组倍率），gpt-4.1 = 官方价 × 0.75（来源 分组价，不再乘倍率）。
   C 协议价：给这个用户设 gpt-4.1「官方价 6 折」→ 覆盖分组价；gpt-4o-mini 不受影响。
   D 取消协议价 → 回到分组价；Key 取消指定 → 回到全站价。
-上游用服务器本机的模拟厂商（e2e-openai 渠道），不花钱。跑完删掉临时分组、规则、Key，渠道分组清单恢复原样。
+上游是真实渠道（CHANNELS，缺省 openlux、v-api），十来次 max_tokens=32 的小调用，花费不到 1 美分。跑完删掉临时分组、规则、Key，渠道分组清单恢复原样。
 
 环境变量：ADMIN_USER / ADMIN_PASSWORD；WEB_URL / API_URL / ADMIN_URL（缺省 neton.cloud 三个域名）。
 """
@@ -22,7 +22,8 @@ import http.cookiejar, json, math, os, secrets, sys, time, urllib.error, urllib.
 WEB = os.environ.get("WEB_URL", "https://neton.cloud").rstrip("/")
 API = os.environ.get("API_URL", "https://api.neton.cloud").rstrip("/")
 ADMIN = os.environ.get("ADMIN_URL", "https://admin.neton.cloud").rstrip("/")
-CHANNEL = os.environ.get("CHANNEL", "e2e-openai")
+# 承载 gpt-4.1 / gpt-4o-mini 的渠道：临时分组要加到它们的分组清单上（跑完恢复）
+CHANNELS = [c.strip() for c in os.environ.get("CHANNELS", "openlux,v-api").split(",") if c.strip()]
 RES = []
 jar = http.cookiejar.CookieJar()
 web_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -123,8 +124,8 @@ print(f"  用户 {uname}（#{UID}），Key #{KID}")
 catalog = {m["model"]: m for m in need(req(plain, "GET", WEB + "/api/backend/app/gateway/model/list"), "public models")}
 markup = admin("GET", "/admin/gateway/price/check")["markup"]
 GROUP = "e2e-pricing-" + secrets.token_hex(3)
-channel = next(c for c in admin("GET", "/admin/gateway/channel/list") if c["name"] == CHANNEL)
-orig_groups = channel["groups"]
+channels = [c for c in admin("GET", "/admin/gateway/channel/list") if c["name"] in CHANNELS]
+orig_groups = {c["id"]: c["groups"] for c in channels}
 spent = 0
 
 try:
@@ -145,8 +146,9 @@ try:
     # ════════ B 分组价 ════════
     print(f"[B] 分组价：建分组 {GROUP}（倍率 0.8），gpt-4.1 分组价「官方价 75 折」，Key 指定到这个分组")
     admin("POST", "/admin/gateway/group/create", {"code": GROUP, "name": "E2E 定价分组", "ratio": "0.8", "selectable": 0})
-    ch = admin("GET", f"/admin/gateway/channel/get/{channel['id']}")
-    admin("PUT", "/admin/gateway/channel/update", channel_body(ch, ch["groups"] + "," + GROUP))
+    for c in channels:
+        ch = admin("GET", f"/admin/gateway/channel/get/{c['id']}")
+        admin("PUT", "/admin/gateway/channel/update", channel_body(ch, ch["groups"] + "," + GROUP))
     admin("PUT", "/admin/gateway/price-rule/save", {"subjectType": "GROUP", "subjectId": GROUP, "model": "gpt-4.1", "mode": "OFFICIAL_DISCOUNT", "discount": "0.75"})
     admin("PUT", f"/admin/gateway/token/update-group?id={KID}&groupCode={GROUP}")
     toks = need(backend("GET", "/app/gateway/token/list"), "tokens")
@@ -203,15 +205,17 @@ finally:
     req(plain, "DELETE", ADMIN + f"/admin/gateway/price-rule/delete?subjectType=GROUP&subjectId={GROUP}&model=gpt-4.1", None, {"Authorization": "Bearer " + ATOK})
     req(plain, "PUT", ADMIN + f"/admin/gateway/token/update-group?id={KID}", None, {"Authorization": "Bearer " + ATOK})
     backend("DELETE", f"/app/gateway/token/delete/{KID}")
-    s, ch = req(plain, "GET", ADMIN + f"/admin/gateway/channel/get/{channel['id']}", None, {"Authorization": "Bearer " + ATOK})
-    if s == 200:
-        req(plain, "PUT", ADMIN + "/admin/gateway/channel/update", channel_body(ch["data"], orig_groups), {"Authorization": "Bearer " + ATOK})
+    for c in channels:
+        s, ch = req(plain, "GET", ADMIN + f"/admin/gateway/channel/get/{c['id']}", None, {"Authorization": "Bearer " + ATOK})
+        if s == 200:
+            req(plain, "PUT", ADMIN + "/admin/gateway/channel/update", channel_body(ch["data"], orig_groups[c["id"]]), {"Authorization": "Bearer " + ATOK})
     gid = next((g["id"] for g in admin("GET", "/admin/gateway/group/list") if g["code"] == GROUP), None)
     if gid:
         s, b = req(plain, "DELETE", ADMIN + f"/admin/gateway/group/delete/{gid}", None, {"Authorization": "Bearer " + ATOK})
         print(f"  删除临时分组 {GROUP} → {s}")
-    after = next(c for c in admin("GET", "/admin/gateway/channel/list") if c["id"] == channel["id"])
-    print(f"  渠道 {CHANNEL} 分组清单恢复为 {after['groups']!r}（原 {orig_groups!r}）")
+    after = {c["id"]: c["groups"] for c in admin("GET", "/admin/gateway/channel/list")}
+    for c in channels:
+        print(f"  渠道 {c['name']} 分组清单恢复为 {after.get(c['id'])!r}（原 {orig_groups[c['id']]!r}）")
 
 bad = [n for o, n in RES if not o]
 print(f"═══ 结果：{len(RES) - len(bad)} passed, {len(bad)} failed ═══")

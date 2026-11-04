@@ -3,7 +3,7 @@
 三种协议各种接口调用 → 日志与余额逐笔对账 → Key 限制 → 清理。
 
 与 live-e2e.py 互补：那份直接打后端 API，这份经过网站的 /api/auth/* 与 /api/backend 代理（CSRF、会话 Cookie、
-浏览器设备号）。上游用服务器本机的模拟厂商（见 live-e2e.py 文件头），只调已上架的 5 个 e2e 模型，不花钱。
+浏览器设备号）。上游是真实渠道：每次几十次小调用（max_tokens 很小），花费几美分以内。Claude 用 Haiku（CLAUDE_MODEL 可换）。
 
 环境变量：ADMIN_USER / ADMIN_PASSWORD；WEB_URL（缺省 https://neton.cloud）、API_URL、ADMIN_URL。
 每次新注册一个 e2eu… 用户（充值 $5），跑完删掉本次建的 Key；用户保留。
@@ -42,6 +42,8 @@ def req(opener, method, url, body=None, headers=None, raw=False, timeout=120):
         return s, t
 
 
+# 真实上游：Claude 用最便宜的 Haiku（可用环境变量换）
+CLAUDE = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 WEBH = {"Origin": WEB, "X-Neton-Csrf": "1"}
 def web(method, path, body=None):
     return req(web_opener, method, WEB + path, body, WEBH)
@@ -125,7 +127,7 @@ check(BAL0 == 5_000_000, f"同 ref 重复充值不重复入账，余额 {BAL0/1e
 print("[5] 调用")
 s, b = req(plain, "GET", API + "/v1/models", headers=OAI)
 ids = sorted(m["id"] for m in b.get("data", [])) if isinstance(b, dict) else []
-check(s == 200 and {"gpt-4o-mini", "gpt-4.1", "claude-sonnet-4", "gemini-2.5-flash", "text-embedding-3-small"} <= set(ids), f"/v1/models 列出 {ids}", f"{s} {str(b)[:200]}")
+check(s == 200 and {"gpt-4o-mini", "gpt-4.1", CLAUDE, "gemini-2.5-flash", "text-embedding-3-small"} <= set(ids), f"/v1/models 列出 {ids}", f"{s} {str(b)[:200]}")
 
 calls = []  # (名称, 期望模型)
 def chat(model, stream=False, label=None):
@@ -146,8 +148,8 @@ def chat(model, stream=False, label=None):
     calls.append((label or model, model, usage))
 
 chat("gpt-4o-mini"); chat("gpt-4o-mini", stream=True); chat("gpt-4.1")
-chat("claude-sonnet-4", label="claude-sonnet-4（OpenAI 格式调 Anthropic 上游）")
-chat("gemini-2.5-flash", label="gemini-2.5-flash（OpenAI 格式调 Gemini 上游）")
+chat(CLAUDE, label=f"{CLAUDE}（OpenAI 格式调 Claude）")
+chat("gemini-2.5-flash", label="gemini-2.5-flash（OpenAI 格式调 Gemini）")
 
 # Responses
 s, b = req(plain, "POST", API + "/v1/responses", {"model": "gpt-4o-mini", "input": "Say hi", "max_output_tokens": 32}, OAI)
@@ -161,14 +163,14 @@ calls.append(("responses", "gpt-4o-mini", b.get("usage") if isinstance(b, dict) 
 
 # Anthropic
 ANT = {"x-api-key": KEY, "anthropic-version": "2023-06-01"}
-s, b = req(plain, "POST", API + "/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 32, "messages": [{"role": "user", "content": "Say hi"}]}, ANT)
+s, b = req(plain, "POST", API + "/v1/messages", {"model": CLAUDE, "max_tokens": 32, "messages": [{"role": "user", "content": "Say hi"}]}, ANT)
 t = "".join(c.get("text", "") for c in b.get("content", [])) if isinstance(b, dict) else ""
-check(s == 200 and t and b.get("usage"), f"/v1/messages（x-api-key）claude-sonnet-4：{t[:30]!r} usage {b.get('usage') if isinstance(b, dict) else None}", f"{s} {str(b)[:200]}")
-calls.append(("messages", "claude-sonnet-4", b.get("usage") if isinstance(b, dict) else None))
-s, t = req(plain, "POST", API + "/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 32, "stream": True, "messages": [{"role": "user", "content": "Say hi"}]}, ANT, raw=True)
+check(s == 200 and t and b.get("usage"), f"/v1/messages（x-api-key）{CLAUDE}：{t[:30]!r} usage {b.get('usage') if isinstance(b, dict) else None}", f"{s} {str(b)[:200]}")
+calls.append(("messages", CLAUDE, b.get("usage") if isinstance(b, dict) else None))
+s, t = req(plain, "POST", API + "/v1/messages", {"model": CLAUDE, "max_tokens": 32, "stream": True, "messages": [{"role": "user", "content": "Say hi"}]}, ANT, raw=True)
 types = [l[6:].strip() for l in t.splitlines() if l.startswith("event:")]
 check(s == 200 and "message_start" in types and types[-1] == "message_stop", f"/v1/messages 流式事件 {sorted(set(types))}", f"{s} {t[:200]}")
-calls.append(("messages-stream", "claude-sonnet-4", None))
+calls.append(("messages-stream", CLAUDE, None))
 s, b = req(plain, "POST", API + "/v1/messages", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "Say hi"}]}, {"Authorization": "Bearer " + KEY, "anthropic-version": "2023-06-01"})
 t = "".join(c.get("text", "") for c in b.get("content", [])) if isinstance(b, dict) else ""
 check(s == 200 and t, f"/v1/messages 跨协议调 gpt-4o-mini（Bearer）：{t[:30]!r}", f"{s} {str(b)[:200]}")
@@ -203,13 +205,13 @@ check(s == 401, f"不带 Key → {s}", str(b)[:150])
 s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "no-such-model-x", "messages": [{"role": "user", "content": "hi"}]}, OAI)
 check(s in (400, 404), f"不存在的模型 → {s} {str(b)[:100]}", str(b)[:150])
 s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini"}, OAI)
-print(f"     (信息) 缺 messages → {s}（网关透传，由上游校验；模拟上游不校验）")
+check(400 <= s < 500, f"缺 messages → {s}（网关透传，上游拒绝，不扣费）", str(b)[:150])
 s, b = req(plain, "POST", API + "/v1beta/models/gemini-2.5-flash:generateContent?key=" + KEY, {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
 check(s == 200, f"Gemini ?key= 查询参数传 Key → {s}", str(b)[:120])
 s, t = req(plain, "POST", API + f"/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key={KEY}", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}, raw=True)
 check(s == 200 and any(isinstance(e, dict) for e in sse(t)), f"Gemini 流式 ?alt=sse&key= → {s}", t[:120])
 s, oe = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "messages": []}, {"Authorization": "Bearer sk-invalid000000"})
-s2, ae = req(plain, "POST", API + "/v1/messages", {"model": "claude-sonnet-4", "messages": []})
+s2, ae = req(plain, "POST", API + "/v1/messages", {"model": CLAUDE, "messages": []})
 s3, ge = req(plain, "POST", API + "/v1beta/models/gemini-2.5-flash:generateContent?key=sk-invalid0000", {"contents": []})
 good = (s, s2, s3) == (401, 401, 401) and isinstance(oe, dict) and (oe.get("error") or {}).get("code") == "invalid_api_key" \
     and isinstance(ae, dict) and ae.get("type") == "error" and (ae.get("error") or {}).get("type") == "authentication_error" \
@@ -224,8 +226,10 @@ time.sleep(4)
 s, b = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=50")
 logs = (b.get("data") or {}).get("list", []) if isinstance(b, dict) else []
 okcalls = [c for c in calls]
-check(len([l for l in logs if l.get("status") == "ok"]) == len(logs) == len(okcalls) + 3,
-      f"使用日志 {len(logs)} 条，全部 status=ok（{len(okcalls)} 次调用 + 缺 messages 透传 + 两次 ?key= 调用）", json.dumps(logs[:1], ensure_ascii=False)[:300])
+nok = len([l for l in logs if l.get("status") == "ok"])
+bad = [l for l in logs if l.get("status") != "ok"]
+check(nok == len(okcalls) + 2 and len(bad) == 1 and int(bad[0].get("charged") or 0) == 0,
+      f"使用日志 {len(logs)} 条：成功 {nok}（{len(okcalls)} 次调用 + 两次 ?key= 调用），失败 {len(bad)}（缺 messages，扣费 0）", json.dumps(logs[:2], ensure_ascii=False)[:300])
 if logs:
     print("     日志字段：", sorted(logs[0].keys()))
 cost = sum(int(l["charged"]) for l in logs)
@@ -234,14 +238,16 @@ bal = b["data"]
 print("     余额：", bal)
 check(BAL0 - bal["balance"] == cost and cost > 0, f"余额减少 {(BAL0-bal['balance'])} μUSD = 日志扣费合计 {cost} μUSD", f"bal={bal} cost={cost}")
 check(not bal.get("reserved"), f"预留额度已归零（{bal.get('reserved')}）", str(bal))
-PRICES = {"gpt-4o-mini": (0.15, 0.6), "gpt-4.1": (2, 8), "claude-sonnet-4": (3, 15), "gemini-2.5-flash": (0.3, 2.5), "text-embedding-3-small": (0.02, 0)}
 s, pb = backend("GET", "/app/gateway/pricebook/mine")
 print("     我的价目表：", str(pb)[:300])
 book = {r["model"]: r["price"] for g in pb["data"] for r in g["rows"]}
 mism = []
 for l in logs:
     m = l["requestModel"]; pr = book[m]; ti, to = int(l["promptTokens"]), int(l["completionTokens"])
-    exp = math.ceil(ti * float(pr["input"]) - 1e-9) + math.ceil(to * float(pr["output"]) - 1e-9)
+    cr = int(l.get("cacheReadTokens") or 0); pin = float(pr["input"]); pcr = float(pr["cacheRead"]) or pin
+    # 网关口径：缓存读比 prompt 还多 = 上游报的 prompt 不含缓存；缓存价为 0（价源没给）按输入价计
+    fresh = ti if cr > ti else ti - cr
+    exp = math.ceil(fresh * pin - 1e-9) + math.ceil(cr * pcr - 1e-9) + math.ceil(to * float(pr["output"]) - 1e-9)
     if exp != int(l["charged"]):
         mism.append((m, ti, to, pr["input"], pr["output"], l["charged"], exp))
 check(not mism, f"逐笔扣费 = tokens × 「我的价目表」单价（{len(logs)} 笔逐项向上取整）", str(mism[:3]))
@@ -262,8 +268,9 @@ check(row and row["source"] == "USER" and row.get("discountBp") == 7000, f"他�
 s, b = req(plain, "POST", API + "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}, OAI)
 time.sleep(3)
 lg = backend("GET", "/app/gateway/usage/log/page?pageNo=1&pageSize=1")[1]["data"]["list"][0]
-# 结算口径：按价目表上的实付单价（0.105 / 0.42）逐项向上取整——展示的单价就是扣费的单价
-exp = math.ceil(int(lg["promptTokens"]) * 0.105 - 1e-9) + math.ceil(int(lg["completionTokens"]) * 0.42 - 1e-9)
+# 结算口径：按价目表上的实付单价逐项向上取整——展示的单价就是扣费的单价
+pin, pout = float(row["price"]["input"]), float(row["price"]["output"])
+exp = math.ceil(int(lg["promptTokens"]) * pin - 1e-9) + math.ceil(int(lg["completionTokens"]) * pout - 1e-9)
 check(s == 200 and int(lg["charged"]) == exp, f"按 7 折扣费：tokens {lg['promptTokens']}+{lg['completionTokens']} → {lg['charged']} μUSD（期望 {exp}）", f"{s} {lg}")
 s, b = admin("DELETE", f"/admin/gateway/price-rule/delete?subjectType=USER&subjectId={UID}&model=gpt-4o-mini")
 s2, pb = backend("GET", "/app/gateway/pricebook/mine")

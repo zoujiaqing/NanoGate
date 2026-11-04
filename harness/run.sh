@@ -2445,6 +2445,7 @@ atC55=$(attr55); satC55=$(sattr55); chC55=$(chg55)
 q "UPDATE gateway_tokens SET group_override=NULL, group_assigned=0 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 
 # ── 块 D：上游 403 的失败请求也带归因（recordLog 那半边）──
+# 403 是我们在上游的账号问题：网关记一行 error、换渠道，只有这一条渠道时回通用 503（不透传上游原话）。
 # 换端口而不是改 fake 模式：既有惯例就是不同端口跑不同模式（见 S4），且 listEnabled() 每次查库、
 # 无缓存，所以 UPDATE base_url 立即生效。一发 403 不会禁用 Key —— S4 证明要连续 5 发。
 fake err403 9956; sleep 1
@@ -2455,9 +2456,9 @@ rD55=$(relay26); sleep 1
 # 按 status='error' 取行，不取「最新一行」：worker 可能在 TTL 后把结算行 finalize 掉、
 # 于是最新那行变成成功行，断言就会指着错的那半边。
 atD55=$(q "SELECT COALESCE(group_code,'<null>')||'/'||COALESCE(group_source,'<null>')||'/'||status FROM gateway_usage_logs WHERE status='error' ORDER BY id DESC LIMIT 1")
-[ "$rD55" = "403" ] && [ "$atD55" = "vip55/TOKEN_SELECTED/error" ] \
+[ "$rD55" = "503" ] && [ "$atD55" = "vip55/TOKEN_SELECTED/error" ] \
   && pass "块D 失败请求也有归因：上游 403 → relay=${rD55}；usage_logs 里 status=error 那行 group/source=${atD55}（recordLog 路径 —— 此前它的 group 参数从 V001 起就白传，这一行连组都没有）" \
-  || fail "块D 失败路径缺归因: relay=${rD55}(期望403；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/TOKEN_SELECTED/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
+  || fail "块D 失败路径缺归因: relay=${rD55}(期望503；200 说明 err403 的 fake 没起来或 base_url 没改到、这一发其实成功了) error 行='${atD55}'(期望 vip55/TOKEN_SELECTED/error；'<null>/<null>/error' 说明 recordLog 仍没写归因、只修了 finalize 那半边；空串说明这一发根本没写 error 行)"
 
 # ════════════════════════════════════════════════════════════════════
 # S56 支付回调地址：发出去的 notify_url 必须是一条**活路由**
@@ -2696,18 +2697,19 @@ ac=$(curl -s --max-time 15 -o /tmp/netonapi-az.json -w "%{http_code}" -X POST "$
   && pass "Azure 形状正确（200，model 改回 gpt-a）" || fail "Azure 请求形状错: HTTP=$ac body=$ab"
 unset AZURE_DEPLOYMENT AZURE_KEY
 
-# ══ S60 跨协议上游错误：Anthropic 入口打到 OpenAI 上游的 403，错误体按 Anthropic 格式返回 ══
+# ══ S60 跨协议上游错误：Anthropic 入口打到 OpenAI 上游的 400（请求本身的问题），错误体按 Anthropic 格式返回 ══
+# 用 400 而不是 403：401/402/403 是我们在上游的账号问题，网关换渠道、全部失败回通用 503（S4 / S55 覆盖），不透传上游原话。
 echo "[S60] 跨协议错误体改写"
-seed_reset; fake err403 9961; sleep 1
-q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-403','openai_compatible','http://127.0.0.1:9961','default','m-x',1,1,1,30000,90000,'1.0',0,0,0);
-   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-403'),'k',1,0,0,0,0);
+seed_reset; fake err400 9961; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-400','openai_compatible','http://127.0.0.1:9961','default','m-x',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-400'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-x','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 xc=$(curl -s --max-time 15 -o /tmp/netonapi-x.json -w "%{http_code}" -X POST "$U/v1/messages" -H "$AUTH" -H "$CT" -d '{"model":"m-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'); xb=$(cat /tmp/netonapi-x.json)
-[ "$xc" = "403" ] && grep -q '"type":"error"' <<< "$xb" && grep -q 'forbidden' <<< "$xb" \
-  && pass "Anthropic 入口收到 Anthropic 形状的 403（含上游原话）" || fail "跨协议错误体: HTTP=$xc body=$xb"
+[ "$xc" = "400" ] && grep -q '"type":"error"' <<< "$xb" && grep -q 'bad parameter' <<< "$xb" \
+  && pass "Anthropic 入口收到 Anthropic 形状的 400（含上游原话）" || fail "跨协议错误体: HTTP=$xc body=$xb"
 oc=$(curl -s --max-time 15 -o /tmp/netonapi-o.json -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-x","messages":[]}'); ob=$(cat /tmp/netonapi-o.json)
-[ "$oc" = "403" ] && [ "$ob" = '{"error": "forbidden"}' ] \
-  && pass "同协议 403 仍原样透传" || fail "同协议透传变了: HTTP=$oc body=$ob"
+[ "$oc" = "400" ] && [ "$ob" = '{"error": "bad parameter"}' ] \
+  && pass "同协议 400 仍原样透传" || fail "同协议透传变了: HTTP=$oc body=$ob"
 
 # ══ S61 渠道连通性探测：按渠道协议打最小请求；不计费、不记日志、不动 Key 失败计数 ══
 echo "[S61] 渠道探测"
@@ -3735,6 +3737,59 @@ q "DELETE FROM gateway_price_rules; UPDATE gateway_tokens SET group_override=NUL
   && pass "缓存：长 TTL 下直接改库不生效（${w0}→${w1}），管理端写规则立即生效（→${w2} = 新官方价 × 0.7）" \
   || fail "缓存失效不对: 改库前=${w0} 改库后=${w1}(期望不变) 规则=${api} 规则后=${w2}(期望≈$((${base:-0}*70/10)))"
 stop_app; boot_app NETONAPI_QUOTA_PER_PRICE_UNIT=1000
+
+# ══ S94 非流式长回答不被网关截断 ══
+# 非流式请求要等上游整段生成完才有响应：推理模型、长回答经常超过 30 秒。框架 HTTP 服务默认 [http] timeout=30000，
+# 超时就 504 —— 用户拿不到结果，上游照样收钱，我们却没扣到费。application.conf 把它放到 600000（与上游客户端总上限一致）。
+echo "[S94] 非流式长回答（上游 35 秒才返回）不被网关截断，照常扣费"
+seed_reset; SLOW_DELAY=35 fake slowok 9894; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('slow94','openai_compatible','http://127.0.0.1:9894','default','m-slow94',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='slow94'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,listed,deleted,created_at,updated_at) VALUES ('m-slow94','1','2','0','0',1000,'manual',1,0,0,0);" >/dev/null
+t94=$(date +%s)
+c94=$(curl -s --max-time 120 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-slow94","max_tokens":500,"messages":[{"role":"user","content":"hi"}]}')
+d94=$(( $(date +%s) - t94 ))
+ch94=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-slow94' AND status='ok' AND charged=2000" 1 50)
+[ "$c94" = "200" ] && [ "$d94" -ge 34 ] && [ "$ch94" = "1" ] \
+  && pass "上游 35 秒才返回的非流式请求：HTTP ${c94}、耗时 ${d94}s，结算 1 行、按 1000+500 tokens 扣 2000 μUSD" \
+  || fail "长回答被截断或没扣费: HTTP=${c94}(期望200) 耗时=${d94}s 结算行=${ch94}(期望1) body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# ══ S95 上游 404 model_not_found → 换渠道，不计 Key 失败、不把上游原文透给用户 ══
+# new-api 类中转站对「你这把 Key 的分组里没有这个模型」回 404 model_not_found。这是渠道服务不了它，不是用户请求错了：
+# 换下一条渠道；Key 对别的模型照样能用，不能计失败（否则被自动停用）；全部失败时回通用 503，不透出上游请求号。
+echo "[S95] 上游 404 model_not_found：换到下一条渠道成功、不计 Key 失败；全部如此则 503 且不透出上游原文"
+seed_reset; fake err404model 9883; fake ok 9884; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES
+     ('nf95','openai_compatible','http://127.0.0.1:9883','default','m-nf95,m-nf95b',10,1,1,30000,90000,'1.0',0,0,0),
+     ('ok95','openai_compatible','http://127.0.0.1:9884','default','m-nf95',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES
+     ((SELECT id FROM gateway_channels WHERE name='nf95'),'k',1,0,0,0,0), ((SELECT id FROM gateway_channels WHERE name='ok95'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,listed,deleted,created_at,updated_at) VALUES
+     ('m-nf95','1','2','0','0',1000,'manual',1,0,0,0), ('m-nf95b','1','2','0','0',1000,'manual',1,0,0,0);" >/dev/null
+a95=$(curl -s --max-time 30 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-nf95","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+e95=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-nf95' AND error_code='upstream_model_not_found'" 1 30)
+o95=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-nf95' AND status='ok'" 1 30)
+f95=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=(SELECT id FROM gateway_channels WHERE name='nf95')")
+b95=$(curl -s --max-time 30 -o "$GB" -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-nf95b","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+leak95=$(grep -c "request id" "$GB" 2>/dev/null)
+[ "$a95" = "200" ] && [ "$e95" = "1" ] && [ "$o95" = "1" ] && [ "$f95" = "0" ] && [ "$b95" = "503" ] && [ "$leak95" = "0" ] \
+  && pass "404 model_not_found 换渠道：HTTP ${a95}（错误行 ${e95}、成功行 ${o95}）、Key 失败计数 ${f95}；唯一渠道也是 404 时 HTTP ${b95}、不透出上游原文" \
+  || fail "404 换渠道不对: 有备用=${a95}(期望200) 错误行=${e95} 成功行=${o95} Key失败=${f95}(期望0) 无备用=${b95}(期望503) 透出=${leak95} body=$(head -c 160 "$GB" 2>/dev/null)"
+
+# ══ S96 Gemini 流式入站 → OpenAI 兼容上游：上游必须收到 stream:true，客户端收到 Gemini 形状的流 ══
+# Gemini 的「流式」写在路径上（:streamGenerateContent），请求体没有 stream 字段；转成 OpenAI 时不补，上游回非流式 JSON，
+# 网关却按 SSE 解析 —— 客户端拿到一个 200 的空流（线上真实上游实测踩到）。
+echo "[S96] Gemini 流式入站打到 OpenAI 兼容上游：返回 Gemini 形状的流且带内容"
+seed_reset; fake ok 9882; sleep 1
+q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('gs96','openai_compatible','http://127.0.0.1:9882','default','m-gs96',1,1,1,30000,90000,'1.0',0,0,0);
+   INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='gs96'),'k',1,0,0,0,0);
+   INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,listed,deleted,created_at,updated_at) VALUES ('m-gs96','1','2','0','0',1000,'manual',1,0,0,0);" >/dev/null
+gs96=$(curl -sN --max-time 30 -X POST "$U/v1beta/models/m-gs96:streamGenerateContent?alt=sse" -H "x-goog-api-key: ${TOKEN_PLAINTEXT}" -H "$CT" -d '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}')
+fr96=$(printf '%s' "$gs96" | grep -c '"candidates"')
+ok96=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-gs96' AND status='ok' AND stream=1" 1 30)
+[ "$fr96" -ge 1 ] && [ "$ok96" = "1" ] \
+  && pass "Gemini 流式 → OpenAI 上游：${fr96} 帧 Gemini candidates，结算 1 行（stream=1）" \
+  || fail "Gemini 流式跨协议不对: 帧=${fr96}(期望≥1) 结算行=${ok96}(期望1) body=$(printf '%s' "$gs96" | head -c 200)"
 
 echo "═══ 结果：$PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ] || { echo "详细日志见 $LOGS/"; exit 1; }

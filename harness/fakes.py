@@ -131,6 +131,12 @@ class H(BaseHTTPRequestHandler):
             stream = bool(body.get("stream"))
             if MODE == "err500":
                 self._json(500, {"error": "upstream down"}); return
+            if MODE == "err400":
+                # 请求本身的问题（参数不对）：网关应原样（或按入站协议改写后）回给用户，不换渠道
+                self._json(400, {"error": "bad parameter"}); return
+            if MODE == "err404model":
+                # new-api 类中转站：这把 Key 的分组里没有这个模型
+                self._json(404, {"error": {"code": "model_not_found", "message": "No available channel for this model on the current token (request id: X1)", "type": "new_api_error"}}); return
             if MODE == "err403":
                 self._json(403, {"error": "forbidden"}); return
             if MODE == "err429":

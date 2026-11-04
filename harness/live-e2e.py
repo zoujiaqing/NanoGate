@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""线上端到端演练：按真实用户的路径走一遍「管理员配渠道定价 → 用户充值建 Key → 三种协议调用 → 扣费对账」。
+"""⚠️ 只能在带模拟上游的环境里跑（服务器本机起 mock-provider.py、后端放行 127.0.0.1 出站）。2026-11-04 正式上线后
+线上已撤掉模拟上游，线上回归改用 live-web-flow.py / live-pricing-flow.py / live-fullchain.py（真实上游）。
+
+线上端到端演练：按真实用户的路径走一遍「管理员配渠道定价 → 用户充值建 Key → 三种协议调用 → 扣费对账」。
 
 上游是部署在服务器本机的模拟厂商（harness/mock-provider.py）：
   mock-a  127.0.0.1:19001  正常，上游 Key sk-mock-a
