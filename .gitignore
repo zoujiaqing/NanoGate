@@ -10,3 +10,4 @@ netonapi-client/
 harness/logs/
 harness/logs/work-*/
 local/
+harness/demo/work/

@@ -38,6 +38,28 @@ Azure OpenAI、Anthropic、Gemini、AWS Bedrock（SigV4）、Vertex AI（服务�
 **用户**：注册 / 登录 / 邮箱找回密码、API Key 自助管理（预算、有效期、模型范围、IP 白名单）、
 用量汇总与明细、充值与流水、模型价格表、接入说明。
 
+## 截图
+
+以下截图来自本地演示环境（`harness/demo/up.sh`：虚构的渠道与用户、随机但贴近真实的用量）。
+
+**用户侧**
+
+| 首页 | 控制台 |
+|---|---|
+| ![首页](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/web-home.png) | ![控制台概览](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/console-overview.png) |
+| **模型与价格**：你的价格、相当于官方价几折、协议价标记 | **用量与额度**：每日消费、按模型 / 按 Key 汇总 |
+| ![模型与价格](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/console-models.png) | ![用量与额度](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/console-usage.png) |
+
+**运营侧**
+
+| 网关概览：收入、成本、毛利 | 模型定价：每个模型在每条渠道上的最差毛利 |
+|---|---|
+| ![网关概览](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/admin-overview.png) | ![模型定价](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/admin-pricing.png) |
+
+**协议定价**：给大客户按模型打「官方价 N 折」，实时显示他的价格与毛利，亏本的折扣保存不了。
+
+![协议定价](https://raw.githubusercontent.com/netonapi/netonapi/main/docs/screenshots/admin-negotiated-detail.png)
+
 ## 能力对照
 
 NetonAPI 不是在 one-api / new-api 上改出来的分支，而是从**运营平台**的角度重新设计：定价以官方价为锚、每条渠道核算真实成本、
