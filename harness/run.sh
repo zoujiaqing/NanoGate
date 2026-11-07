@@ -108,11 +108,10 @@ echo "[build] linking app…"
 # 拿别人留下的 sqlite klib 去链接（或者 link 自己也判 UP-TO-DATE，直接复用那个已经链错的
 # kexe —— 实测两种都发生过）。产物一跑就死在 NETON-DB-VARIANT mismatch。
 DB_VARIANT=postgres
-# 框架 main 处于 WebSocket 集成阶段：协议栈用 ../../Neton 下的兄弟目录源码，其中 tls 依赖的
-# openssl 4.0.2-3 还没发布，要用本地 openssl-kotlin 源码顶上。这个开关只能走命令行：
-# 根构建的 gradle.properties 传不到被 includeBuild 的框架 settings 里。openssl 发布后删掉。
-NETON_BUILD_FLAGS=(-Pnetonstream.local.openssl=true)
-link_app() { ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ); }
+# 默认用 Maven Central 上的框架发布版；联调框架源码时设
+# NETON_BUILD_FLAGS_EXTRA="-Pnetonapi.frameworkSource=true -Pnetonstream.local.openssl=true"
+read -r -a NETON_BUILD_FLAGS <<< "${NETON_BUILD_FLAGS_EXTRA:-}"
+link_app() { ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q -Pneton.database.driver="$DB_VARIANT" ${NETON_BUILD_FLAGS[@]+"${NETON_BUILD_FLAGS[@]}"} ); }
 # NETONAPI_SKIP_LINK=1：产物已由外部构建好（例如多个项目共用框架 composite build、需经构建锁串行时），跳过这一步。
 if [ "${NETONAPI_SKIP_LINK:-0}" = "1" ]; then
   [ -x "$APP" ] || { echo "NETONAPI_SKIP_LINK=1 但 $APP 不存在"; exit 1; }
@@ -181,7 +180,7 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
   if grep -q 'NETON-DB-VARIANT' "$LOGS/migrate.log"; then
     echo "  ⚠️  链进二进制的 sqlx4k variant 不是 ${DB_VARIANT}（多半是共享 Neton/neton 的兄弟项目刚用" >&2
     echo "     -Pneton.database.driver=sqlite 跑过测试）：--rerun-tasks 重编重链一次…" >&2
-    ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" "${NETON_BUILD_FLAGS[@]}" ) \
+    ( cd "$BACKEND_DIR" && ./gradlew "$LINK_TASK" -q --rerun-tasks -Pneton.database.driver="$DB_VARIANT" ${NETON_BUILD_FLAGS[@]+"${NETON_BUILD_FLAGS[@]}"} ) \
       || { echo "rebuild failed"; exit 1; }
     if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
       echo "  ⚠️  自愈后仍不匹配：有别的构建正在并发改写那份共享 klib，等它跑完再重跑 harness" >&2

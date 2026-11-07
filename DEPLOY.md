@@ -5,17 +5,15 @@
 
 ## 依赖仓库布局
 
-镜像用 Gradle composite build，`netonapi-backend/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：
-本仓必须正好在那层目录的**两层深处**，框架与七个 canonical 模块必须落在同层的 `Neton/` 下。
+`netonapi-backend/settings.gradle.kts` 里写死了 `../../Neton/<repo>`：本仓必须正好在那层目录的**两层深处**，
+套件契约与六个 canonical 模块必须落在同层的 `Neton/` 下。Neton 框架、neton-ai 与 geolite4k 从 Maven Central 下载
+（版本见 `netonapi-backend/gradle.properties`），不需要源码。
 外层目录名（`Neton`、`NewGate`）也是契约的一部分——`netonapi-backend/Dockerfile` 的 `COPY` 源同样写死了它们。
 
 ```
 projects/
 ├── Neton/
-│   ├── neton/                              # 框架（includeBuild）
-│   ├── neton-ai/                           # LLM 协议编解码（includeBuild）
-│   ├── geolite4k/                          # GeoIP（includeBuild）
-│   ├── neton-application-contract/         # 模块间契约（includeBuild）
+│   ├── neton-application-contract/         # 模块间契约
 │   ├── neton-application-module-system/
 │   ├── neton-application-module-infra/
 │   ├── neton-application-module-account/
@@ -502,12 +500,9 @@ allowed_networks = "10.20.0.0/16"      # CIDR：这些网段放行（端口仍�
   `libcurl.so` 软链，再
   `./gradlew :application:linkReleaseExecutableLinuxX64 -Pnetonapi.linuxX64.libDir=<该目录绝对路径>`
   （或环境变量 `NETONAPI_LINUX_X64_LIBDIR`）。头文件仓里已 vendor，只缺链接用的 so。
-- **框架处于 WebSocket 集成阶段时**（框架 `gradle.properties` 里 `netonstream.local=true`），协议栈用
-  `../../Neton` 下的兄弟目录源码，其中 tls 依赖的 openssl 4.0.2-3 尚未发布：所有 gradlew 命令都要加
-  `-Pnetonstream.local.openssl=true`，改用本地 `openssl-kotlin` 源码。写进本仓 `gradle.properties` 不生效——
-  根构建的属性传不到被 includeBuild 的框架 settings。openssl 发布后去掉。
-  交叉编译 Linux 时还要加 `-PnativeTargets=macosArm64,linuxX64`：本地 openssl-kotlin 默认只编当前主机平台，
-  不加则 linuxX64 解析不到 openssl。
+- **联调未发布的框架改动**（`-Pnetonapi.frameworkSource=true`，用 `../../Neton` 下的框架源码）时，框架若处于
+  `netonstream.local=true` 的源码联调状态，所有 gradlew 命令还要加 `-Pnetonstream.local.openssl=true`；
+  交叉编译 Linux 时再加 `-PnativeTargets=macosArm64,linuxX64`。默认用 Maven Central 发布版时都不需要。
 - **运行时依赖**：EL10 要装 `libxcrypt-compat`（二进制链的是 `libcrypt.so.1`），否则启动即
   `libcrypt.so.1 => not found`。`ldd netonapi | grep "not found"` 应为空。
 - **前端在目标机构建**：Node 24 + pnpm 11.20，按 Dockerfile 的布局把 `Neton/` 与 `NewGate/` 两层
