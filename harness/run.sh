@@ -69,13 +69,13 @@ fail() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 # 等某条计数查询达到期望值（非流式先响应后计费：客户端拿到 200 时结算还在 NonCancellable 里写库）。
 # 有界轮询代替裸 sleep：到点仍不等就原值返回，交给调用方断言——多写一条同样会被 = 抓住。
 wait_rows() { local sql=$1 want=$2 tries=${3:-25} v; for _ in $(seq 1 "$tries"); do v=$(q "$sql"); [ "$v" = "$want" ] && break; sleep 0.2; done; echo "$v"; }
-q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
+q() { PGOPTIONS="${PGOPTIONS:-} -c netonapi.harness_seed_discounts=on" psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
 # Redis 断言助手：只碰本次拉起的隔离实例的隔离 db。键名带 keyPrefix（配置里可变），
 # 故一律用 *ngrl:* 通配匹配，不把前缀写死在断言里。
 rc() { redis-cli -p "$REDIS_PORT" -n "$REDIS_DB" "$@" 2>/dev/null; }
 rksum() { local k v s=0; for k in $(rc --scan --pattern "$1"); do v=$(rc get "$k"); s=$((s + ${v:-0})); done; echo "$s"; }
 rkdel() { local k; for k in $(rc --scan --pattern "$1"); do rc del "$k" >/dev/null; done; }
-seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_channel_model_costs,gateway_model_prices,gateway_usage_logs,pay_consumption_transactions,gateway_settlements RESTART IDENTITY;
+seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_channel_model_costs,gateway_channel_model_discounts,gateway_model_prices,gateway_usage_logs,pay_consumption_transactions,gateway_settlements RESTART IDENTITY;
   UPDATE pay_consumption_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
   UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
 
@@ -190,6 +190,29 @@ if ! ( cd "$WORK" && "$APP" migrate up >"$LOGS/migrate.log" 2>&1 ); then
     echo "migrate failed, see $LOGS/migrate.log"; tail -3 "$LOGS/migrate.log"; exit 1
   fi
 fi
+# 旧场景用 SQL 造已启用的测试渠道。只在本脚本的 SQL 会话内把夹具成本写入模型倍率表。
+psql -U "$PGUSER" -d "$DB" -Xq -v ON_ERROR_STOP=1 <<'SQL' || exit 1
+CREATE FUNCTION seed_harness_channel_discounts() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('netonapi.harness_seed_discounts', true) = 'on' THEN
+        INSERT INTO gateway_channel_model_discounts (channel_id, model, discount)
+        SELECT DISTINCT NEW.id, COALESCE(NULLIF(btrim(mapping.value), ''), model.name), NEW.cost_discount
+          FROM (
+              SELECT btrim(name) AS name FROM regexp_split_to_table(NEW.models, ',') AS name
+          ) model
+          LEFT JOIN LATERAL jsonb_each_text(CASE WHEN NEW.model_mapping IS JSON OBJECT
+                                               THEN NEW.model_mapping::jsonb ELSE '{}'::jsonb END) mapping
+            ON mapping.key = model.name
+         WHERE model.name <> ''
+        ON CONFLICT (channel_id, model) DO UPDATE SET discount = EXCLUDED.discount;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER seed_harness_channel_discounts
+AFTER INSERT OR UPDATE OF models, model_mapping, cost_discount ON gateway_channels
+FOR EACH ROW EXECUTE FUNCTION seed_harness_channel_discounts();
+SQL
 # 基础令牌 + 账户（harness 直插 gateway 令牌）。
 # ⚠️ account_users **没有迁移种子**：admin/admin123 那个用户来自 module-infra 的 system_users，
 # account 侧的 id=1 是 S26 自己 INSERT 出来的。这一行原本写的是「账号 id=1 由迁移种子
@@ -861,7 +884,7 @@ fi
 # 管理台新建表单提交的就是这一整包（含 status 与 keys 数组）：后端对未知字段直接 400，
 # 漏收一个字段 = 管理台建不了任何渠道。status=0 落库为禁用，keys 两把都入库
 ui25=$(curl -s --max-time 10 -o "/tmp/s25-ui-$$" -w "%{http_code}" -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $JWT" -H "$CT" \
-  -d '{"name":"s25-ui","type":"openai_compatible","baseUrl":"http://8.8.8.8/v1","keys":["sk-s25-ui-000000001","sk-s25-ui-000000002"],"groups":"default","models":"m-ui25","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":0,"remark":""}')
+  -d '{"name":"s25-ui","type":"openai_compatible","baseUrl":"http://8.8.8.8/v1","keys":["sk-s25-ui-000000001","sk-s25-ui-000000002"],"groups":"default","models":"","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":0,"remark":""}')
 uibody=$(cat "/tmp/s25-ui-$$" 2>/dev/null); rm -f "/tmp/s25-ui-$$"
 uist=$(q "SELECT status FROM gateway_channels WHERE name='s25-ui'")
 uikeys=$(q "SELECT COUNT(*) FROM gateway_channel_keys k JOIN gateway_channels c ON c.id=k.channel_id WHERE c.name='s25-ui'")
@@ -902,12 +925,23 @@ logcode=$(grep "relay target refused" "$WORK/logs/all.log" | grep -c "UPSTREAM_U
 # 曾经 ""代理被当成非法代理地址、/v1 又被拼成 /v1/v1，这样的渠道拉模型与转发全部失败（2026-10-27 线上）
 GJ25=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 cv1=$(curl -s --max-time 10 -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $GJ25" -H "$CT" \
-  -d '{"name":"s25-v1","type":"openai_compatible","baseUrl":"http://127.0.0.1:9976/v1","keys":["k-v1"],"groups":"default","models":"m-v1","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":1,"remark":""}' \
+  -d '{"name":"s25-v1","type":"openai_compatible","baseUrl":"http://127.0.0.1:9976/v1","keys":["k-v1"],"groups":"default","models":"","capabilities":"chat","modelMapping":"","paramOverride":"","priority":0,"weight":1,"costSource":"official","costDiscount":"1.0","upstreamPricingFormat":"","upstreamPricingUrl":"","upstreamGroupRatio":"1","upstreamCreditRate":"1","proxyUrl":"","apiVersion":"","providerConfig":"","status":1,"remark":""}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('data') or '')" 2>/dev/null)
 q "INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-v1','1','1','0','0',100,'manual',0,0,0);" >/dev/null
 pv1=$(q "SELECT COALESCE(proxy_url,'<null>') FROM gateway_channels WHERE name='s25-v1'")
-rv1=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-v1","messages":[]}')
 mv1=$(curl -s --max-time 15 -X POST "$U/admin/gateway/channel/models/$cv1" -H "Authorization: Bearer $GJ25" -H "$CT" | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(d['ok'],d.get('error') or '')" 2>/dev/null)
+mc25=$(curl -s --max-time 10 "$U/admin/gateway/channel/model-config/$cv1" -H "Authorization: Bearer $GJ25")
+new25=$(printf '%s' "$mc25" | python3 -c 'import json,sys; rows=json.load(sys.stdin)["data"]; print(any(r["model"] == "m-list-a" and not r["enabled"] and not r.get("costDiscount") for r in rows))')
+setmodel25() {
+  curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X PUT "$U/admin/gateway/channel/model-config" \
+    -H "Authorization: Bearer $GJ25" -H "$CT" -d "{\"channelId\":$cv1,\"model\":\"m-v1\",\"costDiscount\":\"$1\",\"enabled\":true}"
+}
+missing25=$(setmodel25 "")
+enabled25=$(setmodel25 "1")
+[ "$new25" = "True" ] && [ "$missing25" = "400" ] && [ "$enabled25" = "200" ] \
+  && pass "拉取模型默认停用且无倍率，配置倍率后才可启用" \
+  || fail "模型启用闸门: 默认=${new25} 缺倍率=${missing25} 配置=${enabled25}"
+rv1=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-v1","messages":[]}')
 [ -n "$cv1" ] && [ "$pv1" = "<null>" ] && [ "$rv1" = "200" ] && [ "${mv1%% *}" = "True" ] \
   && pass "管理台写法的渠道（Base URL 带 /v1、代理留空）：代理存为空、转发 200、拉模型成功" \
   || fail "管理台写法的渠道: id=${cv1} 代理=${pv1}(期望<null>) 转发=${rv1}(期望200) 拉模型='${mv1}'"
@@ -3261,20 +3295,16 @@ v92=$(curl -s --max-time 10 -o /tmp/netonapi-s92.json -w "%{http_code}" -X PUT "
 grep -q 'CHANNEL_PRICING_FORMAT_REQUIRED' /tmp/netonapi-s92.json && [ "$v92" = "400" ] \
   && pass "成本来源选上游价目接口却不选格式 → 400 CHANNEL_PRICING_FORMAT_REQUIRED" || fail "上游格式校验: HTTP=${v92} $(head -c 200 /tmp/netonapi-s92.json)"
 rm -f /tmp/netonapi-s92.json
-# 成本设置必须由管理员明确给出（上游几乎不可能按官方价 1:1 计费）：不补默认值，缺哪项报哪项的机器码，渠道不落库
+# 价目同步连接参数仍需明确填写，模型倍率由独立的模型配置接口维护。
 ck92() { curl -s --max-time 10 -X POST "$U/admin/gateway/channel/create" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d "{\"name\":\"c-ck92\",\"type\":\"openai_compatible\",\"baseUrl\":\"http://127.0.0.1:9996\"$1}" | grep -oE 'CHANNEL_[A-Z_]+_REQUIRED' | head -1; }
-k1=$(ck92 ',"costDiscount":"0.6"')
-k2=$(ck92 ',"costSource":"official"')
-k3=$(ck92 ',"costSource":"official","costDiscount":" "')
-k4=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi"')
-k5=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1"')
-k6=$(ck92 ',"costSource":"upstream","costDiscount":"1","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1","upstreamCreditRate":""')
+k4=$(ck92 ',"costSource":"upstream","upstreamPricingFormat":"newapi"')
+k5=$(ck92 ',"costSource":"upstream","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1"')
+k6=$(ck92 ',"costSource":"upstream","upstreamPricingFormat":"newapi","upstreamGroupRatio":"0.1","upstreamCreditRate":""')
 n92=$(q "SELECT COUNT(*) FROM gateway_channels WHERE name='c-ck92'")
-[ "$k1" = "CHANNEL_COST_SOURCE_REQUIRED" ] && [ "$k2" = "CHANNEL_COST_DISCOUNT_REQUIRED" ] && [ "$k3" = "CHANNEL_COST_DISCOUNT_REQUIRED" ] \
-  && [ "$k4" = "CHANNEL_UPSTREAM_GROUP_RATIO_REQUIRED" ] && [ "$k5" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$k6" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$n92" = "0" ] \
-  && pass "渠道成本设置必填：缺来源 / 折扣 / 上游分组倍率 / 充值汇率分别报对应机器码，不补默认值、不落库" \
-  || fail "成本必填: 缺来源=${k1} 缺折扣=${k2} 空折扣=${k3} 缺分组倍率=${k4} 缺汇率=${k5} 空汇率=${k6} 落库=${n92}(期望0)"
+[ "$k4" = "CHANNEL_UPSTREAM_GROUP_RATIO_REQUIRED" ] && [ "$k5" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$k6" = "CHANNEL_UPSTREAM_CREDIT_RATE_REQUIRED" ] && [ "$n92" = "0" ] \
+  && pass "上游价目同步须填写分组倍率与额度单价" \
+  || fail "价目同步设置: 缺分组倍率=${k4} 缺汇率=${k5} 空汇率=${k6} 落库=${n92}(期望0)"
 # 从官方价改成上游价目接口：库里的分组倍率 / 汇率 1 只是占位，必须重新给出
 v92b=$(curl -s --max-time 10 -X PUT "$U/admin/gateway/channel/update" -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d "{\"id\":$CC92,\"name\":\"c-cc\",\"type\":\"openai_compatible\",\"baseUrl\":\"http://127.0.0.1:9996\",\"groups\":\"default\",\"models\":\"m-cc\",\"capabilities\":\"chat\",\"costSource\":\"upstream\",\"upstreamPricingFormat\":\"newapi\"}" \
