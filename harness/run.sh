@@ -75,8 +75,8 @@ q() { psql -U "$PGUSER" -d "$DB" -tAc "$1" 2>/dev/null; }
 rc() { redis-cli -p "$REDIS_PORT" -n "$REDIS_DB" "$@" 2>/dev/null; }
 rksum() { local k v s=0; for k in $(rc --scan --pattern "$1"); do v=$(rc get "$k"); s=$((s + ${v:-0})); done; echo "$s"; }
 rkdel() { local k; for k in $(rc --scan --pattern "$1"); do rc del "$k" >/dev/null; done; }
-seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_channel_model_costs,gateway_model_prices,gateway_usage_logs,gateway_quota_transactions,gateway_settlements RESTART IDENTITY;
-  UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
+seed_reset() { q "TRUNCATE gateway_channels,gateway_channel_keys,gateway_channel_model_costs,gateway_model_prices,gateway_usage_logs,pay_consumption_transactions,gateway_settlements RESTART IDENTITY;
+  UPDATE pay_consumption_accounts SET balance=100000000, reserved_balance=0, version=version WHERE user_id=1;
   UPDATE gateway_tokens SET quota_used=0, quota_reserved=0, quota_budget=NULL WHERE key_hash='$TOKEN_HASH';" >/dev/null; }
 
 # fake 是后台拉起的，bind 需要时间；以前每个调用点靠 `sleep 1` 等它，机器一忙就踩空。
@@ -196,7 +196,7 @@ fi
 # 提供」，全仓 SQL 里根本没有那条 INSERT —— 它把一次「能不能开户」的排查带偏了很久。
 # 顺带记下相关事实：account_users_id_seq 由迁移 setval 到 GREATEST(MAX(id),10000)，所以 S26 显式
 # 插的 id=1 与 sms-login 自动注册取到的号（10000 起）不会撞。
-q "INSERT INTO gateway_quota_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
+q "INSERT INTO pay_consumption_accounts (user_id,balance,version,created_at,updated_at) VALUES (1,100000000,0,0,0) ON CONFLICT (user_id) DO UPDATE SET balance=100000000;
    INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT (key_hash) DO NOTHING;" >/dev/null
 
 # 网关启动/停止：boot_app 可带 env 覆盖（S22 验证全局加价率与毛利下限），故 APP_PID 单独记录以便中途重启。
@@ -241,8 +241,8 @@ seq 1 20 | xargs -P 20 -I{} curl -s --max-time 15 -o /dev/null -X POST "$U/v1/ch
 # 不同笔数上的画面 —— 看起来像账务不一致，其实只是还没落完。等 20 行日志到位再读。
 n1=$(wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE user_id=1" 20 50)
 sc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs WHERE user_id=1")
-sd=$(q "SELECT -COALESCE(SUM(amount),0) FROM gateway_quota_transactions WHERE user_id=1 AND type='consume'")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+sd=$(q "SELECT -COALESCE(SUM(amount),0) FROM pay_consumption_transactions WHERE user_id=1 AND type='consume'")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$sc" = "150000" ] && [ "$sc" = "$sd" ] && [ "$sc" = "$bd" ] && [ "$sc" = "$tu" ] \
   && pass "20 并发 → charged=$sc == debit=$sd == balanceΔ=$bd == quotaUsed=$tu" \
@@ -272,8 +272,8 @@ curl -sN --max-time 1 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{
 # 等结算落库再核对（固定 sleep 3 在机器忙时会读到空行，偶发误报）
 wait_rows "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-pr'" 1 50 >/dev/null
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-pr' ORDER BY id DESC LIMIT 1")
-ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+ta=$(q "SELECT -amount FROM pay_consumption_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$lc" = "5000" ] && [ "$ta" = "5000" ] && [ "$bd" = "5000" ] && [ "$tu" = "5000" ] \
   && pass "断连真实扣款四项一致 charged=$lc == debit=$ta == balanceΔ=$bd == quotaUsed=$tu" \
@@ -332,28 +332,28 @@ seed_reset; fake bigstream 9920; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('td','openai_compatible','http://127.0.0.1:9920','default','m-td',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='td'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,per_request_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-td','0','0','0','0',5000,5000,'manual',0,0,0);" >/dev/null
-b0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+b0=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 ( curl -sN --max-time 2 -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-td","stream":true,"messages":[]}' >/dev/null 2>&1 ) & CURL_PID=$!
 sleep 0.6; q "DELETE FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'" >/dev/null; wait "$CURL_PID"; sleep 2
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-td' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT $b0-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT $b0-balance FROM pay_consumption_accounts WHERE user_id=1")
 warn=$(grep -c "token deleted mid-request" "$WORK/logs/all.log")
 [ -n "$lc" ] && [ "$lc" = "$bd" ] && [ "$warn" -ge 1 ] && pass "token 删后账户三项一致 charged=$lc balanceΔ=$bd + warn" || fail "token 删账务错: charged=$lc balanceΔ=$bd warn=$warn"
 q "INSERT INTO gateway_tokens (user_id,name,key_hash,key_display,status,deleted,created_at,updated_at) VALUES (1,'harness','$TOKEN_HASH','sk-harn****0000',1,0,0,0) ON CONFLICT DO NOTHING" >/dev/null
 
 # ══ S7 首建账户并发（唯一键竞态）══
 # 删除账户制造"首建"：20 并发同一 user 首请求各自触发 account() 首建（RelayEngine 余额预检路径）。
-# 修复前两个并发首建会各自 INSERT 撞 uk_gateway_quota_accounts_user 抛异常 → 500；
+# 修复前两个并发首建会各自 INSERT 撞 unique user_id 抛异常 → 500；
 # 修复（ON CONFLICT DO NOTHING + 重读）后：账户表恰好 1 行、无 500 崩溃。
 # 注：裸首建 balance=0，被 balance<=0 预检拒为 429（正确的后付费语义，需先授信）；计费四项不变量已由 S1 覆盖。
 echo "[S7] 首建账户并发"
 seed_reset; fake ok 9910; sleep 1
-q "DELETE FROM gateway_quota_accounts WHERE user_id=1;
+q "DELETE FROM pay_consumption_accounts WHERE user_id=1;
    INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c-new','openai_compatible','http://127.0.0.1:9910','default','m-new',1,1,1,30000,90000,'1.0',0,0,0);
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-new'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-new','2.5','10','0','0',5000,'manual',0,0,0);" >/dev/null
 codes=$(seq 1 20 | xargs -P 20 -I{} curl -s --max-time 15 -o /dev/null -w "%{http_code}\n" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-new","messages":[]}')
-rows=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id=1")
+rows=$(q "SELECT COUNT(*) FROM pay_consumption_accounts WHERE user_id=1")
 n500=$(printf '%s\n' "$codes" | grep -c '^500')
 nresp=$(printf '%s\n' "$codes" | grep -cE '^[0-9]{3}')
 [ "$rows" = "1" ] && [ "$n500" = "0" ] && [ "$nresp" = "20" ] \
@@ -367,8 +367,8 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
    INSERT INTO gateway_channel_keys (channel_id,api_key,status,fail_count,deleted,created_at,updated_at) VALUES ((SELECT id FROM gateway_channels WHERE name='c-idem'),'k',1,0,0,0,0);
    INSERT INTO gateway_model_prices (model,input_price,output_price,cache_read_price,cache_write_price,default_max_output_tokens,source,deleted,created_at,updated_at) VALUES ('m-idem','1','1','0','0',5000,'manual',0,0,0);" >/dev/null
 h8=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-idem","messages":[]}'); sleep 1
-ref=$(q "SELECT ref FROM gateway_quota_transactions WHERE type='consume' ORDER BY id DESC LIMIT 1")
-b1=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ref=$(q "SELECT ref FROM pay_consumption_transactions WHERE type='consume' ORDER BY id DESC LIMIT 1")
+b1=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 if [ "$h8" != "200" ] || [ -z "$ref" ]; then
   # 前置不成立就**别**去断言幂等：请求没成功就不会有 consume 台账，ref 为空会让下面那条手插的
   # ref='' 既不撞唯一约束、又数出 cnt=1、余额也不动 —— 症状跟「约束失效」完全一样。
@@ -376,16 +376,16 @@ if [ "$h8" != "200" ] || [ -z "$ref" ]; then
   fail "S8 前置没成立：relay HTTP=$h8(期望200)、consume ref='${ref:-空}' —— 请求没成功，幂等约束与结算终态这次都没被测到（不是约束失效）"
 else
   # 重放：手动以同一 ref 再插一条台账 → 唯一约束应拒绝（模拟重试/outbox 重放不重复扣）
-  duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO gateway_quota_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
-  cnt=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$ref'")
-  b2=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+  duperr=$(psql -U "$PGUSER" -d "$DB" -tAc "INSERT INTO pay_consumption_transactions (user_id,type,amount,balance_after,ref,created_at) VALUES (1,'consume',-9999,0,'$ref',0)" 2>&1)
+  cnt=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$ref'")
+  b2=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
   { grep -qiE "duplicate|unique|uk_gateway_quota_tx_ref" <<< "$duperr"; } && rejected=1 || rejected=0
   [ "$rejected" = "1" ] && [ "$cnt" = "1" ] && [ "$b1" = "$b2" ] \
     && pass "重复 ref 被唯一约束拒绝(ref=$ref)、台账唯一(cnt=1)、余额不变" \
     || fail "幂等约束失效: ref=$ref rejected=$rejected cnt=$cnt bal=${b1}->${b2}"
   # settlement 终态：FINALIZED + 预留归零（V004-durable-settlement-design 的核心不变量）
   st=$(q "SELECT status FROM gateway_settlements ORDER BY id DESC LIMIT 1")
-  rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+  rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
   qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
   [ "$st" = "FINALIZED" ] && [ "$rb" = "0" ] && [ "$qr" = "0" ] \
     && pass "settlement 终态 FINALIZED、预留归零(account=$rb token=$qr)" \
@@ -406,8 +406,8 @@ mchunks=$(printf '%s\n' "$resp" | grep -c "^data:")
 fakedone=$(printf '%s\n' "$resp" | grep -c "\[DONE\]")
 st=$(q "SELECT status FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-mid' ORDER BY id DESC LIMIT 1")
-ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+ta=$(q "SELECT -amount FROM pay_consumption_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 fc=$(q "SELECT fail_count FROM gateway_channel_keys WHERE channel_id=$(CID c-mid)")
 inflight=$(curl -s --max-time 2 "http://127.0.0.1:9901/inflight" | python3 -c "import sys,json;print(json.load(sys.stdin).get('inflight',-1))" 2>/dev/null)
@@ -443,23 +443,23 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
 # 模拟「usage 已落库但 finalize 未完成」：把已 FINALIZED 的记录退回 FINALIZE_PENDING 并撤销其账务效果
 curl -s --max-time 15 -o /dev/null -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-wk","messages":[]}'; sleep 1
 sid=$(q "SELECT settlement_id FROM gateway_settlements ORDER BY id DESC LIMIT 1")
-q "DELETE FROM gateway_usage_logs; DELETE FROM gateway_quota_transactions;
-   UPDATE gateway_quota_accounts SET balance=100000000, reserved_balance=7000 WHERE user_id=1;
+q "DELETE FROM gateway_usage_logs; DELETE FROM pay_consumption_transactions;
+   UPDATE pay_consumption_accounts SET balance=100000000, reserved_balance=7000 WHERE user_id=1;
    UPDATE gateway_tokens SET quota_used=0, quota_reserved=7000 WHERE key_hash='$TOKEN_HASH';
    UPDATE gateway_settlements SET status='FINALIZE_PENDING', lease_owner=NULL, lease_until=0, next_retry_at=0, attempts=0 WHERE settlement_id='$sid';" >/dev/null
 JWT=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 tick=$(curl -s --max-time 15 -X POST "$U/admin/gateway/settlement/tick" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}')
 st=$(q "SELECT status FROM gateway_settlements WHERE settlement_id='$sid'")
 lc=$(q "SELECT COALESCE(SUM(charged),0) FROM gateway_usage_logs")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
+rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 [ "$st" = "FINALIZED" ] && [ "$lc" = "7000" ] && [ "$bd" = "7000" ] && [ "$rb" = "0" ] && [ "$qr" = "0" ] \
   && pass "worker 重放 FINALIZE_PENDING → FINALIZED、补记 charged=${lc}、扣款=${bd}、预留归零" \
   || fail "worker 重放失败: status=$st charged=$lc balanceΔ=$bd reserved=$rb/$qr tick=$tick"
 # 再 tick 一次必须幂等（不重复扣费）
 curl -s --max-time 15 -o /dev/null -X POST "$U/admin/gateway/settlement/tick" -H "Authorization: Bearer $JWT" -H "$CT" -d '{}'
-bd2=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd2=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$bd2" = "7000" ] && pass "worker 重复 tick 幂等（扣款仍=${bd2}）" || fail "worker 重复 tick 重复扣费: $bd -> $bd2"
 
 # ══ S12 worker TTL：RESERVED 自动释放 / UPSTREAM_STARTED 转人工（C1、C2）══
@@ -468,14 +468,14 @@ seed_reset
 q "INSERT INTO gateway_settlements (settlement_id,user_id,token_id,request_model,endpoint,status,reserved_amount,pricing_snapshot,created_at,updated_at)
    VALUES ('ttlreserved00000000000000000000',1,(SELECT id FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'),'m-x','/v1/chat/completions','RESERVED',4000,'{}',0,0),
           ('ttlstarted000000000000000000000',1,(SELECT id FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'),'m-x','/v1/chat/completions','UPSTREAM_STARTED',6000,'{}',0,0);
-   UPDATE gateway_quota_accounts SET reserved_balance=10000 WHERE user_id=1;
+   UPDATE pay_consumption_accounts SET reserved_balance=10000 WHERE user_id=1;
    UPDATE gateway_tokens SET quota_reserved=10000 WHERE key_hash='$TOKEN_HASH';" >/dev/null
 curl -s --max-time 15 -o /dev/null -X POST "$U/admin/gateway/settlement/tick" -H "Authorization: Bearer $JWT" -H "$CT" -d '{"reserveTtlMs":1,"upstreamTtlMs":1}'
 s1=$(q "SELECT status FROM gateway_settlements WHERE settlement_id='ttlreserved00000000000000000000'")
 s2=$(q "SELECT status FROM gateway_settlements WHERE settlement_id='ttlstarted000000000000000000000'")
 ra=$(q "SELECT retry_action FROM gateway_settlements WHERE settlement_id='ttlstarted000000000000000000000'")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
-bal=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
+bal=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 # RESERVED 释放 4000 → 剩 6000 仍被 UPSTREAM_STARTED 持有（不自动退款）；余额未被扣
 [ "$s1" = "RELEASED" ] && [ "$s2" = "MANUAL_REVIEW" ] && [ "$ra" = "FINALIZE" ] && [ "$rb" = "6000" ] && [ "$bal" = "100000000" ] \
   && pass "TTL：RESERVED→RELEASED(释放4000)、UPSTREAM_STARTED→MANUAL_REVIEW(保留6000不退款)、余额未动" \
@@ -615,8 +615,8 @@ q "UPDATE gateway_model_prices SET input_price='25', output_price='100' WHERE mo
 wait "$CURL_PID"; sleep 1
 code=$(cat /tmp/s17-code.$$ 2>/dev/null); rm -f /tmp/s17-code.$$
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-snap' ORDER BY id DESC LIMIT 1")
-ta=$(q "SELECT -amount FROM gateway_quota_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+ta=$(q "SELECT -amount FROM pay_consumption_transactions WHERE ref LIKE 'settlement:%' ORDER BY id DESC LIMIT 1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 q "UPDATE gateway_groups SET ratio='1.0' WHERE code='default';" >/dev/null   # 还原倍率，不污染后续场景/库状态
 # 这里按 code 而不是 name 找组：V002 之后 name 只是显示名（S27 就会改它），
@@ -638,11 +638,11 @@ code=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X POST "$U/v1/chat/
 sleep 1   # 非流式先响应后计费，等结算落库
 st=$(q "SELECT status FROM gateway_settlements WHERE request_model='m-crp' ORDER BY id DESC LIMIT 1")
 ra=$(q "SELECT retry_action FROM gateway_settlements WHERE request_model='m-crp' ORDER BY id DESC LIMIT 1")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 nlog=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-crp'")
-ntx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='consume'")
+ntx=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='consume'")
 alert=$(grep -c "pricing snapshot invalid" "$WORK/logs/all.log" 2>/dev/null)
 [ "$code" = "200" ] && [ "$st" = "MANUAL_REVIEW" ] && [ "$ra" = "FINALIZE" ] \
   && [ "${rb:-0}" -gt 0 ] && [ "${qr:-0}" -gt 0 ] && [ "$bd" = "0" ] && [ "$nlog" = "0" ] && [ "$ntx" = "0" ] && [ "${alert:-0}" -ge 1 ] \
@@ -661,9 +661,9 @@ q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weigh
 code=$(curl -s --max-time 20 -o /tmp/s19-body.$$ -w "%{http_code}" -X POST "$U/v1/chat/completions" -H "$AUTH" -H "$CT" -d '{"model":"m-bad","messages":[]}')
 body=$(cat /tmp/s19-body.$$ 2>/dev/null); rm -f /tmp/s19-body.$$
 ns=$(q "SELECT COUNT(*) FROM gateway_settlements")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 qr=$(q "SELECT quota_reserved FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 nlog=$(q "SELECT COUNT(*) FROM gateway_usage_logs")
 ec=$(echo "$body" | grep -c "model_pricing_invalid")
 alert=$(grep -c "model pricing invalid" "$WORK/logs/all.log" 2>/dev/null)
@@ -690,7 +690,7 @@ sco=$(q "SELECT cost FROM gateway_settlements WHERE request_model='m-sale' ORDER
 rs=$(q "SELECT reserved_amount FROM gateway_settlements WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
 lc=$(q "SELECT charged FROM gateway_usage_logs WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
 lco=$(q "SELECT cost FROM gateway_usage_logs WHERE request_model='m-sale' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 tu=$(q "SELECT quota_used FROM gateway_tokens WHERE key_hash='$TOKEN_HASH'")
 cat5=$(curl -s --max-time 10 "$U/app/gateway/model/list" | grep -c '"inputPrice":"5"')
 inv=$(grep -c "margin inversion" "$WORK/logs/all.log" 2>/dev/null)
@@ -729,7 +729,7 @@ sleep 1
 sc=$(q "SELECT charged FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
 sco=$(q "SELECT cost FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
 rs=$(q "SELECT reserved_amount FROM gateway_settlements WHERE request_model='m-mk' ORDER BY id DESC LIMIT 1")
-bd=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+bd=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$code" = "200" ] && [ "$sc" = "15000" ] && [ "$sco" = "7500" ] && [ "$bd" = "15000" ] && [ "$rs" = "$exp_res" ] \
   && pass "加价率 2.0：收入=${sc}（官方×2）、成本=${sco}（官方轨不变）、预留=${rs}、余额Δ=${bd}" \
   || fail "加价率未生效: code=$code charged=${sc}(期望15000) cost=${sco}(期望7500) 预留=${rs}(期望${exp_res}) balanceΔ=${bd}"
@@ -772,7 +772,7 @@ code2=$(curl -s --max-time 20 -o /tmp/s23-body.$$ -w "%{http_code}" -X POST "$U/
 b2=$(cat /tmp/s23-body.$$ 2>/dev/null); rm -f /tmp/s23-body.$$
 nf=$(echo "$b2" | grep -c "model_not_found")
 ns=$(q "SELECT COUNT(*) FROM gateway_settlements WHERE request_model='m-chatonly'")
-rb=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+rb=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$code" = "200" ] && [ "$ch" = "c-emb" ] && [ "$pt" = "7" ] && [ "${ct:-0}" = "0" ] && [ "$lg" = "7" ] \
   && [ "$code2" = "404" ] && [ "${nf:-0}" -ge 1 ] && [ "$ns" = "0" ] && [ "${rb:-0}" = "0" ] \
   && pass "能力路由：embeddings 落到 ${ch}（charged=${lg}/prompt=${pt}/completion=${ct}）、chat-only 模型 404 model_not_found 且零 settlement(${ns})/零预留(${rb})" \
@@ -1034,7 +1034,7 @@ VIP26=$(GID vip26)
 q "UPDATE gateway_tokens SET group_override='ghost26', group_assigned=1 WHERE key_hash='$TOKEN_HASH'" >/dev/null
 ca=$(relay26); sleep 1
 na=$(q "SELECT COUNT(*) FROM gateway_settlements")
-da=$(q "SELECT 100000000-balance FROM gateway_quota_accounts WHERE user_id=1")
+da=$(q "SELECT 100000000-balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$ca" = "500" ] && grep -q 'billing_group_config_broken' "$GB" && [ "$na" = "0" ] && [ "$da" = "0" ] \
   && pass "令牌覆盖指向不存在的组 → 500 billing_group_config_broken、零 settlement(${na})、未扣款(${da})" \
   || fail "缺目标组未拒绝: code=${ca}(期望500) body=$(head -c 160 "$GB") settlement=${na} balanceΔ=${da}"
@@ -1163,15 +1163,15 @@ echo "[S30] 充值入口：汇率没配就拒绝（在线充值未开通），�
 # BufferedHttpDispatcher 的兜底分支），真实原因异步落 infra_api_error_logs（infra 的
 # DbErrorLogWriter）—— 这里连它一起断言：光拒绝不够，运维得能查出是哪个环变量没配。
 nrc0=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
-ntx0=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
+ntx0=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'gateway:quota:%'")
 # 余额用「请求前后不变」而不是绝对值：走到这里 S26(c)/S27 已经真扣过费（共 37500），
 # 写 100000000 等于把前面场景的花费误报成「充值入口漏了额度」。
-balBefore=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+balBefore=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 r1=$(curl -s --max-time 10 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 nrc1=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
-ntx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
-bal0=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx1=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'gateway:quota:%'")
+bal0=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 # 没配汇率 = 在线充值未开通：503 + RECHARGE_UNAVAILABLE（控制台据此提示联系客户经理），不是 500
 [ "$r1" = "503" ] && grep -q 'RECHARGE_UNAVAILABLE' "$GB" && [ "$nrc1" = "$nrc0" ] && [ "$ntx1" = "$ntx0" ] && [ "$bal0" = "$balBefore" ] \
   && pass "汇率未配 → 503 RECHARGE_UNAVAILABLE、零意图单(${nrc1})、零发放(${ntx1})、余额未动(${balBefore}->${bal0})" \
@@ -1269,8 +1269,8 @@ for i in 1 2 3 4 5; do
 done
 wait $CB; sleep 1
 ok32=$(grep -c '^200$' "$CODES"); rm -f "$CODES"
-bal32=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-ntx32=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID'")
+bal32=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+ntx32=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID'")
 ps32=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$RID")
 pos32=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID'")
 [ "$bal32" = "100100000" ] && [ "$ntx32" = "1" ] && [ "$ps32" = "1" ] && [ "$pos32" = "1" ] \
@@ -1279,8 +1279,8 @@ pos32=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID'")
 # 串行重投：此时支付单已 SUCCESS，updateSuccess 在 publish 之前就早退了，根本不会二次发事件
 curl -s --max-time 15 -o /dev/null -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID\"}"
 sleep 1
-bal32b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-ntx32b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID'")
+bal32b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+ntx32b=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID'")
 [ "$bal32b" = "$bal32" ] && [ "$ntx32b" = "1" ] \
   && pass "串行重投不再入账：余额仍 ${bal32b}、台账仍 ${ntx32b} 条" \
   || fail "重投又入账了: 余额 ${bal32}→${bal32b} 台账 ${ntx32}→${ntx32b}"
@@ -1293,7 +1293,7 @@ sy1=$(curl -s --max-time 15 -X POST "$U/admin/pay/order/sync/$PO32" -H "Authoriz
 curl -s --max-time 15 -o "$GB" -X POST "$U/app/gateway/recharge" -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}'
 MOID2=$(jdata merchantOrderId); PO32B=$(q "SELECT id FROM pay_orders WHERE merchant_order_id='$MOID2'")
 sy2=$(curl -s --max-time 15 -X POST "$U/admin/pay/order/sync/$PO32B" -H "Authorization: Bearer $GJWT" -H "$CT" -d '{}' | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['status'])" 2>/dev/null)
-st32b=$(q "SELECT status FROM pay_orders WHERE id=$PO32B"); bal32c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+st32b=$(q "SELECT status FROM pay_orders WHERE id=$PO32B"); bal32c=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 sy3=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/admin/pay/order/sync/$PO32B" -H "$CT" -d '{}')
 [ "$sy1" = "ALREADY_FINAL" ] && [ "$sy2" = "UNSUPPORTED" ] && [ "$st32b" = "0" ] && [ "$bal32c" = "$bal32" ] && [ "$sy3" = "401" ] \
   && pass "同步支付状态：已支付单=${sy1}；沙箱待支付单=${sy2}（不支持查单，订单仍待支付、余额不动）；无凭据=${sy3}" \
@@ -1310,8 +1310,8 @@ q "UPDATE gateway_quota_recharges SET pay_status=3 WHERE id=$RID2" >/dev/null
 cb33=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID2\"}")
 sleep 1
 pos33=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID2'")
-ntx33=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID2'")
-bal33=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx33=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID2'")
+bal33=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$cb33" != "200" ] && [ "$pos33" = "0" ] && [ "$ntx33" = "0" ] && [ "$bal33" = "$bal32" ] \
   && pass "入账失败 → 整笔回滚：回调 HTTP=${cb33}、支付单仍待支付(status=${pos33})、台账 ${ntx33} 条、余额未动(${bal33})" \
   || fail "入账失败没有整笔回滚: HTTP=${cb33} pay_orders.status=${pos33}(期望0) 台账=${ntx33}(期望0) 余额=${bal33}(期望${bal32})"
@@ -1320,8 +1320,8 @@ q "UPDATE gateway_quota_recharges SET pay_status=0 WHERE id=$RID2" >/dev/null
 cb33b=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" -d "{\"merchantOrderId\":\"$MOID2\"}")
 sleep 1
 pos33b=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID2'")
-ntx33b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID2'")
-bal33b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx33b=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID2'")
+bal33b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 ps33b=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$RID2")
 [ "$cb33b" = "200" ] && [ "$pos33b" = "1" ] && [ "$ntx33b" = "1" ] && [ "$bal33b" = "100200000" ] && [ "$ps33b" = "1" ] \
   && pass "重投即恢复：支付单转已支付、台账 1 条、余额 ${bal33}→${bal33b}(+100000)" \
@@ -1345,17 +1345,17 @@ khi86=no; grep -q 'RECHARGE_PRICE_TOO_HIGH' "$GB" && khi86=yes
 c86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":200,"channelCode":"sandbox_alipay"}')
 RID86=$(jdata rechargeId); MOID86="gateway:quota:$RID86"
-bal86a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal86a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 curl -s --max-time 15 -o /dev/null -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" \
   -d "{\"merchantOrderId\":\"$MOID86\",\"amount\":\"1\"}"
 sleep 1
 pos86=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
-ntx86=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID86'")
+ntx86=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID86'")
 curl -s --max-time 15 -o /dev/null -X POST "$U/app/pay/channel-notify/sandbox_alipay/mock-success" -H "$CT" \
   -d "{\"merchantOrderId\":\"$MOID86\",\"amount\":\"200\"}"
 sleep 1
 pos86b=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
-bal86b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal86b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$c86" = "200" ] && [ "$pos86" = "0" ] && [ "$ntx86" = "0" ] && [ "$pos86b" = "1" ] && [ "$bal86b" = "$((bal86a+200000))" ] \
   && pass "回调金额核对：实付 1 分 ≠ 订单 200 分 → 不入账；实付相符 → 入账 +200000" \
   || fail "回调金额核对: 下单=${c86} 不符后支付单=${pos86}(期望0) 台账=${ntx86}(期望0) 相符后=${pos86b}(期望1) 余额=${bal86a}→${bal86b}(期望+200000)"
@@ -1365,9 +1365,9 @@ rf86=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/pay/re
   -H "Authorization: Bearer $GJWT" -H "$CT" \
   -d "{\"merchantOrderId\":\"$MOID86\",\"merchantRefundId\":\"s86-refund-$RID86\",\"refundAmount\":100}")
 sleep 1
-bal86c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal86c=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 ps86=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$RID86")
-rtx86=$(q "SELECT type||':'||amount FROM gateway_quota_transactions WHERE ref='refund:$MOID86'")
+rtx86=$(q "SELECT type||':'||amount FROM pay_consumption_transactions WHERE ref='refund:$MOID86'")
 pos86c=$(q "SELECT status FROM pay_orders WHERE merchant_order_id='$MOID86'")
 [ "$rf86" = "200" ] && [ "$bal86c" = "$((bal86b-100000))" ] && [ "$ps86" = "3" ] && [ "$rtx86" = "refund:-100000" ] \
   && pass "退款扣回额度：退一半(100/200 分) → 扣回 100000、台账 ${rtx86}、充值单转已退款" \
@@ -1378,7 +1378,7 @@ echo "[S34] 钱包充值不增网关额度（两个账本不共用余额）"
 # 分流靠 merchant_order_id 前缀，两个监听者各认各的：网关那个对 `wallet:recharge:` 直接 return，
 # 钱包那个对 `gateway:quota:` 也一样 —— 任何一方误认都会在账面上多出一份钱。
 nrc34=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
-gbal34=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+gbal34=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 w1=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/pay/wallet-recharge/create" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"totalPrice":200,"payPrice":200,"bonusPrice":0}')
 WRID=$(python3 -c "import sys,json;print(json.load(sys.stdin).get('data',''))" < "$GB" 2>/dev/null)
@@ -1390,8 +1390,8 @@ sleep 1
 wps=$(q "SELECT pay_status FROM pay_wallet_recharges WHERE id=${WRID:-0}")
 wbal=$(q "SELECT COALESCE(balance,-1) FROM pay_wallets WHERE user_id=1")
 nrc34b=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
-gbal34b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-ngtx=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='wallet:recharge:$WRID'")
+gbal34b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+ngtx=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='wallet:recharge:$WRID'")
 [ "$w1" = "200" ] && [ "$w2" = "200" ] && [ "$w3" = "200" ] && [ "$wps" = "1" ] && [ "$wbal" = "200" ] \
   && [ "$nrc34b" = "$nrc34" ] && [ "$gbal34b" = "$gbal34" ] && [ "$ngtx" = "0" ] \
   && pass "钱包充值 200 只进钱包（pay_wallets.balance=${wbal}）：网关充值单 ${nrc34}→${nrc34b}、网关余额仍 ${gbal34b}、台账无以 wallet: 为 ref 的记录" \
@@ -1447,17 +1447,17 @@ c1=$(echo "$c36" | cut -d' ' -f1)
 # 只按字面量比对的话，运营发出去的码用户照着输入却兑不了，而后台看那张码明明还是未用。
 raw36=$(q "SELECT code FROM gateway_redemption_codes WHERE batch_id='$batch36' ORDER BY id LIMIT 1")
 c1bare=$(printf '%s' "$c1" | tr -d '-' | tr 'a-z' 'A-Z')
-bal36=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal36=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 red36() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d "$1"; }
 d1=$(red36 "{\"code\":\"$c1\"}"); sleep 1
-bal36a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-tx1=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
+bal36a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+tx1=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
 st1=$(q "SELECT status FROM gateway_redemption_codes WHERE code='$raw36'")
 uu1=$(q "SELECT COALESCE(used_user_id,0) FROM gateway_redemption_codes WHERE code='$raw36'")
 d2=$(red36 "{\"code\":\"$c1\"}"); sleep 1
-bal36b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-tx2=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
+bal36b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+tx2=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem' AND ref='redeem:$raw36'")
 [ -n "$batch36" ] && [ "$c1bare" = "$raw36" ] && [ "$c1bare" != "$c1" ] \
   && [ "$d1" = "200" ] && [ "$bal36a" = "$((bal36+50000))" ] && [ "$tx1" = "1" ] && [ "$st1" = "1" ] && [ "$uu1" = "1" ] \
   && [ "$d2" = "409" ] && [ "$bal36b" = "$bal36a" ] && [ "$tx2" = "1" ] \
@@ -1474,7 +1474,7 @@ gen37=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":30000,"count":1}')
 c37=$(printf '%s' "$gen37" | python3 -c "import sys,json;print(((json.load(sys.stdin).get('data') or {}).get('codes') or [''])[0])" 2>/dev/null)
 raw37=$(printf '%s' "$c37" | tr -d '-' | tr 'a-z' 'A-Z')
-bal37=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal37=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 RC=/tmp/s37-codes-$$; : > "$RC"; RB=""
 for i in 1 2 3 4 5; do
   curl -s --max-time 20 -o /dev/null -w "%{http_code}\n" -X POST "$U/app/gateway/redeem" \
@@ -1482,8 +1482,8 @@ for i in 1 2 3 4 5; do
 done
 wait $RB; sleep 1
 ok37=$(grep -c '^200$' "$RC"); rm -f "$RC"
-bal37a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-tx37=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw37'")
+bal37a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+tx37=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem' AND ref='redeem:$raw37'")
 st37=$(q "SELECT status FROM gateway_redemption_codes WHERE code='$raw37'")
 [ "$ok37" = "1" ] && [ "$tx37" = "1" ] && [ "$bal37a" = "$((bal37+30000))" ] && [ "$st37" = "1" ] \
   && pass "5 路并发兑同一张码（${ok37}/5 返回200）只入账一次：余额 ${bal37}→${bal37a}(+30000)、台账 ${tx37} 条、码状态已用" \
@@ -1508,22 +1508,22 @@ adm38() { curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gat
 # 出生即过期的码不允许造：它能创建成功就是一行永远兑不了的死数据，而运营看不出来
 exp38=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":20000,"count":1,"expiresAt":1000}')
-bal38=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal38=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 u1=$(red38 "{\"code\":\"$a1\"}"); sleep 1
-bal38a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal38a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 dis2=$(adm38 "disable/$id2")
 u2=$(red38 "{\"code\":\"$a2\"}"); sleep 1
 disUsed=$(adm38 "disable/$(q "SELECT id FROM gateway_redemption_codes WHERE code='$b1'")")
-bal38b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal38b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 # 台账按这三张码的 ref 精确点名（不是按面额筛）：断的是「本批三张码里，只有首发那张产生过钱」。
 # 这一条是 409 那几发的**钱侧**证据 —— 余额不变只说明当下没动，台账不多才说明拒得干净。
-tx38=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem' AND ref IN ('redeem:$b1','redeem:$b2','redeem:$b3')")
+tx38=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem' AND ref IN ('redeem:$b1','redeem:$b2','redeem:$b3')")
 # 过期只能靠 SQL 造：API 拒绝生成已过期的码（上面已断），而“时间流逝”无法等
 q "UPDATE gateway_redemption_codes SET expires_at=1000 WHERE code='$b3'" >/dev/null
 st38=$(curl -s --max-time 20 -X GET "$U/admin/gateway/redemption/stats/$batch38" -H "Authorization: Bearer $GJWT")
 expn=$(printf '%s' "$st38" | python3 -c "import sys,json;d=(json.load(sys.stdin).get('data') or {});print(f\"{d.get('total')}/{d.get('used')}/{d.get('disabled')}/{d.get('expired')}/{d.get('unused')}\")" 2>/dev/null)
 u3=$(red38 "{\"code\":\"$a3\"}"); sleep 1
-bal38c=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal38c=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 db38=$(adm38 "disable-batch" "{\"batchId\":\"$batch38\"}")
 dbn=$(grep -o '"disabled":[0-9]*' "$GB" | cut -d: -f2 | head -1)
 fin=$(q "SELECT string_agg(status::text,',' ORDER BY id) FROM gateway_redemption_codes WHERE batch_id='$batch38'")
@@ -1551,14 +1551,14 @@ gen39=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/generate" \
   -H "Authorization: Bearer $GJWT" -H "$CT" -d '{"quotaMicro":10000,"count":1,"note":"S39 内部备注"}')
 c39=$(printf '%s' "$gen39" | python3 -c "import sys,json;print(((json.load(sys.stdin).get('data') or {}).get('codes') or [''])[0])" 2>/dev/null)
 raw39=$(printf '%s' "$c39" | tr -d '-' | tr 'a-z' 'A-Z')
-n39a=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
+n39a=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem'")
 inj39=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"code\":\"$c39\",\"quotaMicro\":99999999}")
 sleep 1
-n39b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='redeem'")
+n39b=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='redeem'")
 # 面额按**这张码的 ref** 取，不是全表 MAX：S36/S37/S38 各留了不同面额的台账，
 # MAX 会读到 S36 的 50000 —— 那等于拿别人的数在比，「注入的面额没生效」这条断言恒真。
-amt39=$(q "SELECT COALESCE(MAX(amount),0) FROM gateway_quota_transactions WHERE type='redeem' AND ref='redeem:$raw39'")
+amt39=$(q "SELECT COALESCE(MAX(amount),0) FROM pay_consumption_transactions WHERE type='redeem' AND ref='redeem:$raw39'")
 # 运营备注不得进用户侧响应（note 里写着活动名/客户名，泄露给用户是信息外流）
 leak39=$(grep -c "S39 内部备注" "$GB")
 # 两种世界都得对：注入被拒（400）则台账不得多一条、且这张码名下零台账；
@@ -1581,7 +1581,7 @@ echo "[S40] 下单失败 → 意图单必须被关掉，且真实原因不被清
 # 且抛在 PayOrderTable.insert 之前，所以支付单侧不留痕 —— 干净的「下单失败」。
 nrc40a=$(q "SELECT COUNT(*) FROM gateway_quota_recharges")
 npo40a=$(q "SELECT COUNT(*) FROM pay_orders")
-bal40=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal40=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 bad40=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_40"}')
 sleep 1
@@ -1590,8 +1590,8 @@ rid40=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
 ps40=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$rid40")
 poid40=$(q "SELECT COALESCE(pay_order_id,-1) FROM gateway_quota_recharges WHERE id=$rid40")
 npo40b=$(q "SELECT COUNT(*) FROM pay_orders")
-ntx40=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='gateway:quota:$rid40'")
-bal40b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx40=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='gateway:quota:$rid40'")
+bal40b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 # 全轮日志扫描：命名参数漏绑这类 bug 在编译期与启动期都不报错，只在执行到那一行时 500。
 # 这一条同时守住 close 与 S38 的 disable-batch（两者都犯过）。
 npe40=$(grep -c "NamedParameterValueNotSupplied" "$WORK/logs/all.log" 2>/dev/null)
@@ -1613,14 +1613,14 @@ echo "[S41] 台账时间戳：每一行钱都得知道自己是什么时候发�
 # 我挑的那条路径，扫全表才证明这条 SQL 本身。
 #
 # 非空前提只拿 recharge 与 redeem 两类，**不含 settlement**：S32 开头的 seed_reset 会 TRUNCATE
-# gateway_quota_transactions，而结算台账只由 S28 之前的中继场景产生 —— 到本场景时它们已被清掉。
+# pay_consumption_transactions，而结算台账只由 S28 之前的中继场景产生 —— 到本场景时它们已被清掉。
 # 写 nset>0 会因为 harness 的结构而假红，与本 bug 无关；哨兵 SQL 是同一条，证一类即证全部。
-ntx41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
-nzero41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE created_at IS NULL OR created_at <= 0")
-nrc41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'gateway:quota:%'")
-nred41=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'redeem:%'")
-min41=$(q "SELECT COALESCE(MIN(created_at),0) FROM gateway_quota_transactions")
-max41=$(q "SELECT COALESCE(MAX(created_at),0) FROM gateway_quota_transactions")
+ntx41=$(q "SELECT COUNT(*) FROM pay_consumption_transactions")
+nzero41=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE created_at IS NULL OR created_at <= 0")
+nrc41=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'gateway:quota:%'")
+nred41=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'redeem:%'")
+min41=$(q "SELECT COALESCE(MIN(created_at),0) FROM pay_consumption_transactions")
+max41=$(q "SELECT COALESCE(MAX(created_at),0) FROM pay_consumption_transactions")
 nowms41=$(python3 -c 'import time;print(int(time.time()*1000))')
 # 时间窗既要「不是 0」也要「单位对」：写成秒的话约 1.7e9，比 nowms 小三个数量级，会被下界抓住。
 # 上界留 10 分钟余量给本机与容器的时钟差；下界留 1 小时覆盖整轮 harness 的耗时。
@@ -1684,8 +1684,8 @@ sleep 1
 # 子查询包一层再 COALESCE：不包的话无命中行时 psql 返回**空串**而不是 0，下面的数值比较会炸。
 rid42=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_user_id=$b42),0)")
 inv42=$(q "SELECT COALESCE((SELECT inviter_user_id FROM member_invite_records WHERE id=$rid42),0)")
-nled42=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
-nacc42=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id IN ($a42,$b42)")
+nled42=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'invite:%'")
+nacc42=$(q "SELECT COUNT(*) FROM pay_consumption_accounts WHERE user_id IN ($a42,$b42)")
 skip42b=$(grep -c "invite reward skipped" "$WORK/logs/all.log" 2>/dev/null)
 # 恰好 +2：两个角色各被评估一次。断「>0」不够 —— 那只证明至少一个角色走到了，
 # 另一个角色的回调丢了（比如 grantRole 写成了 early return 整个事件）就看不出来。
@@ -1710,12 +1710,12 @@ sleep 1
 rid43=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_user_id=$b43),0)")
 # 一条 SQL 里把「角色 / 类型 / 面额 / 归属 / 时间戳」全钉住：少钉一项就等于允许一种错账。
 # created_at>0 与 S41 是同一件事 —— 发奖走的正是那条 ref 哨兵 SQL。
-ni43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid43:inviter' AND type='invite' AND amount=50000 AND user_id=$a43 AND created_at>0")
-ne43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid43:invitee' AND type='invite' AND amount=20000 AND user_id=$b43 AND created_at>0")
+ni43=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='invite:$rid43:inviter' AND type='invite' AND amount=50000 AND user_id=$a43 AND created_at>0")
+ne43=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='invite:$rid43:invitee' AND type='invite' AND amount=20000 AND user_id=$b43 AND created_at>0")
 # 总数必须是 2：只数「各自那一条」的话，同一角色被发两次是看不出来的。
-tot43=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
-ba43=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$a43),-1)")
-bb43=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b43),-1)")
+tot43=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'invite:%'")
+ba43=$(q "SELECT COALESCE((SELECT balance FROM pay_consumption_accounts WHERE user_id=$a43),-1)")
+bb43=$(q "SELECT COALESCE((SELECT balance FROM pay_consumption_accounts WHERE user_id=$b43),-1)")
 [ "$atok43" = "yes" ] && [ "$rid43" -gt 0 ] && [ "$ni43" = "1" ] && [ "$ne43" = "1" ] && [ "$tot43" = "2" ] \
   && [ "$ba43" = "50000" ] && [ "$bb43" = "20000" ] \
   && pass "配置后双角色各一条台账：记录 ${rid43} → inviter(${a43}) 50000 ×${ni43}、invitee(${b43}) 20000 ×${ne43}，invite:* 共 ${tot43} 条，余额 ${ba43}/${bb43}（两人都是从 0 起，所以余额就等于奖励额）" \
@@ -1736,9 +1736,9 @@ rm -f /tmp/ng-ghost44-$$.json
 noauth44=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
   "$U/admin/member/invite-code/retry-invite-reward/$rid43")
 sleep 1
-tot44=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref LIKE 'invite:%'")
-ba44=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$a43),-1)")
-bb44=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b43),-1)")
+tot44=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref LIKE 'invite:%'")
+ba44=$(q "SELECT COALESCE((SELECT balance FROM pay_consumption_accounts WHERE user_id=$a43),-1)")
+bb44=$(q "SELECT COALESCE((SELECT balance FROM pay_consumption_accounts WHERE user_id=$b43),-1)")
 skip44b=$(grep -c "quota debit idempotent skip" "$WORK/logs/all.log" 2>/dev/null)
 # 恰好 +2：两个 ref 各被唯一约束挡下一次。断「增加了」不够 —— 那兼容「重放其实什么都没干」；
 # 断「恰好 2」才证明重放真的走到了发钱那一步、并且是被幂等闸门拦下的。
@@ -1768,10 +1768,10 @@ rid45=$(q "SELECT COALESCE((SELECT id FROM member_invite_records WHERE invitee_u
 # 而 pass 文案还写着「邀请人(a45)」。S42 已经断了这一条，S45 不断就等于把结论押在 helper 的
 # 实现细节上：哪天 /mine 改成能代查，这个场景会绿着失去意义。
 inv45=$(q "SELECT COALESCE((SELECT inviter_user_id FROM member_invite_records WHERE id=$rid45),0)")
-ni45=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid45:inviter'")
-ne45=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='invite:$rid45:invitee' AND type='invite' AND amount=20000 AND user_id=$b45 AND created_at>0")
-bb45=$(q "SELECT COALESCE((SELECT balance FROM gateway_quota_accounts WHERE user_id=$b45),-1)")
-nacc45=$(q "SELECT COUNT(*) FROM gateway_quota_accounts WHERE user_id=$a45")
+ni45=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='invite:$rid45:inviter'")
+ne45=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='invite:$rid45:invitee' AND type='invite' AND amount=20000 AND user_id=$b45 AND created_at>0")
+bb45=$(q "SELECT COALESCE((SELECT balance FROM pay_consumption_accounts WHERE user_id=$b45),-1)")
+nacc45=$(q "SELECT COUNT(*) FROM pay_consumption_accounts WHERE user_id=$a45")
 mis45b=$(grep -c "invite reward MISCONFIGURED role=inviter" "$WORK/logs/all.log" 2>/dev/null)
 dmis45=$((mis45b - mis45a))
 [ "$atok45" = "yes" ] && [ "$rid45" -gt 0 ] && [ "$inv45" = "$a45" ] && [ "$ni45" = "0" ] && [ "$nacc45" = "0" ] && [ "$dmis45" = "1" ] \
@@ -1831,8 +1831,8 @@ echo "[S47] 授权巡检：钱相关的管理端动作一律要权限，且拒�
 # 403 本身只说明「被拒了」，点名才说明是这一条 @Permission 在起作用 ——
 # 否则路由写错打到别处的 403 与权限生效长得一模一样。
 # 副作用不变量与状态码一起断言：“403 但已经写进去了”比 200 更糟。
-bal47a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nled47a=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+bal47a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nled47a=$(q "SELECT COUNT(*) FROM pay_consumption_transactions")
 ngrp47a=$(q "SELECT COUNT(*) FROM gateway_groups")
 h1=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/quota/grant" \
   -H "Authorization: Bearer $csjwt" -H "$CT" -d '{"userId":1,"amount":100000,"ref":"s47-probe"}')
@@ -1845,8 +1845,8 @@ h3=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/admin/gateway/
   -H "Authorization: Bearer $csjwt" -H "$CT" -d '{"code":"s47probe","name":"S47","ratio":"1.0"}')
 b3=$(head -c 200 "$GB" 2>/dev/null | tr -d '\n')
 sleep 1
-bal47b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nled47b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+bal47b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nled47b=$(q "SELECT COUNT(*) FROM pay_consumption_transactions")
 ngrp47b=$(q "SELECT COUNT(*) FROM gateway_groups")
 k1=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b1" && k1=yes
 k2=no; grep -q '"message":"PERMISSION_DENIED"' <<< "$b2" && k2=yes
@@ -2001,12 +2001,12 @@ done < "$P50"
   || fail "/page 泄露或脱敏过头: 行数=${nrows}(期望3) 泄露命中=${leak}(期望0) 无掩码行=${nostar}(期望0) 首尾对不上=${misplaced}(期望0)"
 # C：拿 /page 给的串真去兑 —— 必须兑不动、一分不入账。这一条才是脱敏的意义。
 rid1=$(head -1 "$P50" | cut -d' ' -f1); rcode1=$(head -1 "$P50" | cut -d' ' -f2-)
-bal50=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal50=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 d50=$(curl -s --max-time 20 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/redeem" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d "{\"code\":\"$rcode1\"}"); sleep 1
-bal50a=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal50a=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 m50=$(python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null)
-ntx50=$(q "SELECT COUNT(*) FROM gateway_quota_transactions t JOIN gateway_redemption_codes r ON t.ref='redeem:'||r.code WHERE r.batch_id='$batch50'")
+ntx50=$(q "SELECT COUNT(*) FROM pay_consumption_transactions t JOIN gateway_redemption_codes r ON t.ref='redeem:'||r.code WHERE r.batch_id='$batch50'")
 # /disable/{id} 与 /page 共用同一个 toVO，但「共用」是会被改散的，所以单独验一次。
 dis50=$(curl -s --max-time 20 -X POST "$U/admin/gateway/redemption/disable/$rid1" -H "Authorization: Bearer $GJWT")
 dcode50=$(printf '%s' "$dis50" | python3 -c "import sys,json;print((json.load(sys.stdin).get('data') or {}).get('code',''))" 2>/dev/null)
@@ -2036,7 +2036,7 @@ csjwt51=$(curl -s --max-time 30 -X POST "$U/admin/system/auth/login" -H "$CT" \
   -d '{"username":"cs_s51","password":"admin123"}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('accessToken',''))" 2>/dev/null)
 csrole51=$(q "SELECT COUNT(*) FROM system_user_roles WHERE user_id=951")
-# 环境自建，且**不跑 seed_reset**：它会 TRUNCATE gateway_quota_transactions，而台账正是本场景
+# 环境自建，且**不跑 seed_reset**：它会 TRUNCATE pay_consumption_transactions，而台账正是本场景
 # 的断言对象。渠道/定价/上游都用 S51 独占的名字与端口，不碰 S48 留下的那套。
 fake ok 9951; sleep 1
 q "INSERT INTO gateway_channels (name,type,base_url,groups,models,priority,weight,status,ttfb_timeout_ms,idle_timeout_ms,cost_discount,deleted,created_at,updated_at) VALUES ('c51','openai_compatible','http://127.0.0.1:9951','default','m-rv51',1,1,1,30000,90000,'1.0',0,0,0);
@@ -2063,13 +2063,13 @@ rtype51() { python3 -c "import json;d=json.load(open('$GB'));e=d.get('error') or
 rpre51=$(relay51); sleep 1
 
 # ── 块 A：撤回真扣钱、台账 type='revoke'、balance_after 对得上、reserved_balance 不被碰 ──
-bala51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-resa51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+bala51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+resa51=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 hA51=$(rv51 "$GJWT" '{"userId":1,"amount":30000,"ref":"revoke:s51-a"}'); sleep 1
-balA51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-resA51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
-rowA51=$(q "SELECT amount||'|'||balance_after FROM gateway_quota_transactions WHERE ref='revoke:s51-a' AND type='revoke'")
-nA51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-a'")
+balA51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+resA51=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
+rowA51=$(q "SELECT amount||'|'||balance_after FROM pay_consumption_transactions WHERE ref='revoke:s51-a' AND type='revoke'")
+nA51=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='revoke:s51-a'")
 # voA51 取的是 revokedAmount，期望值 **30000 而不是 -30000**：撤回量恒正，而台账的 amount 是
 # 「余额变动了多少」（带符号，撤回为负，就是上面 rowA51 期望里的 -30000）。
 # 第一版断言把两者当成同一个东西，于是其余五项真实数字全对、只有这一项不符而翻红。
@@ -2085,8 +2085,8 @@ voA51=$(python3 -c "import json;d=json.load(open('$GB')).get('data') or {};print
 # ref 是撤回唯一的幂等键，所以它必填（块 E 断言）。运营在后台双击一次就是双扣的话，
 # 台账上看不出这是两次还是一次 —— 与 S36 的重兑、S8 的重复 ref 同一套路数。
 hB51=$(rv51 "$GJWT" '{"userId":1,"amount":30000,"ref":"revoke:s51-a"}'); sleep 1
-balB51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nB51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-a'")
+balB51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nB51=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='revoke:s51-a'")
 [ "$hB51" = "200" ] && [ "$balB51" = "$balA51" ] && [ "$nB51" = "1" ] \
   && pass "同 ref 重放幂等：HTTP=${hB51}（幂等跳过不报错）、余额仍 ${balB51}、台账仍 ${nB51} 行" \
   || fail "撤回不幂等: HTTP=${hB51}(期望200) 余额=${balA51}->${balB51}(期望不变) 台账=${nB51}(期望1)"
@@ -2095,14 +2095,14 @@ nB51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-
 # 负数 amount 不是输入卫生问题：revoke(-50000) 就是一次发放，持有 gateway:quota:revoke 的人
 # 借此绕过 gateway:quota:grant，两个权限的分离形同虚设。所以拒绝理由必须**点名 grant**，
 # 与 S47 要求点名权限串同理 —— 只断 400 的话，任何一处校验失败都长得一样。
-balD51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nledD51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+balD51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nledD51=$(q "SELECT COUNT(*) FROM pay_consumption_transactions")
 hD51=$(rv51 "$GJWT" '{"userId":1,"amount":-50000,"ref":"revoke:s51-d"}'); mD51=$(msg51)
 hE51=$(rv51 "$GJWT" '{"userId":1,"amount":1000,"ref":""}'); mE51=$(msg51)
 hE251=$(rv51 "$GJWT" '{"userId":1,"amount":0,"ref":"revoke:s51-e2"}'); mE251=$(msg51)
 sleep 1
-balD51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nledD51b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
+balD51b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nledD51b=$(q "SELECT COUNT(*) FROM pay_consumption_transactions")
 [ "$mD51" = "QUOTA_REVOKE_AMOUNT_INVALID" ] && okD51=1 || okD51=0
 [ "$hD51" = "400" ] && [ "$okD51" = "1" ] && [ "$hE51" = "400" ] && [ "$hE251" = "400" ] \
   && [ "$balD51b" = "$balD51" ] && [ "$nledD51b" = "$nledD51" ] \
@@ -2110,10 +2110,10 @@ nledD51b=$(q "SELECT COUNT(*) FROM gateway_quota_transactions")
   || fail "非法入参没挡住: 负数=${hD51}(期望400) 点名grant=${okD51}(期望1，message='${mD51}') 空ref=${hE51}(期望400，'${mE51}') 零amount=${hE251}(期望400，'${mE251}') 余额=${balD51}->${balD51b}(期望不变) 台账=${nledD51}->${nledD51b}(期望不变)"
 
 # ── 块 F：零角色主体必须 403 且点名权限，admin 对照 200 ──
-balF51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+balF51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 hF51=$(rv51 "$csjwt51" '{"userId":1,"amount":1000,"ref":"revoke:s51-f"}'); mF51=$(msg51); sleep 1
-balF51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-nF51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-f'")
+balF51b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+nF51=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='revoke:s51-f'")
 [ "$mF51" = "PERMISSION_DENIED" ] && okF51=1 || okF51=0
 [ -n "$csjwt51" ] && [ "$csrole51" = "0" ] && [ "$hF51" = "403" ] && [ "$okF51" = "1" ] \
   && [ "$balF51b" = "$balF51" ] && [ "$nF51" = "0" ] && [ "$hA51" = "200" ] \
@@ -2121,11 +2121,11 @@ nF51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='revoke:s51-
   || fail "撤回的授权边界不对: cs登录=$([ -n "$csjwt51" ] && echo yes || echo no)(期望yes) 角色数=${csrole51}(期望0) HTTP=${hF51}(期望403) 点名权限=${okF51}(期望1，message='${mF51}') 余额=${balF51}->${balF51b}(期望不变) 台账=${nF51}(期望0) admin对照=${hA51}(期望200)"
 
 # ── 块 C：撤到转负也必须成功（这是与 consume 的分界线）──
-balC51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+balC51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 over51=$((balC51 + 50000))
 hC51=$(rv51 "$GJWT" "{\"userId\":1,\"amount\":${over51},\"ref\":\"revoke:s51-c\"}"); sleep 1
-balC51b=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-availC51=$(q "SELECT balance - reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
+balC51b=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+availC51=$(q "SELECT balance - reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
 voC51=$(python3 -c "import json;d=json.load(open('$GB')).get('data') or {};print(d.get('balance'),d.get('available'))" 2>/dev/null)
 [ "$hC51" = "200" ] && [ "$balC51b" = "-50000" ] && [ "$availC51" = "-50000" ] && [ "$voC51" = "-50000 -50000" ] \
   && pass "撤到转负成功（不是「余额不足被拒」）：余额 ${balC51} 撤 ${over51} → ${balC51b}、可用余额 ${availC51}、响应 balance/available 与库一致" \
@@ -2140,14 +2140,14 @@ voC51=$(python3 -c "import json;d=json.load(open('$GB')).get('data') or {};print
 hG51=$(relay51); sleep 1
 mG51=$(rmsg51)
 tG51=$(rtype51)
-resG51=$(q "SELECT reserved_balance FROM gateway_quota_accounts WHERE user_id=1")
-balG51=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+resG51=$(q "SELECT reserved_balance FROM pay_consumption_accounts WHERE user_id=1")
+balG51=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 nlogG51=$(q "SELECT COUNT(*) FROM gateway_usage_logs WHERE request_model='m-rv51'")
-ntxG51=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE type='consume' AND created_at > 0")
+ntxG51=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE type='consume' AND created_at > 0")
 # type 精确断言 insufficient_quota，message 还须含 balance：RelayEngine 里 402（账户余额不足）与
 # 429（token 预算耗尽）共用同一个 error.type，只断 type 分不清这一发到底是被「撤回扣掉的账户
 # 余额」挡的、还是被某个 token 的预算挡的。而本场景要证的因果恰恰是前者 —— 撤回动的是
-# gateway_quota_accounts.balance，与 token 预算无关。message 含 balance 才把这条因果钉死。
+# pay_consumption_accounts.balance，与 token 预算无关。message 含 balance 才把这条因果钉死。
 case "$mG51" in *balance*) okG51=1;; *) okG51=0;; esac
 [ "$rpre51" = "200" ] && [ "$hG51" = "402" ] && [ "$tG51" = "insufficient_quota" ] && [ "$okG51" = "1" ] \
   && [ "$resG51" = "0" ] && [ "$balG51" = "$balC51b" ] \
@@ -2244,7 +2244,7 @@ jf53() { python3 -c "import json;v=(json.load(open('$GB')).get('data') or {}).ge
 jmsg53() { python3 -c "import json;print(json.load(open('$GB')).get('message') or '')" 2>/dev/null; }
 
 # ── 块 A：刚下的单 —— 待支付、额度已算定、paidAt 还是空 ──
-bal53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal53=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 rc53=$(curl -s --max-time 15 -o "$GB" -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"sandbox_alipay"}')
 RID53=$(jf53 rechargeId); MOID53=$(jf53 merchantOrderId); AMT53=$(jf53 amountMicro)
@@ -2263,8 +2263,8 @@ cb53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
 sleep 1
 hB53=$(st53 "$RID53" "$UJWT")
 psB53=$(jf53 payStatus); paB53=$(jf53 paidAt); moB53=$(jf53 merchantOrderId)
-balB53=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
-ntx53=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='$MOID53' AND type='recharge'")
+balB53=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
+ntx53=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='$MOID53' AND type='recharge'")
 # paidAt 必须是正数时间戳：null/空/0 都算没写。-gt 对非数字会报错，所以先用 case 拦住。
 okpa53=0; case "$paB53" in ''|null) ;; *) [ "$paB53" -gt 0 ] 2>/dev/null && okpa53=1;; esac
 [ "$cb53" = "200" ] && [ "$hB53" = "200" ] && [ "$psB53" = "1" ] && [ "$okpa53" = "1" ] \
@@ -2286,7 +2286,7 @@ hD53=$(st53 999999999 "$UJWT"); mD53=$(jmsg53)
   || fail "块D 两种 404 可区分: 不存在id=${hD53}(期望404) message='${mD53}' vs 跨用户 message='${mC53}'（两者必须非空且相等，空串相等是提取链断了的假绿）"
 
 # ── 块 E：下单失败被 close() 关掉的单仍可读，且回读成「已关闭」 ──
-bal53e=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+bal53e=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 bad53=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$U/app/gateway/recharge" \
   -H "Authorization: Bearer $UJWT" -H "$CT" -d '{"price":100,"channelCode":"no_such_channel_53"}')
 sleep 1
@@ -2297,8 +2297,8 @@ rid53e=$(q "SELECT COALESCE(MAX(id),0) FROM gateway_quota_recharges")
 psE53db=$(q "SELECT pay_status FROM gateway_quota_recharges WHERE id=$rid53e")
 hE53=$(st53 "$rid53e" "$UJWT")
 psE53=$(jf53 payStatus); paE53=$(jf53 paidAt)
-ntx53e=$(q "SELECT COUNT(*) FROM gateway_quota_transactions WHERE ref='gateway:quota:$rid53e'")
-bal53f=$(q "SELECT balance FROM gateway_quota_accounts WHERE user_id=1")
+ntx53e=$(q "SELECT COUNT(*) FROM pay_consumption_transactions WHERE ref='gateway:quota:$rid53e'")
+bal53f=$(q "SELECT balance FROM pay_consumption_accounts WHERE user_id=1")
 [ "$bad53" = "400" ] && [ "$rid53e" != "$RID53" ] && [ "$psE53db" = "2" ] && [ "$hE53" = "200" ] \
   && [ "$psE53" = "2" ] && [ "$paE53" = "null" ] && [ "$ntx53e" = "0" ] && [ "$bal53f" = "$bal53e" ] \
   && pass "块E 已关闭的单可读：未知渠道 → 下单 ${bad53}、意图单 ${rid53e} 被 close() 置 pay_status=${psE53db}；回读 ${hE53} payStatus=${psE53} paidAt=${paE53}、台账 ${ntx53e} 条、余额未动(${bal53f})" \

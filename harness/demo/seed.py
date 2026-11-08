@@ -170,7 +170,7 @@ WITH r AS (SELECT id, (power(random(), 1.6) * 6.8 * 86400000)::bigint AS back FR
 UPDATE gateway_usage_logs l SET created_at = l.created_at - r.back FROM r WHERE l.id = r.id;
 WITH r AS (SELECT id, (power(random(), 1.6) * 6.8 * 86400000)::bigint AS back FROM gateway_settlements)
 UPDATE gateway_settlements s SET created_at = s.created_at - r.back, updated_at = s.created_at - r.back FROM r WHERE s.id = r.id;
-UPDATE gateway_quota_transactions t SET created_at = s.created_at
+UPDATE pay_consumption_transactions t SET created_at = s.created_at
   FROM gateway_settlements s WHERE t.ref = 'settlement:' || s.settlement_id;
 """
     out = subprocess.run(PSQL.split() + ["-c", sql], capture_output=True, text=True)
